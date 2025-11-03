@@ -3,6 +3,7 @@
 *.lck
 *.log
 *.patch
+*.pcapng
 *~
 .buildpath
 .checkstyle
