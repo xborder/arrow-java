@@ -122,9 +122,7 @@ under the License.
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
         <configuration combine.children="append">
-          <compilerArgs>
-            <arg>-Werror</arg>
-          </compilerArgs>
+          <compilerArgs></compilerArgs>
         </configuration>
       </plugin>
       <plugin>

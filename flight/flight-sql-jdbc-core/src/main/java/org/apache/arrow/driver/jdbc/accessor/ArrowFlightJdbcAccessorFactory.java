@@ -31,6 +31,7 @@ import org.apache.arrow.driver.jdbc.accessor.impl.complex.ArrowFlightJdbcListVec
 import org.apache.arrow.driver.jdbc.accessor.impl.complex.ArrowFlightJdbcMapVectorAccessor;
 import org.apache.arrow.driver.jdbc.accessor.impl.complex.ArrowFlightJdbcStructVectorAccessor;
 import org.apache.arrow.driver.jdbc.accessor.impl.complex.ArrowFlightJdbcUnionVectorAccessor;
+import org.apache.arrow.driver.jdbc.accessor.impl.extension.ArrowFlightJdbcUuidVectorAccessor;
 import org.apache.arrow.driver.jdbc.accessor.impl.numeric.ArrowFlightJdbcBaseIntVectorAccessor;
 import org.apache.arrow.driver.jdbc.accessor.impl.numeric.ArrowFlightJdbcBitVectorAccessor;
 import org.apache.arrow.driver.jdbc.accessor.impl.numeric.ArrowFlightJdbcDecimalVectorAccessor;
@@ -44,6 +45,7 @@ import org.apache.arrow.vector.DateMilliVector;
 import org.apache.arrow.vector.Decimal256Vector;
 import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.DurationVector;
+import org.apache.arrow.vector.ExtensionTypeVector;
 import org.apache.arrow.vector.FixedSizeBinaryVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
@@ -75,6 +77,7 @@ import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.complex.UnionVector;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 
 /** Factory to instantiate the accessors. */
 public class ArrowFlightJdbcAccessorFactory {
@@ -198,6 +201,15 @@ public class ArrowFlightJdbcAccessorFactory {
           (DenseUnionVector) vector, getCurrentRow, setCursorWasNull);
     } else if (vector instanceof NullVector || vector == null) {
       return new ArrowFlightJdbcNullVectorAccessor(setCursorWasNull);
+    } else if (vector instanceof ExtensionTypeVector) {
+      final ArrowType type = vector.getField().getType();
+      if (type instanceof org.apache.arrow.vector.types.pojo.UuidType
+          || (type instanceof ArrowType.ExtensionType
+              && "uuid".equals(((ArrowType.ExtensionType) type).extensionName()))) {
+        org.apache.arrow.driver.jdbc.accessor.impl.extension.ArrowFlightJdbcUuidVectorAccessor
+            .ensureUuidTypeRegistered();
+        return new ArrowFlightJdbcUuidVectorAccessor(vector, getCurrentRow, setCursorWasNull);
+      }
     }
 
     throw new UnsupportedOperationException(

@@ -95,6 +95,13 @@ Type Mapping
 The JDBC to Arrow type mapping can be obtained at runtime from
 `JdbcToArrowUtils.getArrowTypeFromJdbcType`_.
 
+UUIDs
+-----
+
+Some JDBC drivers expose UUIDs as Types.OTHER with type name "uuid" (e.g., PostgreSQL) or as a fixed-size
+BINARY(16) column (e.g., MySQL/MariaDB). The adapter maps these to Arrow FixedSizeBinary(16), which is the
+canonical on-wire storage for UUID in Arrow. Values are consumed from the ResultSet as UUID objects, byte arrays,
+BLOBs, or Strings (in canonical UUID text form).
 .. _JdbcToArrowUtils.getArrowTypeFromJdbcType: https://arrow.apache.org/docs/java/reference/org/apache/arrow/adapter/jdbc/JdbcToArrowUtils.html#getArrowTypeFromJdbcType-org.apache.arrow.adapter.jdbc.JdbcFieldInfo-java.util.Calendar-
 
 +--------------------+--------------------+-------+

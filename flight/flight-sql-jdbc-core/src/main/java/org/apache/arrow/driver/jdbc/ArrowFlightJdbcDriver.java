@@ -37,6 +37,8 @@ import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.util.VisibleForTesting;
+import org.apache.arrow.vector.types.pojo.ExtensionTypeRegistry;
+import org.apache.arrow.vector.types.pojo.UuidType;
 import org.apache.calcite.avatica.AvaticaConnection;
 import org.apache.calcite.avatica.DriverVersion;
 import org.apache.calcite.avatica.Meta;
@@ -59,6 +61,11 @@ public class ArrowFlightJdbcDriver extends UnregisteredDriver {
     final String tryReflectionSetAccessible = System.getProperty(key);
     if (tryReflectionSetAccessible == null) {
       System.setProperty(key, Boolean.TRUE.toString());
+    }
+
+    // Register Arrow extension types needed by the driver (UUID)
+    if (ExtensionTypeRegistry.lookup("arrow.uuid") == null) {
+      ExtensionTypeRegistry.register(new UuidType());
     }
 
     new ArrowFlightJdbcDriver().register();

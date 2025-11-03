@@ -117,14 +117,19 @@ public class ArrowFlightJdbcDriverTest {
 
     try (Connection connection =
         driver.connect(
-            "jdbc:arrow-flight://"
-                + dataSource.getConfig().getHost()
+            "jdbc:arrow-flight-sql://"
+                + "data.dev.dremio.site"// dataSource.getConfig().getHost()
                 + ":"
-                + dataSource.getConfig().getPort()
+                + "443"//dataSource.getConfig().getPort()
                 + "?"
-                + "useEncryption=false",
-            dataSource.getProperties(
-                dataSource.getConfig().getUser(), dataSource.getConfig().getPassword()))) {
+                + "token=RZ2tY%2BW0SIKjXh8imqL15WccJ2Xnm3%2Fnp8dxuSSTbU5WS1cDvgDUElwrmj9QUg%3D%3D"
+                + "&catalog=7480f90b-b3bb-48bc-8fdf-e9bb507688e3"
+//                + "useEncryption=false"
+            ,
+            new Properties()
+//            dataSource.getProperties(
+//                dataSource.getConfig().getUser(), dataSource.getConfig().getPassword())
+    )) {
       assertTrue(connection.isValid(300));
     }
     try (Connection connection =

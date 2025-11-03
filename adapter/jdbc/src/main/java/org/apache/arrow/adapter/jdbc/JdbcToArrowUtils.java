@@ -48,6 +48,7 @@ import org.apache.arrow.adapter.jdbc.consumer.DateConsumer;
 import org.apache.arrow.adapter.jdbc.consumer.Decimal256Consumer;
 import org.apache.arrow.adapter.jdbc.consumer.DecimalConsumer;
 import org.apache.arrow.adapter.jdbc.consumer.DoubleConsumer;
+import org.apache.arrow.adapter.jdbc.consumer.FixedSizeBinaryConsumer;
 import org.apache.arrow.adapter.jdbc.consumer.FloatConsumer;
 import org.apache.arrow.adapter.jdbc.consumer.IntConsumer;
 import org.apache.arrow.adapter.jdbc.consumer.JdbcConsumer;
@@ -208,6 +209,16 @@ public class JdbcToArrowUtils {
         }
         return new ArrowType.Timestamp(TimeUnit.MILLISECOND, timezone);
       case Types.BINARY:
+        {
+          // If the column is fixed-size BINARY(16), treat as FixedSizeBinary(16),
+          // which is the canonical Arrow storage for UUIDs.
+          int len =
+              fieldInfo.getPrecision() > 0 ? fieldInfo.getPrecision() : fieldInfo.getDisplaySize();
+          if (len == 16) {
+            return new ArrowType.FixedSizeBinary(16);
+          }
+          return new ArrowType.Binary();
+        }
       case Types.VARBINARY:
       case Types.LONGVARBINARY:
       case Types.BLOB:
@@ -532,6 +543,9 @@ public class JdbcToArrowUtils {
       case Binary:
       case LargeBinary:
         return BinaryConsumer.createConsumer((VarBinaryVector) vector, columnIndex, nullable);
+      case FixedSizeBinary:
+        return FixedSizeBinaryConsumer.createConsumer(
+            (org.apache.arrow.vector.FixedSizeBinaryVector) vector, columnIndex, nullable);
       case Date:
         return DateConsumer.createConsumer((DateDayVector) vector, columnIndex, nullable, calendar);
       case Time:
