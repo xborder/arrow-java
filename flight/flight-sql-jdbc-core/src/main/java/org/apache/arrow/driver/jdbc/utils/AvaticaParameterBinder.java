@@ -19,6 +19,7 @@ package org.apache.arrow.driver.jdbc.utils;
 import java.util.List;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
 import org.apache.arrow.driver.jdbc.converter.impl.BinaryAvaticaParameterConverter;
+import org.apache.arrow.driver.jdbc.converter.impl.BinaryViewAvaticaParameterConverter;
 import org.apache.arrow.driver.jdbc.converter.impl.BoolAvaticaParameterConverter;
 import org.apache.arrow.driver.jdbc.converter.impl.DateAvaticaParameterConverter;
 import org.apache.arrow.driver.jdbc.converter.impl.DecimalAvaticaParameterConverter;
@@ -40,6 +41,7 @@ import org.apache.arrow.driver.jdbc.converter.impl.TimestampAvaticaParameterConv
 import org.apache.arrow.driver.jdbc.converter.impl.UnionAvaticaParameterConverter;
 import org.apache.arrow.driver.jdbc.converter.impl.Utf8AvaticaParameterConverter;
 import org.apache.arrow.driver.jdbc.converter.impl.UuidAvaticaParameterConverter;
+import org.apache.arrow.driver.jdbc.converter.impl.Utf8ViewAvaticaParameterConverter;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -212,7 +214,7 @@ public class AvaticaParameterBinder {
 
     @Override
     public Boolean visit(ArrowType.Utf8View type) {
-      throw new UnsupportedOperationException("Utf8View is unsupported");
+      return new Utf8ViewAvaticaParameterConverter(type).bindParameter(vector, typedValue, index);
     }
 
     @Override
@@ -227,7 +229,7 @@ public class AvaticaParameterBinder {
 
     @Override
     public Boolean visit(ArrowType.BinaryView type) {
-      throw new UnsupportedOperationException("BinaryView is unsupported");
+      return new BinaryViewAvaticaParameterConverter(type).bindParameter(vector, typedValue, index);
     }
 
     @Override
