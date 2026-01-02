@@ -18,6 +18,7 @@ package org.apache.arrow.flight.grpc;
 
 import com.google.common.base.Throwables;
 import com.google.common.io.ByteStreams;
+import io.grpc.HasByteBuffer;
 import io.grpc.internal.ReadableBuffer;
 import java.io.IOException;
 import java.io.InputStream;

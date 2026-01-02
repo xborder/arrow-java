@@ -22,6 +22,7 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.vector.compression.CompressionCodec;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.message.IpcOption;
 
@@ -53,6 +54,15 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
 
   @Override
   public void start(VectorSchemaRoot root, DictionaryProvider dictionaries, IpcOption option) {
+    start(root, dictionaries, option, null);
+  }
+
+  @Override
+  public void start(
+      VectorSchemaRoot root,
+      DictionaryProvider dictionaries,
+      IpcOption option,
+      CompressionCodec codec) {
     this.option = option;
     try {
       DictionaryUtils.generateSchemaMessages(
@@ -68,7 +78,12 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
       throw new RuntimeException("Could not generate and send all schema messages", e);
     }
     // We include the null count and align buffers to be compatible with Flight/C++
-    unloader = new VectorUnloader(root, /* includeNullCount */ true, /* alignBuffers */ true);
+    if (codec != null) {
+      unloader =
+          new VectorUnloader(root, /* includeNullCount */ true, codec, /* alignBuffers */ true);
+    } else {
+      unloader = new VectorUnloader(root, /* includeNullCount */ true, /* alignBuffers */ true);
+    }
   }
 
   @Override

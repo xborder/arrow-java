@@ -18,6 +18,7 @@ package org.apache.arrow.flight;
 
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.compression.CompressionCodec;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.message.IpcOption;
 
@@ -70,6 +71,26 @@ public interface OutboundStreamListener {
    * <p>This method must be called before all others, except {@link #putMetadata(ArrowBuf)}.
    */
   void start(VectorSchemaRoot root, DictionaryProvider dictionaries, IpcOption option);
+
+  /**
+   * Start sending data, using the schema of the given {@link VectorSchemaRoot} with compression.
+   *
+   * <p>This method must be called before all others, except {@link #putMetadata(ArrowBuf)}.
+   *
+   * @param root The schema root to send.
+   * @param dictionaries The dictionary provider, or null if no dictionaries.
+   * @param option IPC serialization options.
+   * @param codec The compression codec to use for compressing record batches, or null for no
+   *     compression.
+   */
+  default void start(
+      VectorSchemaRoot root,
+      DictionaryProvider dictionaries,
+      IpcOption option,
+      CompressionCodec codec) {
+    // Default implementation ignores the codec for backward compatibility
+    start(root, dictionaries, option);
+  }
 
   /**
    * Send the current contents of the associated {@link VectorSchemaRoot}.
