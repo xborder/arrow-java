@@ -267,9 +267,10 @@ public final class MockFlightSqlProducer implements FlightSqlProducer {
       final CallContext callContext,
       final FlightDescriptor flightDescriptor) {
     final String query = commandStatementQuery.getQuery();
-    final Entry<Schema, List<UUID>> queryInfo =
-        Preconditions.checkNotNull(
-            queryResults.get(query), format("Query not registered: <%s>.", query));
+    final Entry<Schema, List<UUID>> queryInfo = queryResults.get(query);
+    if (queryInfo == null) {
+      throw CallStatus.INVALID_ARGUMENT.withDescription("Query not found").toRuntimeException();
+    }
     final List<FlightEndpoint> endpoints =
         queryInfo.getValue().stream()
             .map(TicketConversionUtils::getTicketBytesFromUuid)

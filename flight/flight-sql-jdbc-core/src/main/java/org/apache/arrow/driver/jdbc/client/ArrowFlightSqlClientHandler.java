@@ -341,10 +341,14 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
     LOGGER.debug("Suppressed error {}", operationDescription, fre);
   }
 
-  /** A prepared statement handler. */
-  public interface PreparedStatement extends AutoCloseable {
+  /**
+   * Represents a statement execution that can be either a simple one-time statement or a prepared
+   * statement. This abstraction allows the JDBC driver to use the appropriate Flight SQL protocol
+   * commands based on how the statement was created.
+   */
+  public interface StatementExecution extends AutoCloseable {
     /**
-     * Executes this {@link PreparedStatement}.
+     * Executes this statement as a query.
      *
      * @return the {@link FlightInfo} representing the outcome of this query execution.
      * @throws SQLException on error.
@@ -352,37 +356,55 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
     FlightInfo executeQuery() throws SQLException;
 
     /**
-     * Executes a {@link StatementType#UPDATE} query.
+     * Executes this statement as an update.
      *
      * @return the number of rows affected.
      */
     long executeUpdate();
 
     /**
-     * Gets the {@link StatementType} of this {@link PreparedStatement}.
+     * Gets the {@link StatementType} of this statement.
      *
      * @return the Statement Type.
      */
     StatementType getType();
 
     /**
-     * Gets the {@link Schema} of this {@link PreparedStatement}.
+     * Gets the {@link Schema} of the result set for this statement.
      *
-     * @return {@link Schema}.
+     * @return {@link Schema}, or null if not available before execution.
      */
     Schema getDataSetSchema();
 
     /**
-     * Gets the {@link Schema} of the parameters for this {@link PreparedStatement}.
+     * Gets the {@link Schema} of the parameters for this statement.
      *
-     * @return {@link Schema}.
+     * @return {@link Schema}, or an empty schema if no parameters.
      */
     Schema getParameterSchema();
 
+    /**
+     * Sets the parameters for this statement execution.
+     *
+     * @param parameters the parameter values.
+     */
     void setParameters(VectorSchemaRoot parameters);
+
+    /**
+     * Returns whether this is a prepared statement that requires server-side cleanup.
+     *
+     * @return true if this is a prepared statement, false for simple statements.
+     */
+    boolean isPreparedStatement();
 
     @Override
     void close();
+  }
+
+  /** A prepared statement handler. */
+  public interface PreparedStatement extends StatementExecution {
+    // PreparedStatement extends StatementExecution with no additional methods.
+    // This interface is kept for backward compatibility.
   }
 
   /** A connection is created with catalog set as a session option. */
@@ -412,6 +434,9 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
 
   /**
    * Creates a new {@link PreparedStatement} for the given {@code query}.
+   *
+   * <p>This method sends a CreatePreparedStatement action to the server and should be used when the
+   * application explicitly creates a PreparedStatement via {@code Connection.prepareStatement()}.
    *
    * @param query the SQL query.
    * @return a new prepared statement.
@@ -452,6 +477,11 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
       }
 
       @Override
+      public boolean isPreparedStatement() {
+        return true;
+      }
+
+      @Override
       public void close() {
         try {
           preparedStatement.close(getOptions());
@@ -460,6 +490,107 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
         }
       }
     };
+  }
+
+  /**
+   * Creates a {@link StatementExecution} for a simple one-time statement execution.
+   *
+   * <p>This method uses CommandStatementQuery for SELECT queries and CommandStatementUpdate for
+   * UPDATE/INSERT/DELETE queries, avoiding the overhead of CreatePreparedStatement and
+   * ClosePreparedStatement actions. This is more efficient for one-time statement executions via
+   * the JDBC Statement API.
+   *
+   * @param query the SQL query.
+   * @return a statement execution for the query.
+   */
+  public StatementExecution executeSimple(final String query) {
+    return new SimpleStatementExecution(query);
+  }
+
+  /**
+   * Implementation of {@link StatementExecution} for simple one-time statements. Uses
+   * CommandStatementQuery and CommandStatementUpdate instead of prepared statements.
+   */
+  private class SimpleStatementExecution implements StatementExecution {
+    private final String query;
+    private FlightInfo flightInfo;
+    private Schema resultSchema;
+    private boolean executed = false;
+
+    SimpleStatementExecution(String query) {
+      this.query = query;
+    }
+
+    @Override
+    public FlightInfo executeQuery() throws SQLException {
+      if (!executed) {
+        flightInfo = sqlClient.execute(query, getOptions());
+        resultSchema = flightInfo.getSchema();
+        executed = true;
+      }
+      return flightInfo;
+    }
+
+    @Override
+    public long executeUpdate() {
+      return sqlClient.executeUpdate(query, getOptions());
+    }
+
+    @Override
+    public StatementType getType() {
+      // For simple statements, we don't know the type until we execute.
+      // We'll determine this based on whether the query looks like an UPDATE.
+      // This is a heuristic; the actual type will be determined by the server.
+      // We default to SELECT because:
+      // 1. SELECT queries are more common
+      // 2. If we incorrectly classify an UPDATE as a SELECT, the server will handle it
+      // 3. If we incorrectly classify a SELECT as an UPDATE, the server may fail
+      String trimmedQuery = query.trim().toUpperCase();
+      if (trimmedQuery.startsWith("INSERT")
+          || trimmedQuery.startsWith("UPDATE")
+          || trimmedQuery.startsWith("DELETE")
+          || trimmedQuery.startsWith("CREATE")
+          || trimmedQuery.startsWith("DROP")
+          || trimmedQuery.startsWith("ALTER")
+          || trimmedQuery.startsWith("TRUNCATE")
+          || trimmedQuery.startsWith("MERGE")
+          || trimmedQuery.startsWith("UPSERT")
+          || trimmedQuery.startsWith("GRANT")
+          || trimmedQuery.startsWith("REVOKE")
+          || trimmedQuery.startsWith("SET")
+          || trimmedQuery.startsWith("CALL")
+          || trimmedQuery.startsWith("EXECUTE")) {
+        return StatementType.UPDATE;
+      }
+      return StatementType.SELECT;
+    }
+
+    @Override
+    public Schema getDataSetSchema() {
+      // Schema is only available after execution for simple statements
+      return resultSchema;
+    }
+
+    @Override
+    public Schema getParameterSchema() {
+      // Simple statements don't support parameters
+      return new Schema(java.util.Collections.emptyList());
+    }
+
+    @Override
+    public void setParameters(VectorSchemaRoot parameters) {
+      // Simple statements don't support parameters - this is a no-op
+    }
+
+    @Override
+    public boolean isPreparedStatement() {
+      return false;
+    }
+
+    @Override
+    public void close() {
+      // No server-side cleanup needed for simple statements
+    }
   }
 
   /**

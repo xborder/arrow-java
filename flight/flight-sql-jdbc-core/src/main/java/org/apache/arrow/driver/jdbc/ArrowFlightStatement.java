@@ -17,7 +17,7 @@
 package org.apache.arrow.driver.jdbc;
 
 import java.sql.SQLException;
-import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
+import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.StatementExecution;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -44,18 +44,34 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
 
   @Override
   public FlightInfo executeFlightInfoQuery() throws SQLException {
-    final PreparedStatement preparedStatement =
-        getConnection().getMeta().getPreparedStatement(handle);
     final Meta.Signature signature = getSignature();
     if (signature == null) {
       return null;
     }
 
-    final Schema resultSetSchema = preparedStatement.getDataSetSchema();
-    signature.columns.addAll(
-        ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
-    setSignature(signature);
+    final StatementExecution statementExecution =
+        getConnection().getMeta().getStatementExecution(handle);
+    // For metadata queries that return empty result sets (e.g., getAttributes,
+    // getBestRowIdentifier),
+    // the statement execution is not stored in the map because they go through MetaImpl's
+    // createEmptyResultSet which doesn't call prepareAndExecute. In this case, return null
+    // to indicate there's no FlightInfo to fetch.
+    if (statementExecution == null) {
+      return null;
+    }
 
-    return preparedStatement.executeQuery();
+    // Execute the query to get FlightInfo
+    final FlightInfo flightInfo = statementExecution.executeQuery();
+
+    // Update signature with schema from FlightInfo (for simple statements, schema is only
+    // available after execution)
+    final Schema resultSetSchema = flightInfo.getSchema();
+    if (resultSetSchema != null) {
+      signature.columns.addAll(
+          ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
+      setSignature(signature);
+    }
+
+    return flightInfo;
   }
 }

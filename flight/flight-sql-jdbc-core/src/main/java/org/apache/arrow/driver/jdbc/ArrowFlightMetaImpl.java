@@ -18,13 +18,13 @@ package org.apache.arrow.driver.jdbc;
 
 import java.sql.Connection;
 import java.sql.SQLException;
-import java.sql.SQLTimeoutException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
+import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.StatementExecution;
 import org.apache.arrow.driver.jdbc.utils.AvaticaParameterBinder;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.util.Preconditions;
@@ -39,7 +39,7 @@ import org.apache.calcite.avatica.remote.TypedValue;
 
 /** Metadata handler for Arrow Flight. */
 public class ArrowFlightMetaImpl extends MetaImpl {
-  private final Map<StatementHandleKey, PreparedStatement> statementHandlePreparedStatementMap;
+  private final Map<StatementHandleKey, StatementExecution> statementExecutionMap;
 
   /**
    * Constructs a {@link MetaImpl} object specific for Arrow Flight.
@@ -48,7 +48,7 @@ public class ArrowFlightMetaImpl extends MetaImpl {
    */
   public ArrowFlightMetaImpl(final AvaticaConnection connection) {
     super(connection);
-    this.statementHandlePreparedStatementMap = new ConcurrentHashMap<>();
+    this.statementExecutionMap = new ConcurrentHashMap<>();
     setDefaultConnectionProperties();
   }
 
@@ -77,12 +77,13 @@ public class ArrowFlightMetaImpl extends MetaImpl {
 
   @Override
   public void closeStatement(final StatementHandle statementHandle) {
-    PreparedStatement preparedStatement =
-        statementHandlePreparedStatementMap.remove(new StatementHandleKey(statementHandle));
-    // Testing if the prepared statement was created because the statement can be not created until
-    // this moment
-    if (preparedStatement != null) {
-      preparedStatement.close();
+    StatementExecution statementExecution =
+        statementExecutionMap.remove(new StatementHandleKey(statementHandle));
+    // Close the statement execution if it exists.
+    // For simple statements, close() is a no-op.
+    // For prepared statements, close() sends ClosePreparedStatement to the server.
+    if (statementExecution != null) {
+      statementExecution.close();
     }
   }
 
@@ -98,20 +99,24 @@ public class ArrowFlightMetaImpl extends MetaImpl {
       final long maxRowCount) {
     Preconditions.checkArgument(
         connection.id.equals(statementHandle.connectionId), "Connection IDs are not consistent");
-    PreparedStatement preparedStatement = getPreparedStatement(statementHandle);
+    StatementExecution statementExecution = getStatementExecution(statementHandle);
 
-    if (preparedStatement == null) {
-      throw new IllegalStateException("Prepared statement not found: " + statementHandle);
+    if (statementExecution == null) {
+      throw new IllegalStateException("Statement execution not found: " + statementHandle);
     }
 
-    new AvaticaParameterBinder(
-            preparedStatement, ((ArrowFlightConnection) connection).getBufferAllocator())
-        .bind(typedValues);
+    // Only bind parameters for prepared statements (simple statements don't support parameters)
+    if (statementExecution.isPreparedStatement() && typedValues != null && !typedValues.isEmpty()) {
+      new AvaticaParameterBinder(
+              (PreparedStatement) statementExecution,
+              ((ArrowFlightConnection) connection).getBufferAllocator())
+          .bind(typedValues);
+    }
 
     if (statementHandle.signature == null
         || statementHandle.signature.statementType == StatementType.IS_DML) {
       // Update query
-      long updatedCount = preparedStatement.executeUpdate();
+      long updatedCount = statementExecution.executeUpdate();
       return new ExecuteResult(
           Collections.singletonList(
               MetaResultSet.count(statementHandle.connectionId, statementHandle.id, updatedCount)));
@@ -142,21 +147,27 @@ public class ArrowFlightMetaImpl extends MetaImpl {
       throws IllegalStateException {
     Preconditions.checkArgument(
         connection.id.equals(statementHandle.connectionId), "Connection IDs are not consistent");
-    PreparedStatement preparedStatement = getPreparedStatement(statementHandle);
+    StatementExecution statementExecution = getStatementExecution(statementHandle);
 
-    if (preparedStatement == null) {
-      throw new IllegalStateException("Prepared statement not found: " + statementHandle);
+    if (statementExecution == null) {
+      throw new IllegalStateException("Statement execution not found: " + statementHandle);
+    }
+
+    // Batch execution requires a prepared statement for parameter binding
+    if (!statementExecution.isPreparedStatement()) {
+      throw new IllegalStateException("Batch execution requires a prepared statement");
     }
 
     final AvaticaParameterBinder binder =
         new AvaticaParameterBinder(
-            preparedStatement, ((ArrowFlightConnection) connection).getBufferAllocator());
+            (PreparedStatement) statementExecution,
+            ((ArrowFlightConnection) connection).getBufferAllocator());
     for (int i = 0; i < parameterValuesList.size(); i++) {
       binder.bind(parameterValuesList.get(i), i);
     }
 
     // Update query
-    long[] updatedCounts = {preparedStatement.executeUpdate()};
+    long[] updatedCounts = {statementExecution.executeUpdate()};
     return new ExecuteBatchResult(updatedCounts);
   }
 
@@ -172,14 +183,49 @@ public class ArrowFlightMetaImpl extends MetaImpl {
         String.format("%s does not use frames.", this), AvaticaConnection.HELPER.unsupported());
   }
 
+  /**
+   * Creates a server-side prepared statement for the given query. This method sends a
+   * CreatePreparedStatement action to the server and should be used when the application explicitly
+   * creates a PreparedStatement via {@code Connection.prepareStatement()}.
+   */
   private PreparedStatement prepareForHandle(final String query, StatementHandle handle) {
     final PreparedStatement preparedStatement =
         ((ArrowFlightConnection) connection).getClientHandler().prepare(query);
     handle.signature =
         newSignature(
             query, preparedStatement.getDataSetSchema(), preparedStatement.getParameterSchema());
-    statementHandlePreparedStatementMap.put(new StatementHandleKey(handle), preparedStatement);
+    statementExecutionMap.put(new StatementHandleKey(handle), preparedStatement);
     return preparedStatement;
+  }
+
+  /**
+   * Creates a simple statement execution for the given query. This method uses
+   * CommandStatementQuery/CommandStatementUpdate instead of creating a server-side prepared
+   * statement, which is more efficient for one-time statement executions.
+   */
+  private StatementExecution executeSimpleForHandle(final String query, StatementHandle handle) {
+    final StatementExecution statementExecution =
+        ((ArrowFlightConnection) connection).getClientHandler().executeSimple(query);
+    // For simple statements, we create a signature based on the statement type heuristic.
+    // The actual schema will be populated after execution.
+    handle.signature = newSignatureForSimpleStatement(query, statementExecution.getType());
+    statementExecutionMap.put(new StatementHandleKey(handle), statementExecution);
+    return statementExecution;
+  }
+
+  /**
+   * Creates a signature for a simple statement. Unlike prepared statements, simple statements don't
+   * have schema information until after execution, so we use a heuristic to determine the statement
+   * type.
+   */
+  private static Signature newSignatureForSimpleStatement(String sql, StatementType statementType) {
+    return new Signature(
+        new ArrayList<>(), // columns will be populated after execution
+        sql,
+        new ArrayList<>(), // simple statements don't support parameters
+        Collections.emptyMap(),
+        null, // unnecessary, as SQL requests use ArrowFlightJdbcCursor
+        statementType);
   }
 
   @Override
@@ -209,27 +255,26 @@ public class ArrowFlightMetaImpl extends MetaImpl {
       final int maxRowsInFirstFrame,
       final PrepareCallback callback)
       throws NoSuchStatementException {
-    try {
-      PreparedStatement preparedStatement = prepareForHandle(query, handle);
-      final StatementType statementType = preparedStatement.getType();
+    // Use simple statement execution (CommandStatementQuery/CommandStatementUpdate)
+    // instead of creating a server-side prepared statement.
+    // This avoids unnecessary CreatePreparedStatement and ClosePreparedStatement calls.
+    StatementExecution statementExecution = executeSimpleForHandle(query, handle);
+    final StatementType statementType = statementExecution.getType();
 
-      final long updateCount =
-          statementType.equals(StatementType.UPDATE) ? preparedStatement.executeUpdate() : -1;
+    final long updateCount =
+        statementType.equals(StatementType.UPDATE) ? statementExecution.executeUpdate() : -1;
+    try {
       synchronized (callback.getMonitor()) {
         callback.clear();
         callback.assign(handle.signature, null, updateCount);
       }
       callback.execute();
-      final MetaResultSet metaResultSet =
-          MetaResultSet.create(handle.connectionId, handle.id, false, handle.signature, null);
-      return new ExecuteResult(Collections.singletonList(metaResultSet));
-    } catch (SQLTimeoutException e) {
-      // So far AvaticaStatement(executeInternal) only handles NoSuchStatement and Runtime
-      // Exceptions.
-      throw new RuntimeException(e);
     } catch (SQLException e) {
-      throw new NoSuchStatementException(handle);
+      throw new RuntimeException(e);
     }
+    final MetaResultSet metaResultSet =
+        MetaResultSet.create(handle.connectionId, handle.id, false, handle.signature, null);
+    return new ExecuteResult(Collections.singletonList(metaResultSet));
   }
 
   @Override
@@ -264,8 +309,32 @@ public class ArrowFlightMetaImpl extends MetaImpl {
         .setTransactionIsolation(Connection.TRANSACTION_NONE);
   }
 
+  /**
+   * Gets the statement execution for the given statement handle.
+   *
+   * @param statementHandle the statement handle.
+   * @return the statement execution, or null if not found.
+   */
+  StatementExecution getStatementExecution(StatementHandle statementHandle) {
+    return statementExecutionMap.get(new StatementHandleKey(statementHandle));
+  }
+
+  /**
+   * Gets the prepared statement for the given statement handle. This method is used by
+   * ArrowFlightStatement to access the prepared statement for query execution.
+   *
+   * @param statementHandle the statement handle.
+   * @return the prepared statement, or null if not found or if it's a simple statement.
+   * @deprecated Use {@link #getStatementExecution(StatementHandle)} instead.
+   */
+  @Deprecated
   PreparedStatement getPreparedStatement(StatementHandle statementHandle) {
-    return statementHandlePreparedStatementMap.get(new StatementHandleKey(statementHandle));
+    StatementExecution execution =
+        statementExecutionMap.get(new StatementHandleKey(statementHandle));
+    if (execution instanceof PreparedStatement) {
+      return (PreparedStatement) execution;
+    }
+    return null;
   }
 
   // Helper used to look up prepared statement instances later. Avatica doesn't give us the
