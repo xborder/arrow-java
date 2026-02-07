@@ -24,9 +24,13 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
 import org.apache.arrow.driver.jdbc.utils.AvaticaParameterBinder;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
+import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
+import org.apache.arrow.flight.FlightStatusCode;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.calcite.avatica.AvaticaConnection;
@@ -39,7 +43,15 @@ import org.apache.calcite.avatica.remote.TypedValue;
 
 /** Metadata handler for Arrow Flight. */
 public class ArrowFlightMetaImpl extends MetaImpl {
+  enum StatementExecutionMode {
+    QUERY_ONLY,
+    UPDATE_ONLY,
+    QUERY_WITH_FALLBACK
+  }
+
   private final Map<StatementHandleKey, PreparedStatement> statementHandlePreparedStatementMap;
+  private final Map<StatementHandleKey, FlightInfo> statementHandleFlightInfoMap;
+  private final Map<StatementHandleKey, StatementExecutionMode> statementHandleExecutionModeMap;
 
   /**
    * Constructs a {@link MetaImpl} object specific for Arrow Flight.
@@ -49,11 +61,26 @@ public class ArrowFlightMetaImpl extends MetaImpl {
   public ArrowFlightMetaImpl(final AvaticaConnection connection) {
     super(connection);
     this.statementHandlePreparedStatementMap = new ConcurrentHashMap<>();
+    this.statementHandleFlightInfoMap = new ConcurrentHashMap<>();
+    this.statementHandleExecutionModeMap = new ConcurrentHashMap<>();
     setDefaultConnectionProperties();
   }
 
   /** Construct a signature. */
   static Signature newSignature(final String sql, Schema resultSetSchema, Schema parameterSchema) {
+    StatementType statementType =
+        resultSetSchema == null || resultSetSchema.getFields().isEmpty()
+            ? StatementType.IS_DML
+            : StatementType.SELECT;
+    return newSignature(sql, resultSetSchema, parameterSchema, statementType);
+  }
+
+  /** Construct a signature with an explicit statement type. */
+  static Signature newSignature(
+      final String sql,
+      Schema resultSetSchema,
+      Schema parameterSchema,
+      StatementType statementType) {
     List<ColumnMetaData> columnMetaData =
         resultSetSchema == null
             ? new ArrayList<>()
@@ -62,10 +89,6 @@ public class ArrowFlightMetaImpl extends MetaImpl {
         parameterSchema == null
             ? new ArrayList<>()
             : ConvertUtils.convertArrowFieldsToAvaticaParameters(parameterSchema.getFields());
-    StatementType statementType =
-        resultSetSchema == null || resultSetSchema.getFields().isEmpty()
-            ? StatementType.IS_DML
-            : StatementType.SELECT;
     return new Signature(
         columnMetaData,
         sql,
@@ -79,6 +102,8 @@ public class ArrowFlightMetaImpl extends MetaImpl {
   public void closeStatement(final StatementHandle statementHandle) {
     PreparedStatement preparedStatement =
         statementHandlePreparedStatementMap.remove(new StatementHandleKey(statementHandle));
+    statementHandleFlightInfoMap.remove(new StatementHandleKey(statementHandle));
+    statementHandleExecutionModeMap.remove(new StatementHandleKey(statementHandle));
     // Testing if the prepared statement was created because the statement can be
     // not created until
     // this moment
@@ -211,11 +236,52 @@ public class ArrowFlightMetaImpl extends MetaImpl {
       final PrepareCallback callback)
       throws NoSuchStatementException {
     try {
-      PreparedStatement preparedStatement = prepareForHandle(query, handle);
-      final StatementType statementType = preparedStatement.getType();
+      final ArrowFlightConnection flightConnection = (ArrowFlightConnection) connection;
+      final ArrowFlightSqlClientHandler clientHandler = flightConnection.getClientHandler();
 
-      final long updateCount =
-          statementType.equals(StatementType.UPDATE) ? preparedStatement.executeUpdate() : -1;
+      Schema resultSetSchema = null;
+      FlightInfo statementFlightInfo = null;
+      StatementType statementType;
+      long updateCount = -1;
+      FlightRuntimeException updateFallbackException = null;
+      final StatementExecutionMode executionMode = getStatementExecutionMode(handle);
+
+      if (executionMode == StatementExecutionMode.UPDATE_ONLY) {
+        statementType = StatementType.IS_DML;
+      } else {
+        try {
+          statementFlightInfo = clientHandler.getInfo(query);
+          resultSetSchema = statementFlightInfo.getSchemaOptional().orElse(null);
+          statementType = StatementType.SELECT;
+        } catch (FlightRuntimeException infoException) {
+          if (executionMode == StatementExecutionMode.QUERY_ONLY) {
+            throw infoException;
+          }
+          if (shouldFallbackToUpdate(infoException)) {
+            statementType = StatementType.IS_DML;
+            updateFallbackException = infoException;
+          } else {
+            throw infoException;
+          }
+        }
+      }
+
+      if (statementType == StatementType.IS_DML) {
+        try {
+          updateCount = clientHandler.executeUpdate(query);
+        } catch (FlightRuntimeException updateException) {
+          if (updateFallbackException != null) {
+            updateFallbackException.addSuppressed(updateException);
+            throw updateFallbackException;
+          }
+          throw updateException;
+        }
+      }
+
+      handle.signature = newSignature(query, resultSetSchema, null, statementType);
+      if (statementFlightInfo != null) {
+        statementHandleFlightInfoMap.put(new StatementHandleKey(handle), statementFlightInfo);
+      }
       synchronized (callback.getMonitor()) {
         callback.clear();
         callback.assign(handle.signature, null, updateCount);
@@ -282,6 +348,37 @@ public class ArrowFlightMetaImpl extends MetaImpl {
 
   PreparedStatement getPreparedStatement(StatementHandle statementHandle) {
     return statementHandlePreparedStatementMap.get(new StatementHandleKey(statementHandle));
+  }
+
+  void setStatementExecutionMode(StatementHandle statementHandle, StatementExecutionMode mode) {
+    statementHandleExecutionModeMap.put(new StatementHandleKey(statementHandle), mode);
+  }
+
+  void clearStatementExecutionMode(StatementHandle statementHandle) {
+    statementHandleExecutionModeMap.remove(new StatementHandleKey(statementHandle));
+  }
+
+  FlightInfo removeStatementFlightInfo(StatementHandle statementHandle) {
+    return statementHandleFlightInfoMap.remove(new StatementHandleKey(statementHandle));
+  }
+
+  private StatementExecutionMode getStatementExecutionMode(StatementHandle statementHandle) {
+    final StatementExecutionMode mode =
+        statementHandleExecutionModeMap.get(new StatementHandleKey(statementHandle));
+    return mode == null ? StatementExecutionMode.QUERY_WITH_FALLBACK : mode;
+  }
+
+  private boolean shouldFallbackToUpdate(FlightRuntimeException exception) {
+    final FlightStatusCode code = exception.status().code();
+    if (code == FlightStatusCode.INVALID_ARGUMENT || code == FlightStatusCode.UNIMPLEMENTED) {
+      return true;
+    }
+    if (code == FlightStatusCode.INTERNAL) {
+      final String message = exception.getMessage();
+      return message != null
+          && (message.contains("Query not registered") || message.contains("Query not found"));
+    }
+    return false;
   }
 
   // Helper used to look up prepared statement instances later. Avatica doesn't

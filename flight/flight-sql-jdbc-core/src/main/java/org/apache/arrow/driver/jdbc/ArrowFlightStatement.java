@@ -16,6 +16,7 @@
  */
 package org.apache.arrow.driver.jdbc;
 
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
@@ -43,19 +44,69 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   }
 
   @Override
+  public ResultSet executeQuery(final String sql) throws SQLException {
+    final ArrowFlightMetaImpl meta = getConnection().getMeta();
+    meta.setStatementExecutionMode(handle, ArrowFlightMetaImpl.StatementExecutionMode.QUERY_ONLY);
+    try {
+      return super.executeQuery(sql);
+    } finally {
+      meta.clearStatementExecutionMode(handle);
+    }
+  }
+
+  @Override
+  public boolean execute(final String sql) throws SQLException {
+    final ArrowFlightMetaImpl meta = getConnection().getMeta();
+    meta.setStatementExecutionMode(
+        handle, ArrowFlightMetaImpl.StatementExecutionMode.QUERY_WITH_FALLBACK);
+    try {
+      return super.execute(sql);
+    } finally {
+      meta.clearStatementExecutionMode(handle);
+    }
+  }
+
+  @Override
+  public long executeLargeUpdate(final String sql) throws SQLException {
+    final ArrowFlightMetaImpl meta = getConnection().getMeta();
+    meta.setStatementExecutionMode(handle, ArrowFlightMetaImpl.StatementExecutionMode.UPDATE_ONLY);
+    try {
+      return super.executeLargeUpdate(sql);
+    } finally {
+      meta.clearStatementExecutionMode(handle);
+    }
+  }
+
+  @Override
   public FlightInfo executeFlightInfoQuery() throws SQLException {
-    final PreparedStatement preparedStatement =
-        getConnection().getMeta().getPreparedStatement(handle);
     final Meta.Signature signature = getSignature();
     if (signature == null) {
       return null;
     }
 
-    final Schema resultSetSchema = preparedStatement.getDataSetSchema();
-    signature.columns.addAll(
-        ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
-    setSignature(signature);
+    final ArrowFlightMetaImpl meta = getConnection().getMeta();
+    final PreparedStatement preparedStatement = meta.getPreparedStatement(handle);
+    final Schema resultSetSchema;
+    final FlightInfo flightInfo;
 
-    return preparedStatement.executeQuery();
+    if (preparedStatement != null) {
+      resultSetSchema = preparedStatement.getDataSetSchema();
+      flightInfo = preparedStatement.executeQuery();
+    } else {
+      final FlightInfo cachedFlightInfo = meta.removeStatementFlightInfo(handle);
+      flightInfo =
+          cachedFlightInfo != null
+              ? cachedFlightInfo
+              : getConnection().getClientHandler().getInfo(signature.sql);
+      resultSetSchema = flightInfo.getSchemaOptional().orElse(null);
+    }
+
+    if (resultSetSchema != null && signature.columns.isEmpty()) {
+      signature.columns.addAll(
+          ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
+      setSignature(signature);
+    }
+
+    return flightInfo;
   }
 }
