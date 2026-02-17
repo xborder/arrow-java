@@ -19,6 +19,7 @@ package org.apache.arrow.driver.jdbc;
 import static org.apache.arrow.driver.jdbc.utils.ArrowFlightConnectionConfigImpl.ArrowFlightConnectionProperty.replaceSemiColons;
 
 import io.netty.util.concurrent.DefaultThreadFactory;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -35,7 +36,9 @@ import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
 import org.apache.calcite.avatica.AvaticaConnection;
 import org.apache.calcite.avatica.AvaticaFactory;
+import org.apache.calcite.avatica.AvaticaStatement;
 import org.apache.calcite.avatica.DriverVersion;
+import org.apache.calcite.avatica.Meta;
 
 /** Connection to the Arrow Flight server. */
 public final class ArrowFlightConnection extends AvaticaConnection {
@@ -163,6 +166,11 @@ public final class ArrowFlightConnection extends AvaticaConnection {
    */
   ArrowFlightSqlClientHandler getClientHandler() {
     return clientHandler;
+  }
+
+  ResultSet executeQueryInternal(AvaticaStatement statement, Meta.Signature signature)
+      throws SQLException {
+    return super.executeQueryInternal(statement, signature, null, null, false);
   }
 
   /**

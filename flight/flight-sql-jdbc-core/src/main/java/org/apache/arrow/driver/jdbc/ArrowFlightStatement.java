@@ -18,16 +18,21 @@ package org.apache.arrow.driver.jdbc;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.calcite.avatica.AvaticaConnection;
+import org.apache.calcite.avatica.AvaticaResultSet;
 import org.apache.calcite.avatica.AvaticaStatement;
 import org.apache.calcite.avatica.Meta;
 import org.apache.calcite.avatica.Meta.StatementHandle;
 
 /** A SQL statement for querying data from an Arrow Flight server. */
 public class ArrowFlightStatement extends AvaticaStatement implements ArrowFlightInfoStatement {
+  private FlightInfo cachedStatementFlightInfo;
 
   ArrowFlightStatement(
       final ArrowFlightConnection connection,
@@ -45,36 +50,22 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
 
   @Override
   public ResultSet executeQuery(final String sql) throws SQLException {
-    final ArrowFlightMetaImpl meta = getConnection().getMeta();
-    meta.setStatementExecutionMode(handle, ArrowFlightMetaImpl.StatementExecutionMode.QUERY_ONLY);
     try {
-      return super.executeQuery(sql);
-    } finally {
-      meta.clearStatementExecutionMode(handle);
+      return executeStatementQuery(sql);
+    } catch (FlightRuntimeException exception) {
+      throw toSqlException(sql, exception);
     }
   }
 
   @Override
   public boolean execute(final String sql) throws SQLException {
-    final ArrowFlightMetaImpl meta = getConnection().getMeta();
-    meta.setStatementExecutionMode(
-        handle, ArrowFlightMetaImpl.StatementExecutionMode.QUERY_WITH_FALLBACK);
-    try {
-      return super.execute(sql);
-    } finally {
-      meta.clearStatementExecutionMode(handle);
-    }
+    cachedStatementFlightInfo = null;
+    return super.execute(sql);
   }
 
   @Override
   public long executeLargeUpdate(final String sql) throws SQLException {
-    final ArrowFlightMetaImpl meta = getConnection().getMeta();
-    meta.setStatementExecutionMode(handle, ArrowFlightMetaImpl.StatementExecutionMode.UPDATE_ONLY);
-    try {
-      return super.executeLargeUpdate(sql);
-    } finally {
-      meta.clearStatementExecutionMode(handle);
-    }
+    return executeStatementUpdate(sql, null);
   }
 
   @Override
@@ -93,7 +84,8 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
       resultSetSchema = preparedStatement.getDataSetSchema();
       flightInfo = preparedStatement.executeQuery();
     } else {
-      final FlightInfo cachedFlightInfo = meta.removeStatementFlightInfo(handle);
+      final FlightInfo cachedFlightInfo = cachedStatementFlightInfo;
+      cachedStatementFlightInfo = null;
       flightInfo =
           cachedFlightInfo != null
               ? cachedFlightInfo
@@ -108,5 +100,65 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     }
 
     return flightInfo;
+  }
+
+  private ResultSet executeStatementQuery(final String sql) throws SQLException {
+    cachedStatementFlightInfo = null;
+    closeOpenResultSet();
+    final ArrowFlightSqlClientHandler clientHandler = getConnection().getClientHandler();
+    final FlightInfo flightInfo = clientHandler.getInfo(sql);
+    cachedStatementFlightInfo = flightInfo;
+
+    final Schema resultSetSchema = flightInfo.getSchemaOptional().orElse(null);
+    final Meta.Signature signature =
+        ArrowFlightMetaImpl.newSignature(sql, resultSetSchema, null, Meta.StatementType.SELECT);
+    setSignature(signature);
+    updateCount = -1;
+
+    try {
+      return getConnection().executeQueryInternal(this, signature);
+    } catch (SQLException exception) {
+      cachedStatementFlightInfo = null;
+      throw exception;
+    }
+  }
+
+  private long executeStatementUpdate(final String sql, FlightRuntimeException queryException)
+      throws SQLException {
+    cachedStatementFlightInfo = null;
+    closeOpenResultSet();
+    final ArrowFlightSqlClientHandler clientHandler = getConnection().getClientHandler();
+    try {
+      final long count = clientHandler.executeUpdate(sql);
+      updateCount = count;
+      setSignature(
+          ArrowFlightMetaImpl.newSignature(sql, null, null, Meta.StatementType.IS_DML));
+      return count;
+    } catch (FlightRuntimeException updateException) {
+      if (queryException != null) {
+        queryException.addSuppressed(updateException);
+        throw toSqlException(sql, queryException);
+      }
+      throw toSqlException(sql, updateException);
+    }
+  }
+
+  private void closeOpenResultSet() throws SQLException {
+    if (openResultSet == null) {
+      return;
+    }
+    final AvaticaResultSet resultSet = openResultSet;
+    openResultSet = null;
+    try {
+      resultSet.close();
+    } catch (Exception exception) {
+      throw AvaticaConnection.HELPER.createException(
+          "Error while closing previous result set", exception);
+    }
+  }
+
+  private SQLException toSqlException(String sql, RuntimeException exception) {
+    return AvaticaConnection.HELPER.createException(
+        "Error while executing SQL \"" + sql + "\": " + exception.getMessage(), exception);
   }
 }

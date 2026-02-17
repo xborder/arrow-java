@@ -85,6 +85,11 @@ public class ArrowFlightJdbcFactory implements AvaticaFactory {
     ArrowFlightSqlClientHandler.PreparedStatement preparedStatement =
         flightConnection.getMeta().getPreparedStatement(statementHandle);
 
+    if (preparedStatement == null) {
+      throw AvaticaConnection.HELPER.createException(
+          "Missing prepared statement for handle " + statementHandle.id);
+    }
+
     return ArrowFlightPreparedStatement.newPreparedStatement(
         flightConnection,
         preparedStatement,

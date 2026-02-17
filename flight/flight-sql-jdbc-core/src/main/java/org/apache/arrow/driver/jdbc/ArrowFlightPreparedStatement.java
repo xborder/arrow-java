@@ -70,7 +70,6 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
 
   @Override
   public synchronized void close() throws SQLException {
-    this.preparedStatement.close();
     super.close();
   }
 
