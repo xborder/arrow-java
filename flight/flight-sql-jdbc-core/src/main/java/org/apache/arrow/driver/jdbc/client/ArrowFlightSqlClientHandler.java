@@ -267,6 +267,16 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
     return sqlClient.execute(query, getOptions());
   }
 
+  /**
+   * Executes an update query.
+   *
+   * @param query The update query.
+   * @return the number of rows affected.
+   */
+  public long executeUpdate(final String query) {
+    return sqlClient.executeUpdate(query, getOptions());
+  }
+
   @Override
   public void close() throws SQLException {
     if (catalog.isPresent()) {
@@ -351,7 +361,53 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
   }
 
   /** A prepared statement handler. */
-  public interface PreparedStatement extends AutoCloseable {
+  public interface SqlStatementHandle extends AutoCloseable {
+    default boolean isPrepared() {
+      return false;
+    }
+
+    default FlightInfo executeQuery(String query) throws SQLException {
+      throw new UnsupportedOperationException("Statement handle does not support direct query");
+    }
+
+    default long executeUpdate(String query) {
+      throw new UnsupportedOperationException("Statement handle does not support direct update");
+    }
+
+    default FlightInfo executeQuery() throws SQLException {
+      throw new UnsupportedOperationException("Statement handle does not support prepared query");
+    }
+
+    default long executeUpdate() {
+      throw new UnsupportedOperationException("Statement handle does not support prepared update");
+    }
+
+    default StatementType getType() {
+      throw new UnsupportedOperationException("Statement handle has no type");
+    }
+
+    default Schema getDataSetSchema() {
+      throw new UnsupportedOperationException("Statement handle has no dataset schema");
+    }
+
+    default Schema getParameterSchema() {
+      throw new UnsupportedOperationException("Statement handle has no parameter schema");
+    }
+
+    default void setParameters(VectorSchemaRoot parameters) {
+      throw new UnsupportedOperationException("Statement handle does not support parameters");
+    }
+
+    @Override
+    void close();
+  }
+
+  /** A prepared statement handler. */
+  public interface PreparedStatement extends SqlStatementHandle {
+    @Override
+    default boolean isPrepared() {
+      return true;
+    }
     /**
      * Executes this {@link PreparedStatement}.
      *
@@ -484,6 +540,27 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
         }
       }
     };
+  }
+
+  public SqlStatementHandle createStatementHandle() {
+    return new DirectStatementHandle();
+  }
+
+  private final class DirectStatementHandle implements SqlStatementHandle {
+    @Override
+    public FlightInfo executeQuery(String query) {
+      return sqlClient.execute(query, getOptions());
+    }
+
+    @Override
+    public long executeUpdate(String query) {
+      return sqlClient.executeUpdate(query, getOptions());
+    }
+
+    @Override
+    public void close() {
+      // no-op for direct statements
+    }
   }
 
   /**

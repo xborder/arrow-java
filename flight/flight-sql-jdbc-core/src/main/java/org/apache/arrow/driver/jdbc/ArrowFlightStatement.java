@@ -16,11 +16,15 @@
  */
 package org.apache.arrow.driver.jdbc;
 
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
+import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.SqlStatementHandle;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.calcite.avatica.AvaticaConnection;
+import org.apache.calcite.avatica.AvaticaResultSet;
 import org.apache.calcite.avatica.AvaticaStatement;
 import org.apache.calcite.avatica.Meta;
 import org.apache.calcite.avatica.Meta.StatementHandle;
@@ -43,19 +47,122 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   }
 
   @Override
+  public ResultSet executeQuery(final String sql) throws SQLException {
+    checkOpen();
+    updateCount = -1;
+    final ArrowFlightConnection connection = getConnection();
+    final ArrowFlightMetaImpl meta = connection.getMeta();
+    meta.ensureDirectStatementHandle(handle);
+    RuntimeException lastException = null;
+
+    for (int i = 0; i < connection.getMaxRetriesPerExecute(); i++) {
+      try {
+        final Meta.Signature signature = ArrowFlightMetaImpl.newStatementSignature(sql);
+        setSignature(signature);
+        return executeQueryInternal(signature, false);
+      } catch (RuntimeException exception) {
+        lastException = exception;
+        final StatementHandle oldHandle = handle;
+        resetStatement();
+        meta.onStatementHandleReset(oldHandle, handle);
+      }
+    }
+
+    if (lastException != null) {
+      throw AvaticaConnection.HELPER.createException(
+          "Error while executing SQL \"" + sql + "\": " + lastException.getMessage(),
+          lastException);
+    }
+    throw AvaticaConnection.HELPER.createException(
+        "Failed to successfully execute query after "
+            + connection.getMaxRetriesPerExecute()
+            + " attempts.");
+  }
+
+  @Override
+  public long executeLargeUpdate(final String sql) throws SQLException {
+    checkOpen();
+    clearOpenResultSet();
+    updateCount = -1;
+
+    final ArrowFlightConnection connection = getConnection();
+    final ArrowFlightMetaImpl meta = connection.getMeta();
+    meta.ensureDirectStatementHandle(handle);
+    RuntimeException lastException = null;
+
+    for (int i = 0; i < connection.getMaxRetriesPerExecute(); i++) {
+      try {
+        final SqlStatementHandle statementHandle = meta.getStatementHandle(handle);
+        if (statementHandle == null) {
+          throw new IllegalStateException("Statement handle not found: " + handle);
+        }
+        final long updatedCount = statementHandle.executeUpdate(sql);
+        setSignature(ArrowFlightMetaImpl.newSignature(sql, null, null));
+        updateCount = updatedCount;
+        return updatedCount;
+      } catch (RuntimeException exception) {
+        lastException = exception;
+        final StatementHandle oldHandle = handle;
+        resetStatement();
+        meta.onStatementHandleReset(oldHandle, handle);
+      }
+    }
+
+    if (lastException != null) {
+      throw AvaticaConnection.HELPER.createException(
+          "Error while executing SQL \"" + sql + "\": " + lastException.getMessage(),
+          lastException);
+    }
+    throw AvaticaConnection.HELPER.createException(
+        "Failed to successfully execute update after "
+            + connection.getMaxRetriesPerExecute()
+            + " attempts.");
+  }
+
+  @Override
   public FlightInfo executeFlightInfoQuery() throws SQLException {
-    final PreparedStatement preparedStatement =
-        getConnection().getMeta().getPreparedStatement(handle);
+    final ArrowFlightConnection connection = getConnection();
+    final ArrowFlightMetaImpl meta = connection.getMeta();
     final Meta.Signature signature = getSignature();
     if (signature == null) {
       return null;
     }
 
-    final Schema resultSetSchema = preparedStatement.getDataSetSchema();
-    signature.columns.addAll(
-        ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
-    setSignature(signature);
+    final SqlStatementHandle statementHandle = meta.getStatementHandle(handle);
+    if (statementHandle != null && statementHandle.isPrepared()) {
+      final PreparedStatement preparedStatement = (PreparedStatement) statementHandle;
+      final Schema resultSetSchema = preparedStatement.getDataSetSchema();
+      signature.columns.addAll(
+          ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
+      setSignature(signature);
+      return preparedStatement.executeQuery();
+    }
 
-    return preparedStatement.executeQuery();
+    final FlightInfo flightInfo =
+        statementHandle != null
+            ? statementHandle.executeQuery(signature.sql)
+            : connection.getClientHandler().getInfo(signature.sql);
+    final Schema resultSetSchema = flightInfo.getSchemaOptional().orElse(null);
+    if (resultSetSchema != null) {
+      signature.columns.addAll(
+          ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
+      setSignature(signature);
+    }
+    return flightInfo;
+  }
+
+  private void clearOpenResultSet() throws SQLException {
+    synchronized (this) {
+      if (openResultSet != null) {
+        final AvaticaResultSet resultSet = openResultSet;
+        openResultSet = null;
+        try {
+          resultSet.close();
+        } catch (Exception exception) {
+          throw AvaticaConnection.HELPER.createException(
+              "Error while closing previous result set", exception);
+        }
+      }
+    }
   }
 }

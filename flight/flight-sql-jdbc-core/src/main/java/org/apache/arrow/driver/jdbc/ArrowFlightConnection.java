@@ -254,6 +254,10 @@ public final class ArrowFlightConnection extends AvaticaConnection {
     return allocator;
   }
 
+  long getMaxRetriesPerExecute() {
+    return maxRetriesPerExecute;
+  }
+
   public ArrowFlightMetaImpl getMeta() {
     return (ArrowFlightMetaImpl) this.meta;
   }
