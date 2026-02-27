@@ -84,6 +84,9 @@ public class ArrowFlightMetaImpl extends MetaImpl {
   public void closeStatement(final StatementHandle statementHandle) {
     SqlStatementHandle statementHandleInstance =
         statementHandleMap.remove(new StatementHandleKey(statementHandle));
+    // Testing if the prepared statement was created because the statement can be
+    // not created until
+    // this moment
     if (statementHandleInstance != null) {
       statementHandleInstance.close();
     }
