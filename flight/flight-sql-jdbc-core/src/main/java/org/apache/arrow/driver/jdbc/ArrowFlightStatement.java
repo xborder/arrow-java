@@ -57,7 +57,7 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
 
     for (int i = 0; i < connection.getMaxRetriesPerExecute(); i++) {
       try {
-        final Meta.Signature signature = ArrowFlightMetaImpl.newStatementSignature(sql);
+        final Meta.Signature signature = ArrowFlightMetaImpl.newSignature(sql);
         setSignature(signature);
         return executeQueryInternal(signature, false);
       } catch (RuntimeException exception) {
@@ -97,7 +97,7 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
           throw new IllegalStateException("Statement handle not found: " + handle);
         }
         final long updatedCount = statementHandle.executeUpdate(sql);
-        setSignature(ArrowFlightMetaImpl.newSignature(sql, null, null));
+        setSignature(ArrowFlightMetaImpl.newSignature(sql));
         updateCount = updatedCount;
         return updatedCount;
       } catch (RuntimeException exception) {
@@ -129,6 +129,9 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     }
 
     final SqlStatementHandle statementHandle = meta.getStatementHandle(handle);
+    // Statement.execute(String) goes through Meta.prepareAndExecute, which stores a prepared
+    // handle even though the JDBC object is still an ArrowFlightStatement. Therefore,
+    // executeFlightInfoQuery must handle both direct and prepared handles here.
     if (statementHandle != null && statementHandle.isPrepared()) {
       final PreparedStatement preparedStatement = (PreparedStatement) statementHandle;
       final Schema resultSetSchema = preparedStatement.getDataSetSchema();

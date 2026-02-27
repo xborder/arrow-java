@@ -76,14 +76,8 @@ public class ArrowFlightMetaImpl extends MetaImpl {
         statementType);
   }
 
-  static Signature newStatementSignature(final String sql) {
-    return new Signature(
-        new ArrayList<>(),
-        sql,
-        new ArrayList<>(),
-        Collections.emptyMap(),
-        null,
-        StatementType.SELECT);
+  static Signature newSignature(final String sql) {
+    return newSignature(sql, null, null);
   }
 
   @Override
