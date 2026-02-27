@@ -50,33 +50,17 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   public ResultSet executeQuery(final String sql) throws SQLException {
     checkOpen();
     updateCount = -1;
-    final ArrowFlightConnection connection = getConnection();
-    final ArrowFlightMetaImpl meta = connection.getMeta();
+    final ArrowFlightMetaImpl meta = getConnection().getMeta();
     meta.ensureDirectStatementHandle(handle);
-    RuntimeException lastException = null;
-
-    for (int i = 0; i < connection.getMaxRetriesPerExecute(); i++) {
-      try {
-        final Meta.Signature signature = ArrowFlightMetaImpl.newSignature(sql);
-        setSignature(signature);
-        return executeQueryInternal(signature, false);
-      } catch (RuntimeException exception) {
-        lastException = exception;
-        final StatementHandle oldHandle = handle;
-        resetStatement();
-        meta.onStatementHandleReset(oldHandle, handle);
-      }
-    }
-
-    if (lastException != null) {
+    try {
+      final Meta.Signature signature = ArrowFlightMetaImpl.newSignature(sql);
+      setSignature(signature);
+      return executeQueryInternal(signature, false);
+    } catch (RuntimeException exception) {
       throw AvaticaConnection.HELPER.createException(
-          "Error while executing SQL \"" + sql + "\": " + lastException.getMessage(),
-          lastException);
+          "Error while executing SQL \"" + sql + "\": " + exception.getMessage(),
+          exception);
     }
-    throw AvaticaConnection.HELPER.createException(
-        "Failed to successfully execute query after "
-            + connection.getMaxRetriesPerExecute()
-            + " attempts.");
   }
 
   @Override
@@ -85,38 +69,22 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     clearOpenResultSet();
     updateCount = -1;
 
-    final ArrowFlightConnection connection = getConnection();
-    final ArrowFlightMetaImpl meta = connection.getMeta();
+    final ArrowFlightMetaImpl meta = getConnection().getMeta();
     meta.ensureDirectStatementHandle(handle);
-    RuntimeException lastException = null;
-
-    for (int i = 0; i < connection.getMaxRetriesPerExecute(); i++) {
-      try {
-        final SqlStatementHandle statementHandle = meta.getStatementHandle(handle);
-        if (statementHandle == null) {
-          throw new IllegalStateException("Statement handle not found: " + handle);
-        }
-        final long updatedCount = statementHandle.executeUpdate(sql);
-        setSignature(ArrowFlightMetaImpl.newSignature(sql));
-        updateCount = updatedCount;
-        return updatedCount;
-      } catch (RuntimeException exception) {
-        lastException = exception;
-        final StatementHandle oldHandle = handle;
-        resetStatement();
-        meta.onStatementHandleReset(oldHandle, handle);
+    try {
+      final SqlStatementHandle statementHandle = meta.getStatementHandle(handle);
+      if (statementHandle == null) {
+        throw new IllegalStateException("Statement handle not found: " + handle);
       }
-    }
-
-    if (lastException != null) {
+      final long updatedCount = statementHandle.executeUpdate(sql);
+      setSignature(ArrowFlightMetaImpl.newSignature(sql));
+      updateCount = updatedCount;
+      return updatedCount;
+    } catch (RuntimeException exception) {
       throw AvaticaConnection.HELPER.createException(
-          "Error while executing SQL \"" + sql + "\": " + lastException.getMessage(),
-          lastException);
+          "Error while executing SQL \"" + sql + "\": " + exception.getMessage(),
+          exception);
     }
-    throw AvaticaConnection.HELPER.createException(
-        "Failed to successfully execute update after "
-            + connection.getMaxRetriesPerExecute()
-            + " attempts.");
   }
 
   @Override
