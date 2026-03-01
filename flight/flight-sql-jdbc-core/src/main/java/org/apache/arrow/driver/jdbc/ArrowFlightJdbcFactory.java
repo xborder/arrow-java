@@ -20,7 +20,7 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.util.Properties;
 import java.util.TimeZone;
-import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler;
+import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.SqlStatement;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.calcite.avatica.AvaticaConnection;
 import org.apache.calcite.avatica.AvaticaFactory;
@@ -82,8 +82,8 @@ public class ArrowFlightJdbcFactory implements AvaticaFactory {
       final int resultSetHoldability)
       throws SQLException {
     final ArrowFlightConnection flightConnection = (ArrowFlightConnection) connection;
-    ArrowFlightSqlClientHandler.PreparedStatement preparedStatement =
-        flightConnection.getMeta().getPreparedStatement(statementHandle);
+    SqlStatement preparedStatement =
+        flightConnection.getMeta().getStatement(statementHandle);
 
     return ArrowFlightPreparedStatement.newPreparedStatement(
         flightConnection,
