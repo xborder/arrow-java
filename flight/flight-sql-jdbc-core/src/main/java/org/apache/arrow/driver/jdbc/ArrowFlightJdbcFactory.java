@@ -22,7 +22,6 @@ import java.util.Properties;
 import java.util.TimeZone;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.SqlStatement;
 import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.util.Preconditions;
 import org.apache.calcite.avatica.AvaticaConnection;
 import org.apache.calcite.avatica.AvaticaFactory;
 import org.apache.calcite.avatica.AvaticaResultSetMetaData;

@@ -362,9 +362,6 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
 
   /** A prepared statement handler. */
   public interface SqlStatement extends AutoCloseable {
-    default boolean isPrepared() {
-      return false;
-    }
 
     default FlightInfo executeQuery(String query) throws SQLException {
       throw new UnsupportedOperationException("Statement handle does not support direct query");
@@ -404,10 +401,6 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
 
   /** A prepared statement handler. */
   public interface PreparedStatement extends SqlStatement {
-    @Override
-    default boolean isPrepared() {
-      return true;
-    }
     /**
      * Executes this {@link PreparedStatement}.
      *

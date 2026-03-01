@@ -42,7 +42,7 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
       final int resultSetHoldability)
       throws SQLException {
     super(connection, handle, signature, resultSetType, resultSetConcurrency, resultSetHoldability);
-    Preconditions.checkArgument(preparedStatement.isPrepared());
+    Preconditions.checkArgument(preparedStatement instanceof ArrowFlightSqlClientHandler.PreparedStatement);
     this.preparedStatement = Preconditions.checkNotNull(preparedStatement);
   }
 

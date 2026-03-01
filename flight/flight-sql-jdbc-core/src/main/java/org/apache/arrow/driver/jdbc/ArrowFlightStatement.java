@@ -92,22 +92,21 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
       return null;
     }
 
-    final SqlStatement statementHandle = meta.getStatement(handle);
+    final SqlStatement statement = meta.getStatement(handle);
     // Statement.execute(String) goes through Meta.prepareAndExecute, which stores a prepared
     // handle even though the JDBC object is still an ArrowFlightStatement. Therefore,
     // executeFlightInfoQuery must handle both direct and prepared handles here.
-    if (statementHandle != null && statementHandle.isPrepared()) {
-      final PreparedStatement preparedStatement = (PreparedStatement) statementHandle;
-      final Schema resultSetSchema = preparedStatement.getDataSetSchema();
+    if (statement instanceof PreparedStatement) {
+      final Schema resultSetSchema = statement.getDataSetSchema();
       signature.columns.addAll(
           ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
       setSignature(signature);
-      return preparedStatement.executeQuery();
+      return statement.executeQuery();
     }
 
     final FlightInfo flightInfo =
-        statementHandle != null
-            ? statementHandle.executeQuery(signature.sql)
+        statement != null
+            ? statement.executeQuery(signature.sql)
             : connection.getClientHandler().getInfo(signature.sql);
     final Schema resultSetSchema = flightInfo.getSchemaOptional().orElse(null);
     if (resultSetSchema != null) {
@@ -137,7 +136,7 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     final ArrowFlightConnection conn = getConnection();
     final ArrowFlightMetaImpl meta = conn.getMeta();
     final SqlStatement statementHandle = meta.getStatement(handle);
-    if (statementHandle == null || statementHandle.isPrepared()) {
+    if (statementHandle == null || statementHandle instanceof PreparedStatement) {
       final SqlStatement newStatementHandle = conn.getClientHandler().createAdhocStatement();
       meta.updateStatementHandle(handle, newStatementHandle);
     }
