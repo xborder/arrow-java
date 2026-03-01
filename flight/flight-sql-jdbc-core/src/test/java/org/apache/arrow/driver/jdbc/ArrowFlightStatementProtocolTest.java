@@ -20,22 +20,30 @@ import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.google.protobuf.Message;
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Collections;
+import java.util.function.Consumer;
 import org.apache.arrow.driver.jdbc.utils.MockFlightSqlProducer;
+import org.apache.arrow.flight.FlightProducer.ServerStreamListener;
 import org.apache.arrow.flight.sql.FlightSqlUtils;
+import org.apache.arrow.flight.sql.FlightSqlProducer.Schemas;
+import org.apache.arrow.flight.sql.impl.FlightSql.CommandGetDbSchemas;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.Types.MinorType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.Text;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -44,6 +52,36 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 public class ArrowFlightStatementProtocolTest {
+  /*
+   * Repro notes for direct-handle experiments:
+   *
+   * Experiment A (remove direct-handle guard):
+   * - Temporarily remove the calls to:
+   *     meta.ensureDirectStatementHandle(handle)
+   *   in:
+   *     ArrowFlightStatement.executeQuery
+   *     ArrowFlightStatement.executeLargeUpdate
+   * - Run:
+   *     mvn -pl flight/flight-sql-jdbc-core \
+   *       -Dtest=ArrowFlightStatementProtocolTest#testStatementExecuteThenExecuteUpdateUsesStatementProtocol clean test
+   * - Expect failure: "Statement handle does not support direct update".
+   *
+   * - Run:
+   *     mvn -pl flight/flight-sql-jdbc-core \
+   *       -Dtest=ArrowFlightStatementProtocolTest#testStatementExecuteUpdateThenExecuteQueryUsesStatementProtocol clean test
+   * - Expect failure: prepared handle bound to UPDATE is reused for query.
+   *
+   * Experiment B (assert direct-handle validity):
+   * - Temporarily add after ensureDirectStatementHandle:
+   *     final SqlStatementHandle statementHandle = meta.getStatementHandle(handle);
+   *     Preconditions.checkState(
+   *         statementHandle != null && !statementHandle.isPrepared(),
+   *         "Direct statement handle expected");
+   *   in executeQuery and executeLargeUpdate.
+   * - Run:
+   *     mvn -pl flight/flight-sql-jdbc-core -Dtest=ArrowFlightStatementProtocolTest clean test
+   * - Expect success.
+   */
   private static final String SELECT_QUERY = "SELECT * FROM PROTOCOL_SELECT";
   private static final String UPDATE_QUERY = "UPDATE PROTOCOL_UPDATE";
   private static final Schema QUERY_SCHEMA =
@@ -78,6 +116,27 @@ public class ArrowFlightStatementProtocolTest {
               }
             }));
     PRODUCER.addUpdateQuery(UPDATE_QUERY, 1);
+
+    final Message commandGetDbSchemas = CommandGetDbSchemas.getDefaultInstance();
+    final Consumer<ServerStreamListener> commandGetSchemasResultProducer =
+        listener -> {
+          try (final BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+              final VectorSchemaRoot root =
+                  VectorSchemaRoot.create(Schemas.GET_SCHEMAS_SCHEMA, allocator)) {
+            final VarCharVector catalogName = (VarCharVector) root.getVector("catalog_name");
+            final VarCharVector schemaName = (VarCharVector) root.getVector("db_schema_name");
+            catalogName.setSafe(0, new Text("catalog_name #0"));
+            schemaName.setSafe(0, new Text("db_schema_name #0"));
+            root.setRowCount(1);
+            listener.start(root);
+            listener.putNext();
+          } catch (final Throwable throwable) {
+            listener.error(throwable);
+          } finally {
+            listener.completed();
+          }
+        };
+    PRODUCER.addCatalogQuery(commandGetDbSchemas, commandGetSchemasResultProducer);
   }
 
   @BeforeEach
@@ -120,6 +179,30 @@ public class ArrowFlightStatementProtocolTest {
   }
 
   @Test
+  public void testStatementExecuteUsesPreparedProtocolForQuery() throws SQLException {
+    try (Statement statement = connection.createStatement()) {
+      assertThat(statement.execute(SELECT_QUERY), is(true));
+      try (ResultSet resultSet = statement.getResultSet()) {
+        assertTrue(resultSet.next());
+      }
+    }
+
+    assertThat(
+        PRODUCER
+            .getActionTypeCounter()
+            .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_STATEMENT.getType(), 0),
+        is(1));
+    assertThat(
+        PRODUCER.getCommandTypeCounter().getOrDefault(
+            MockFlightSqlProducer.COMMAND_PREPARED_STATEMENT_QUERY, 0),
+        is(1));
+    assertThat(
+        PRODUCER.getCommandTypeCounter().getOrDefault(
+            MockFlightSqlProducer.COMMAND_STATEMENT_QUERY, 0),
+        is(0));
+  }
+
+  @Test
   public void testStatementExecuteUpdateUsesStatementProtocol() throws SQLException {
     try (Statement statement = connection.createStatement()) {
       assertThat(statement.executeUpdate(UPDATE_QUERY), is(1));
@@ -141,10 +224,101 @@ public class ArrowFlightStatementProtocolTest {
   }
 
   @Test
+  public void testStatementExecuteUsesPreparedProtocolForUpdate() throws SQLException {
+    try (Statement statement = connection.createStatement()) {
+      assertThat(statement.execute(UPDATE_QUERY), is(false));
+      assertThat(statement.getUpdateCount(), is(1));
+    }
+
+    assertThat(
+        PRODUCER
+            .getActionTypeCounter()
+            .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_STATEMENT.getType(), 0),
+        is(1));
+    assertThat(
+        PRODUCER.getCommandTypeCounter().getOrDefault(
+            MockFlightSqlProducer.COMMAND_PREPARED_STATEMENT_UPDATE, 0),
+        is(1));
+  }
+  @Test
+  public void testStatementExecuteThenExecuteUpdateUsesStatementProtocol() throws SQLException {
+    try (Statement statement = connection.createStatement()) {
+      assertThat(statement.execute(SELECT_QUERY), is(true));
+      try (ResultSet resultSet = statement.getResultSet()) {
+        assertTrue(resultSet.next());
+      }
+      assertThat(statement.executeUpdate(UPDATE_QUERY), is(1));
+    }
+
+    assertThat(
+        PRODUCER
+            .getActionTypeCounter()
+            .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_STATEMENT.getType(), 0),
+        is(1));
+    assertThat(
+        PRODUCER.getCommandTypeCounter().getOrDefault(
+            MockFlightSqlProducer.COMMAND_PREPARED_STATEMENT_QUERY, 0),
+        is(1));
+    assertThat(
+        PRODUCER.getCommandTypeCounter().getOrDefault(
+            MockFlightSqlProducer.COMMAND_STATEMENT_UPDATE, 0),
+        is(1));
+  }
+
+  @Test
+  public void testStatementExecuteUpdateThenExecuteQueryUsesStatementProtocol() throws SQLException {
+    try (Statement statement = connection.createStatement()) {
+      assertThat(statement.execute(UPDATE_QUERY), is(false));
+      assertThat(statement.getUpdateCount(), is(1));
+      try (ResultSet resultSet = statement.executeQuery(SELECT_QUERY)) {
+        assertTrue(resultSet.next());
+      }
+    }
+
+    assertThat(
+        PRODUCER
+            .getActionTypeCounter()
+            .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_STATEMENT.getType(), 0),
+        is(1));
+    assertThat(
+        PRODUCER.getCommandTypeCounter().getOrDefault(
+            MockFlightSqlProducer.COMMAND_PREPARED_STATEMENT_UPDATE, 0),
+        is(1));
+    assertThat(
+        PRODUCER.getCommandTypeCounter().getOrDefault(
+            MockFlightSqlProducer.COMMAND_STATEMENT_QUERY, 0),
+        is(1));
+  }
+
+  @Test
   public void testPreparedStatementExecuteQueryUsesPreparedProtocol() throws SQLException {
     try (PreparedStatement statement = connection.prepareStatement(SELECT_QUERY);
         ResultSet resultSet = statement.executeQuery()) {
       assertTrue(resultSet.next());
+    }
+
+    assertThat(
+        PRODUCER
+            .getActionTypeCounter()
+            .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_STATEMENT.getType(), 0),
+        is(1));
+    assertThat(
+        PRODUCER.getCommandTypeCounter().getOrDefault(
+            MockFlightSqlProducer.COMMAND_PREPARED_STATEMENT_QUERY, 0),
+        is(1));
+    assertThat(
+        PRODUCER.getCommandTypeCounter().getOrDefault(
+            MockFlightSqlProducer.COMMAND_STATEMENT_QUERY, 0),
+        is(0));
+  }
+
+  @Test
+  public void testPreparedStatementExecuteUsesPreparedProtocolForQuery() throws SQLException {
+    try (PreparedStatement statement = connection.prepareStatement(SELECT_QUERY)) {
+      assertThat(statement.execute(), is(true));
+      try (ResultSet resultSet = statement.getResultSet()) {
+        assertTrue(resultSet.next());
+      }
     }
 
     assertThat(
@@ -177,9 +351,37 @@ public class ArrowFlightStatementProtocolTest {
         PRODUCER.getCommandTypeCounter().getOrDefault(
             MockFlightSqlProducer.COMMAND_PREPARED_STATEMENT_UPDATE, 0),
         is(1));
+  }
+
+  @Test
+  public void testPreparedStatementExecuteUsesPreparedProtocolForUpdate() throws SQLException {
+    try (PreparedStatement statement = connection.prepareStatement(UPDATE_QUERY)) {
+      assertThat(statement.execute(), is(false));
+      assertThat(statement.getUpdateCount(), is(1));
+    }
+
+    assertThat(
+        PRODUCER
+            .getActionTypeCounter()
+            .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_STATEMENT.getType(), 0),
+        is(1));
     assertThat(
         PRODUCER.getCommandTypeCounter().getOrDefault(
-            MockFlightSqlProducer.COMMAND_STATEMENT_UPDATE, 0),
+            MockFlightSqlProducer.COMMAND_PREPARED_STATEMENT_UPDATE, 0),
+        is(1));
+  }
+
+  @Test
+  public void testMetadataGetSchemasUsesJdbcApi() throws SQLException {
+    final DatabaseMetaData metaData = connection.getMetaData();
+    try (ResultSet resultSet = metaData.getSchemas()) {
+      assertTrue(resultSet.next());
+    }
+
+    assertThat(
+        PRODUCER
+            .getActionTypeCounter()
+            .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_STATEMENT.getType(), 0),
         is(0));
   }
 }

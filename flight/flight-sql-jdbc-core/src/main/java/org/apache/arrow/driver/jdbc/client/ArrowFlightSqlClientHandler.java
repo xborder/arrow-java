@@ -361,7 +361,7 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
   }
 
   /** A prepared statement handler. */
-  public interface SqlStatementHandle extends AutoCloseable {
+  public interface SqlStatement extends AutoCloseable {
     default boolean isPrepared() {
       return false;
     }
@@ -403,7 +403,7 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
   }
 
   /** A prepared statement handler. */
-  public interface PreparedStatement extends SqlStatementHandle {
+  public interface PreparedStatement extends SqlStatement {
     @Override
     default boolean isPrepared() {
       return true;
@@ -542,11 +542,11 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
     };
   }
 
-  public SqlStatementHandle createStatementHandle() {
-    return new DirectStatementHandle();
+  public SqlStatement createAdhocStatement() {
+    return new AdhocStatement();
   }
 
-  private final class DirectStatementHandle implements SqlStatementHandle {
+  private final class AdhocStatement implements SqlStatement {
     @Override
     public FlightInfo executeQuery(String query) {
       return sqlClient.execute(query, getOptions());

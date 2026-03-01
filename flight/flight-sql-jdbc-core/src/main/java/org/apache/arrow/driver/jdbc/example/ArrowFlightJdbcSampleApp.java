@@ -47,36 +47,36 @@ public final class ArrowFlightJdbcSampleApp {
     System.out.println("Connecting to: " + url);
     try (Connection connection = DriverManager.getConnection(url, properties)) {
       runStatementExamples(connection);
-//      runPreparedStatementExamples(connection);
+      //      runPreparedStatementExamples(connection);
     }
   }
 
   private static void runStatementExamples(Connection connection) throws SQLException {
     try (Statement statement = connection.createStatement()) {
       System.out.println("\nStatement.execute (query): " + SELECT_SQL);
-//      boolean hasResultSet = statement.execute(SELECT_SQL);
-//      if (hasResultSet) {
-//        try (ResultSet resultSet = statement.getResultSet()) {
-//          printResultSet(resultSet);
-//        }
-//      } else {
-//        System.out.println("Update count: " + statement.getUpdateCount());
-//      }
-//
-//      System.out.println("\nStatement.execute (update): " + UPDATE_SQL);
-//      boolean hasResultSet = statement.execute(UPDATE_SQL);
-//      if (!hasResultSet) {
-//        System.out.println("Update count: " + statement.getUpdateCount());
-//      }
+      //      boolean hasResultSet = statement.execute(SELECT_SQL);
+      //      if (hasResultSet) {
+      //        try (ResultSet resultSet = statement.getResultSet()) {
+      //          printResultSet(resultSet);
+      //        }
+      //      } else {
+      //        System.out.println("Update count: " + statement.getUpdateCount());
+      //      }
+      //
+      //      System.out.println("\nStatement.execute (update): " + UPDATE_SQL);
+      //      boolean hasResultSet = statement.execute(UPDATE_SQL);
+      //      if (!hasResultSet) {
+      //        System.out.println("Update count: " + statement.getUpdateCount());
+      //      }
 
-//      System.out.println("\nStatement.executeQuery: " + SELECT_SQL);
-//      try (ResultSet resultSet = statement.executeQuery(SELECT_SQL)) {
-//        printResultSet(resultSet);
-//      }
+      //      System.out.println("\nStatement.executeQuery: " + SELECT_SQL);
+      //      try (ResultSet resultSet = statement.executeQuery(SELECT_SQL)) {
+      //        printResultSet(resultSet);
+      //      }
 
-//      System.out.println("\nStatement.executeUpdate: " + UPDATE_SQL);
-//      int updated = statement.executeUpdate(UPDATE_SQL);
-//      System.out.println("Updated rows: " + updated);
+      //      System.out.println("\nStatement.executeUpdate: " + UPDATE_SQL);
+      //      int updated = statement.executeUpdate(UPDATE_SQL);
+      //      System.out.println("Updated rows: " + updated);
     }
   }
 

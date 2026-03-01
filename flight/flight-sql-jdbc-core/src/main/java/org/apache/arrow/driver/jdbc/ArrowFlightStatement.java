@@ -19,7 +19,7 @@ package org.apache.arrow.driver.jdbc;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
-import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.SqlStatementHandle;
+import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.SqlStatement;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -50,10 +50,9 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   public ResultSet executeQuery(final String sql) throws SQLException {
     checkOpen();
     updateCount = -1;
-    final ArrowFlightMetaImpl meta = getConnection().getMeta();
-    meta.ensureDirectStatementHandle(handle);
+    resetAdhocHandle();
     try {
-      final Meta.Signature signature = ArrowFlightMetaImpl.newSignature(sql);
+      final Meta.Signature signature = ArrowFlightMetaImpl.newStatementSignature(sql);
       setSignature(signature);
       return executeQueryInternal(signature, false);
     } catch (RuntimeException exception) {
@@ -69,15 +68,12 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     clearOpenResultSet();
     updateCount = -1;
 
-    final ArrowFlightMetaImpl meta = getConnection().getMeta();
-    meta.ensureDirectStatementHandle(handle);
+    resetAdhocHandle();
     try {
-      final SqlStatementHandle statementHandle = meta.getStatementHandle(handle);
-      if (statementHandle == null) {
-        throw new IllegalStateException("Statement handle not found: " + handle);
-      }
+      final ArrowFlightMetaImpl meta = getConnection().getMeta();
+      final SqlStatement statementHandle = meta.getStatement(handle);
       final long updatedCount = statementHandle.executeUpdate(sql);
-      setSignature(ArrowFlightMetaImpl.newSignature(sql));
+      setSignature(ArrowFlightMetaImpl.newUpdateSignature(sql));
       updateCount = updatedCount;
       return updatedCount;
     } catch (RuntimeException exception) {
@@ -96,7 +92,7 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
       return null;
     }
 
-    final SqlStatementHandle statementHandle = meta.getStatementHandle(handle);
+    final SqlStatement statementHandle = meta.getStatement(handle);
     // Statement.execute(String) goes through Meta.prepareAndExecute, which stores a prepared
     // handle even though the JDBC object is still an ArrowFlightStatement. Therefore,
     // executeFlightInfoQuery must handle both direct and prepared handles here.
@@ -134,6 +130,16 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
               "Error while closing previous result set", exception);
         }
       }
+    }
+  }
+
+  private void resetAdhocHandle() throws SQLException {
+    final ArrowFlightConnection conn = getConnection();
+    final ArrowFlightMetaImpl meta = conn.getMeta();
+    final SqlStatement statementHandle = meta.getStatement(handle);
+    if (statementHandle == null || statementHandle.isPrepared()) {
+      final SqlStatement newStatementHandle = conn.getClientHandler().createAdhocStatement();
+      meta.updateStatementHandle(handle, newStatementHandle);
     }
   }
 }
