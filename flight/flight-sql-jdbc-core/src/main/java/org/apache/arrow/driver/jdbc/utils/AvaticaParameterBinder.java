@@ -17,7 +17,7 @@
 package org.apache.arrow.driver.jdbc.utils;
 
 import java.util.List;
-import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
+import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.SqlStatement;
 import org.apache.arrow.driver.jdbc.converter.impl.BinaryAvaticaParameterConverter;
 import org.apache.arrow.driver.jdbc.converter.impl.BinaryViewAvaticaParameterConverter;
 import org.apache.arrow.driver.jdbc.converter.impl.BoolAvaticaParameterConverter;
@@ -59,7 +59,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  * <p>NOTE: Make sure to close the parameters VectorSchemaRoot once we're done with them.
  */
 public class AvaticaParameterBinder {
-  private final PreparedStatement preparedStatement;
+  private final SqlStatement preparedStatement;
   private final VectorSchemaRoot parameters;
 
   /**
@@ -69,7 +69,7 @@ public class AvaticaParameterBinder {
    * @param bufferAllocator The BufferAllocator to use for allocating memory.
    */
   public AvaticaParameterBinder(
-      PreparedStatement preparedStatement, BufferAllocator bufferAllocator) {
+      SqlStatement preparedStatement, BufferAllocator bufferAllocator) {
     this.parameters =
         VectorSchemaRoot.create(preparedStatement.getParameterSchema(), bufferAllocator);
     this.preparedStatement = preparedStatement;

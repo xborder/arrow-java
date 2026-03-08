@@ -19,6 +19,7 @@ package org.apache.arrow.driver.jdbc;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler;
+import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.SqlStatement;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.util.Preconditions;
 import org.apache.calcite.avatica.AvaticaPreparedStatement;
@@ -29,11 +30,11 @@ import org.apache.calcite.avatica.Meta.StatementHandle;
 public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
     implements ArrowFlightInfoStatement {
 
-  private final ArrowFlightSqlClientHandler.PreparedStatement preparedStatement;
+  private final SqlStatement preparedStatement;
 
   private ArrowFlightPreparedStatement(
       final ArrowFlightConnection connection,
-      final ArrowFlightSqlClientHandler.PreparedStatement preparedStatement,
+      final SqlStatement preparedStatement,
       final StatementHandle handle,
       final Signature signature,
       final int resultSetType,
@@ -41,12 +42,13 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
       final int resultSetHoldability)
       throws SQLException {
     super(connection, handle, signature, resultSetType, resultSetConcurrency, resultSetHoldability);
+    Preconditions.checkArgument(preparedStatement instanceof ArrowFlightSqlClientHandler.PreparedStatement);
     this.preparedStatement = Preconditions.checkNotNull(preparedStatement);
   }
 
   static ArrowFlightPreparedStatement newPreparedStatement(
       final ArrowFlightConnection connection,
-      final ArrowFlightSqlClientHandler.PreparedStatement preparedStmt,
+      final SqlStatement preparedStmt,
       final StatementHandle statementHandle,
       final Signature signature,
       final int resultSetType,

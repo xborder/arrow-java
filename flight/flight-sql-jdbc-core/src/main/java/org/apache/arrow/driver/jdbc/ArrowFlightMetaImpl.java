@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
+import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.SqlStatement;
 import org.apache.arrow.driver.jdbc.utils.AvaticaParameterBinder;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.util.Preconditions;
@@ -39,7 +40,7 @@ import org.apache.calcite.avatica.remote.TypedValue;
 
 /** Metadata handler for Arrow Flight. */
 public class ArrowFlightMetaImpl extends MetaImpl {
-  private final Map<StatementHandleKey, PreparedStatement> statementHandlePreparedStatementMap;
+  private final Map<StatementHandleKey, SqlStatement> statementHandleMap;
 
   /**
    * Constructs a {@link MetaImpl} object specific for Arrow Flight.
@@ -48,12 +49,16 @@ public class ArrowFlightMetaImpl extends MetaImpl {
    */
   public ArrowFlightMetaImpl(final AvaticaConnection connection) {
     super(connection);
-    this.statementHandlePreparedStatementMap = new ConcurrentHashMap<>();
+    this.statementHandleMap = new ConcurrentHashMap<>();
     setDefaultConnectionProperties();
   }
 
   /** Construct a signature. */
-  static Signature newSignature(final String sql, Schema resultSetSchema, Schema parameterSchema) {
+  static Signature newSignature(
+      final String sql,
+      final Schema resultSetSchema,
+      final Schema parameterSchema,
+      final StatementType statementType) {
     List<ColumnMetaData> columnMetaData =
         resultSetSchema == null
             ? new ArrayList<>()
@@ -62,10 +67,6 @@ public class ArrowFlightMetaImpl extends MetaImpl {
         parameterSchema == null
             ? new ArrayList<>()
             : ConvertUtils.convertArrowFieldsToAvaticaParameters(parameterSchema.getFields());
-    StatementType statementType =
-        resultSetSchema == null || resultSetSchema.getFields().isEmpty()
-            ? StatementType.IS_DML
-            : StatementType.SELECT;
     return new Signature(
         columnMetaData,
         sql,
@@ -75,15 +76,23 @@ public class ArrowFlightMetaImpl extends MetaImpl {
         statementType);
   }
 
+  static Signature newStatementSignature(final String sql) {
+    return newSignature(sql, null, null, StatementType.SELECT);
+  }
+
+  static Signature newUpdateSignature(final String sql) {
+    return newSignature(sql, null, null, StatementType.IS_DML);
+  }
+
   @Override
   public void closeStatement(final StatementHandle statementHandle) {
-    PreparedStatement preparedStatement =
-        statementHandlePreparedStatementMap.remove(new StatementHandleKey(statementHandle));
+    SqlStatement statementHandleInstance =
+        statementHandleMap.remove(new StatementHandleKey(statementHandle));
     // Testing if the prepared statement was created because the statement can be
     // not created until
     // this moment
-    if (preparedStatement != null) {
-      preparedStatement.close();
+    if (statementHandleInstance != null) {
+      statementHandleInstance.close();
     }
   }
 
@@ -93,13 +102,22 @@ public class ArrowFlightMetaImpl extends MetaImpl {
   }
 
   @Override
+  public StatementHandle createStatement(final ConnectionHandle connectionHandle) {
+    final StatementHandle handle = super.createStatement(connectionHandle);
+    statementHandleMap.put(
+        new StatementHandleKey(handle),
+        ((ArrowFlightConnection) connection).getClientHandler().createAdhocStatement());
+    return handle;
+  }
+
+  @Override
   public ExecuteResult execute(
       final StatementHandle statementHandle,
       final List<TypedValue> typedValues,
       final long maxRowCount) {
     Preconditions.checkArgument(
         connection.id.equals(statementHandle.connectionId), "Connection IDs are not consistent");
-    PreparedStatement preparedStatement = getPreparedStatement(statementHandle);
+    SqlStatement preparedStatement = getStatement(statementHandle);
 
     if (preparedStatement == null) {
       throw new IllegalStateException("Prepared statement not found: " + statementHandle);
@@ -109,8 +127,11 @@ public class ArrowFlightMetaImpl extends MetaImpl {
             preparedStatement, ((ArrowFlightConnection) connection).getBufferAllocator())
         .bind(typedValues);
 
-    if (statementHandle.signature == null
-        || statementHandle.signature.statementType == StatementType.IS_DML) {
+    final StatementType statementType =
+        statementHandle.signature == null
+            ? StatementType.IS_DML
+            : statementHandle.signature.statementType;
+    if (statementType == StatementType.IS_DML || statementType == StatementType.UPDATE) {
       // Update query
       long updatedCount = preparedStatement.executeUpdate();
       return new ExecuteResult(
@@ -143,7 +164,7 @@ public class ArrowFlightMetaImpl extends MetaImpl {
       throws IllegalStateException {
     Preconditions.checkArgument(
         connection.id.equals(statementHandle.connectionId), "Connection IDs are not consistent");
-    PreparedStatement preparedStatement = getPreparedStatement(statementHandle);
+    SqlStatement preparedStatement = getStatement(statementHandle);
 
     if (preparedStatement == null) {
       throw new IllegalStateException("Prepared statement not found: " + statementHandle);
@@ -178,15 +199,22 @@ public class ArrowFlightMetaImpl extends MetaImpl {
         ((ArrowFlightConnection) connection).getClientHandler().prepare(query);
     handle.signature =
         newSignature(
-            query, preparedStatement.getDataSetSchema(), preparedStatement.getParameterSchema());
-    statementHandlePreparedStatementMap.put(new StatementHandleKey(handle), preparedStatement);
+            query,
+            preparedStatement.getDataSetSchema(),
+            preparedStatement.getParameterSchema(),
+            preparedStatement.getType());
+    final StatementHandleKey key = new StatementHandleKey(handle);
+    final SqlStatement previous = statementHandleMap.put(key, preparedStatement);
+    if (previous != null && previous != preparedStatement) {
+      previous.close();
+    }
     return preparedStatement;
   }
 
   @Override
   public StatementHandle prepare(
       final ConnectionHandle connectionHandle, final String query, final long maxRowCount) {
-    final StatementHandle handle = super.createStatement(connectionHandle);
+    final StatementHandle handle = createStatement(connectionHandle);
     prepareForHandle(query, handle);
     return handle;
   }
@@ -280,8 +308,16 @@ public class ArrowFlightMetaImpl extends MetaImpl {
         .setTransactionIsolation(Connection.TRANSACTION_NONE);
   }
 
-  PreparedStatement getPreparedStatement(StatementHandle statementHandle) {
-    return statementHandlePreparedStatementMap.get(new StatementHandleKey(statementHandle));
+  SqlStatement getStatement(StatementHandle statementHandle) {
+    return statementHandleMap.get(new StatementHandleKey(statementHandle));
+  }
+
+  void updateStatementHandle(StatementHandle statementHandle, SqlStatement newHandle) {
+    final StatementHandleKey key = new StatementHandleKey(statementHandle);
+    final SqlStatement previous = statementHandleMap.put(key, newHandle);
+    if (previous != null && previous != newHandle) {
+      previous.close();
+    }
   }
 
   // Helper used to look up prepared statement instances later. Avatica doesn't
