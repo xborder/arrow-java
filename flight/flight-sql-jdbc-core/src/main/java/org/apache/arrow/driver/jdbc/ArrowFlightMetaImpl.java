@@ -234,12 +234,28 @@ public class ArrowFlightMetaImpl extends MetaImpl {
   }
 
   public static Signature buildDefaultSignature() {
-    return buildSignature(null, null, null);
+    return buildSignature(null, StatementType.SELECT);
+  }
+
+  public static Signature buildSignature(final String sql, final StatementType type) {
+    return buildSignature(sql, null, null, type);
   }
 
   /** Builds an Avatica signature from Arrow result and parameter schemas. */
   public static Signature buildSignature(
       final String sql, final Schema resultSetSchema, final Schema parameterSchema) {
+    StatementType statementType =
+        resultSetSchema == null || resultSetSchema.getFields().isEmpty()
+            ? StatementType.IS_DML
+            : StatementType.SELECT;
+    return buildSignature(sql, resultSetSchema, parameterSchema, statementType);
+  }
+
+  private static Signature buildSignature(
+      final String sql,
+      final Schema resultSetSchema,
+      final Schema parameterSchema,
+      final StatementType statementType) {
     List<ColumnMetaData> columnMetaData =
         resultSetSchema == null
             ? new ArrayList<>()
@@ -248,10 +264,6 @@ public class ArrowFlightMetaImpl extends MetaImpl {
         parameterSchema == null
             ? new ArrayList<>()
             : ConvertUtils.convertArrowFieldsToAvaticaParameters(parameterSchema.getFields());
-    StatementType statementType =
-        resultSetSchema == null || resultSetSchema.getFields().isEmpty()
-            ? StatementType.IS_DML
-            : StatementType.SELECT;
     return new Signature(
         columnMetaData,
         sql,

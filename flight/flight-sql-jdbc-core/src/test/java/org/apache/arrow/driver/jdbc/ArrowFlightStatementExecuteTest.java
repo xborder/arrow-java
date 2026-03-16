@@ -155,6 +155,23 @@ public class ArrowFlightStatementExecuteTest {
   }
 
   @Test
+  public void testExecuteQueryRestoresStatementMapEntryWithStatement() throws SQLException {
+    final ArrowFlightStatement arrowStatement = (ArrowFlightStatement) statement;
+    final ArrowFlightConnection arrowConnection = (ArrowFlightConnection) connection;
+
+    assertThat(statement.execute(SAMPLE_QUERY_CMD), is(true));
+
+    try (ResultSet resultSet = statement.executeQuery(SAMPLE_QUERY_CMD)) {
+      assertThat(resultSet.next(), is(true));
+    }
+
+    assertSame(arrowStatement, arrowConnection.statementMap.get(arrowStatement.handle.id));
+    assertThat(
+        arrowConnection.getMeta().getPreparedStatementInstanceOrNull(arrowStatement.handle),
+        is(nullValue()));
+  }
+
+  @Test
   public void testExecuteShouldRunUpdateQueryForSmallUpdate() throws SQLException {
     assertThat(statement.execute(SAMPLE_UPDATE_QUERY), is(false)); // Means this is an UPDATE query.
     assertThat(

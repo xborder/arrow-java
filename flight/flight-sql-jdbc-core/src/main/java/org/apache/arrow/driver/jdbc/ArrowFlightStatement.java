@@ -16,13 +16,19 @@
  */
 package org.apache.arrow.driver.jdbc;
 
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
+import org.apache.arrow.flight.FlightStatusCode;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.calcite.avatica.AvaticaConnection;
+import org.apache.calcite.avatica.AvaticaResultSet;
 import org.apache.calcite.avatica.AvaticaStatement;
 import org.apache.calcite.avatica.Meta;
 import org.apache.calcite.avatica.Meta.StatementHandle;
+import org.apache.calcite.avatica.Meta.StatementType;
 
 /** A SQL statement for querying data from an Arrow Flight server. */
 public class ArrowFlightStatement extends AvaticaStatement implements ArrowFlightInfoStatement {
@@ -42,9 +48,41 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   }
 
   @Override
+  public ResultSet executeQuery(final String sql) throws SQLException {
+    checkOpen();
+    updateCount = -1;
+    switchToDirectStatementMode();
+    try {
+      final Meta.Signature signature = ArrowFlightMetaImpl.buildSignature(sql, StatementType.SELECT);
+      setSignature(signature);
+      return executeQueryInternal(signature, false);
+    } catch (Exception exception) {
+      throw wrapStatementExecutionException(sql, exception);
+    }
+  }
+
+  @Override
+  public long executeLargeUpdate(final String sql) throws SQLException {
+    checkOpen();
+    clearOpenResultSet();
+    updateCount = -1;
+    switchToDirectStatementMode();
+
+    try {
+      final long updatedCount = getConnection().getClientHandler().executeUpdate(sql);
+      setSignature(ArrowFlightMetaImpl.buildSignature(sql, StatementType.IS_DML));
+      updateCount = updatedCount;
+      return updatedCount;
+    } catch (Exception exception) {
+      throw wrapStatementExecutionException(sql, exception);
+    }
+  }
+
+  @Override
   public FlightInfo executeFlightInfoQuery() throws SQLException {
+    final ArrowFlightConnection connection = getConnection();
     final ArrowFlightPreparedStatement preparedStatement =
-        getConnection().getMeta().getPreparedStatementInstanceOrNull(handle);
+        connection.getMeta().getPreparedStatementInstanceOrNull(handle);
     final Meta.Signature signature = getSignature();
     if (signature == null) {
       return null;
@@ -58,6 +96,61 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
       return preparedStatement.executeFlightInfoQuery();
     }
 
-    throw new IllegalStateException("Prepared statement query not found: " + handle);
+    final FlightInfo flightInfo = connection.getClientHandler().getInfo(signature.sql);
+    final Schema resultSetSchema = flightInfo.getSchemaOptional().orElse(null);
+    if (resultSetSchema != null) {
+      signature.columns.addAll(
+          ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
+      setSignature(signature);
+    }
+    return flightInfo;
+  }
+
+  private SQLException wrapStatementExecutionException(final String sql, final Exception exception)
+      throws SQLException {
+    if (!(exception instanceof SQLException)) {
+      return AvaticaConnection.HELPER.createException(
+          "Error while executing SQL \"" + sql + "\": " + exception.getMessage(), exception);
+    }
+    final SQLException sqlException = (SQLException) exception;
+    final String prefix = "Error while executing SQL \"" + sql + "\"";
+    final String message = sqlException.getMessage();
+    if (message != null && message.startsWith(prefix)) {
+      return sqlException;
+    }
+    final Throwable cause = sqlException.getCause();
+    if (cause instanceof FlightRuntimeException) {
+      final FlightStatusCode statusCode = ((FlightRuntimeException) cause).status().code();
+      if (statusCode == FlightStatusCode.UNAVAILABLE) {
+        return sqlException;
+      }
+    }
+    return AvaticaConnection.HELPER.createException(prefix + ": " + message, sqlException);
+  }
+
+  private void clearOpenResultSet() throws SQLException {
+    synchronized (this) {
+      if (openResultSet != null) {
+        final AvaticaResultSet resultSet = openResultSet;
+        openResultSet = null;
+        try {
+          resultSet.close();
+        } catch (Exception exception) {
+          throw AvaticaConnection.HELPER.createException(
+              "Error while closing previous result set", exception);
+        }
+      }
+    }
+  }
+
+  private void switchToDirectStatementMode() throws SQLException {
+    final ArrowFlightConnection connection = getConnection();
+    final AvaticaStatement existingStatement = connection.statementMap.get(handle.id);
+    if (existingStatement instanceof ArrowFlightPreparedStatement) {
+      ((ArrowFlightPreparedStatement) existingStatement).closePreparedResources();
+    }
+    if (existingStatement != this) {
+      connection.statementMap.put(handle.id, this);
+    }
   }
 }
