@@ -27,11 +27,13 @@ import org.apache.calcite.avatica.AvaticaConnection;
 import org.apache.calcite.avatica.AvaticaResultSet;
 import org.apache.calcite.avatica.AvaticaStatement;
 import org.apache.calcite.avatica.Meta;
+import org.apache.calcite.avatica.Meta.ExecuteResult;
+import org.apache.calcite.avatica.Meta.PrepareCallback;
 import org.apache.calcite.avatica.Meta.StatementHandle;
 import org.apache.calcite.avatica.Meta.StatementType;
 
 /** A SQL statement for querying data from an Arrow Flight server. */
-public class ArrowFlightStatement extends AvaticaStatement implements ArrowFlightInfoStatement {
+public class ArrowFlightStatement extends AvaticaStatement implements ArrowFlightMetaStatement {
 
   ArrowFlightStatement(
       final ArrowFlightConnection connection,
@@ -48,12 +50,31 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   }
 
   @Override
+  public ExecuteResult prepareAndExecute(
+      final String query,
+      final long maxRowCount,
+      final int maxRowsInFirstFrame,
+      final PrepareCallback callback)
+      throws SQLException {
+    // Keep Avatica Statement.execute(String) behavior: Avatica calls Meta.prepareAndExecute,
+    // which resolves to this statement hook.
+    this.closeStatement();
+
+    return ArrowFlightPreparedStatement.builder(getConnection())
+        .withQuery(query)
+        .withExistingStatement(this)
+        .build()
+        .prepareAndExecute(callback);
+  }
+
+  @Override
   public ResultSet executeQuery(final String sql) throws SQLException {
     checkOpen();
     updateCount = -1;
     switchToDirectStatementMode();
     try {
-      final Meta.Signature signature = ArrowFlightMetaImpl.buildSignature(sql, StatementType.SELECT);
+      final Meta.Signature signature =
+          ArrowFlightMetaImpl.buildSignature(sql, StatementType.SELECT);
       setSignature(signature);
       return executeQueryInternal(signature, false);
     } catch (Exception exception) {
@@ -81,29 +102,37 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   @Override
   public FlightInfo executeFlightInfoQuery() throws SQLException {
     final ArrowFlightConnection connection = getConnection();
-    final ArrowFlightPreparedStatement preparedStatement =
-        connection.getMeta().getPreparedStatementInstanceOrNull(handle);
     final Meta.Signature signature = getSignature();
     if (signature == null) {
       return null;
     }
 
-    if (preparedStatement != null) {
-      final Schema resultSetSchema = preparedStatement.getDataSetSchema();
-      signature.columns.addAll(
-          ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
-      setSignature(signature);
-      return preparedStatement.executeFlightInfoQuery();
+    // A Statement handle can point to either this direct statement instance or a prepared
+    // statement instance created by Avatica Statement.execute(String) through
+    // Meta.prepareAndExecute.
+    final AvaticaStatement currentStatement = connection.statementMap.get(handle.id);
+    if (currentStatement instanceof ArrowFlightMetaStatement && currentStatement != this) {
+      // Prepared path: reuse the current statement implementation associated with the handle.
+      final FlightInfo flightInfo =
+          ((ArrowFlightMetaStatement) currentStatement).executeFlightInfoQuery();
+      updateSignatureColumnsFromFlightInfo(signature, flightInfo);
+      return flightInfo;
     }
 
+    // Direct Statement.executeQuery(String) / executeUpdate(String) path.
     final FlightInfo flightInfo = connection.getClientHandler().getInfo(signature.sql);
+    updateSignatureColumnsFromFlightInfo(signature, flightInfo);
+    return flightInfo;
+  }
+
+  private void updateSignatureColumnsFromFlightInfo(
+      final Meta.Signature signature, final FlightInfo flightInfo) {
     final Schema resultSetSchema = flightInfo.getSchemaOptional().orElse(null);
     if (resultSetSchema != null) {
       signature.columns.addAll(
           ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
       setSignature(signature);
     }
-    return flightInfo;
   }
 
   private SQLException wrapStatementExecutionException(final String sql, final Exception exception)
@@ -146,11 +175,14 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   private void switchToDirectStatementMode() throws SQLException {
     final ArrowFlightConnection connection = getConnection();
     final AvaticaStatement existingStatement = connection.statementMap.get(handle.id);
-    if (existingStatement instanceof ArrowFlightPreparedStatement) {
-      ((ArrowFlightPreparedStatement) existingStatement).closePreparedResources();
+    if (existingStatement == this) {
+      return;
     }
-    if (existingStatement != this) {
-      connection.statementMap.put(handle.id, this);
+    if (existingStatement instanceof ArrowFlightMetaStatement) {
+      // Release resources from previously attached statement implementation before switching back
+      // to direct statement mode for executeQuery/executeUpdate.
+      ((ArrowFlightMetaStatement) existingStatement).closeStatement();
     }
+    connection.statementMap.put(handle.id, this);
   }
 }
