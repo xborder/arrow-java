@@ -111,10 +111,10 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     // statement instance created by Avatica Statement.execute(String) through
     // Meta.prepareAndExecute.
     final AvaticaStatement currentStatement = connection.statementMap.get(handle.id);
-    if (currentStatement instanceof ArrowFlightMetaStatement && currentStatement != this) {
+    if (currentStatement instanceof ArrowFlightPreparedStatement) {
       // Prepared path: reuse the current statement implementation associated with the handle.
       final FlightInfo flightInfo =
-          ((ArrowFlightMetaStatement) currentStatement).executeFlightInfoQuery();
+          ((ArrowFlightPreparedStatement) currentStatement).executeFlightInfoQuery();
       updateSignatureColumnsFromFlightInfo(signature, flightInfo);
       return flightInfo;
     }
@@ -178,10 +178,10 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     if (existingStatement == this) {
       return;
     }
-    if (existingStatement instanceof ArrowFlightMetaStatement) {
+    if (existingStatement instanceof ArrowFlightPreparedStatement) {
       // Release resources from previously attached statement implementation before switching back
       // to direct statement mode for executeQuery/executeUpdate.
-      ((ArrowFlightMetaStatement) existingStatement).closeStatement();
+      ((ArrowFlightPreparedStatement) existingStatement).closeStatement();
     }
     connection.statementMap.put(handle.id, this);
   }
