@@ -28,6 +28,7 @@ import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.vector.compression.CompressionCodec;
 import org.apache.arrow.vector.dictionary.Dictionary;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
@@ -55,6 +56,7 @@ final class DictionaryUtils {
       final FlightDescriptor descriptor,
       final DictionaryProvider provider,
       final IpcOption option,
+      final CompressionCodec compressionCodec,
       final Consumer<ArrowMessage> messageCallback)
       throws Exception {
     final Set<Long> dictionaryIds = new HashSet<>();
@@ -77,7 +79,12 @@ final class DictionaryUtils {
               Collections.singletonList(vector.getField()),
               Collections.singletonList(vector),
               count);
-      final VectorUnloader unloader = new VectorUnloader(dictRoot);
+      final VectorUnloader unloader =
+          new VectorUnloader(
+              dictRoot,
+              /* includeNullCount */ true,
+              compressionCodec,
+              /* alignBuffers */ true);
       try (final ArrowDictionaryBatch dictionaryBatch =
               new ArrowDictionaryBatch(id, unloader.getRecordBatch());
           final ArrowMessage message = new ArrowMessage(dictionaryBatch, option)) {

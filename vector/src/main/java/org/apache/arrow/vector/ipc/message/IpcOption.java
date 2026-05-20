@@ -16,9 +16,19 @@
  */
 package org.apache.arrow.vector.ipc.message;
 
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.apache.arrow.vector.types.MetadataVersion;
 
-/** IPC options, now only use for write. */
+/**
+ * IPC write options.
+ *
+ * <p>Body compression applies only to record and dictionary batch bodies; schema and metadata-only
+ * messages are never compressed. Compressed codecs are resolved via {@code
+ * CompressionCodec.Factory}, so applications must include {@code arrow-compression} on the runtime
+ * classpath or module path to use codecs such as LZ4 or ZSTD.
+ */
 public class IpcOption {
 
   // Write the pre-0.15.0 encapsulated IPC message format
@@ -28,13 +38,63 @@ public class IpcOption {
   // The metadata version. Defaults to V5.
   public final MetadataVersion metadataVersion;
 
+  // The IPC body compression codec. Defaults to no compression.
+  public final CompressionUtil.CodecType codecType;
+
+  // Optional compression level for codecs that support it.
+  public final Optional<Integer> compressionLevel;
+
+  /** Create default IPC write options with V5 metadata and no body compression. */
   public IpcOption() {
-    this(false, MetadataVersion.DEFAULT);
+    this(
+        false,
+        MetadataVersion.DEFAULT,
+        CompressionUtil.CodecType.NO_COMPRESSION,
+        Optional.empty());
   }
 
+  /**
+   * Create IPC write options with explicit legacy framing and metadata version, but no body
+   * compression.
+   */
   public IpcOption(boolean writeLegacyIpcFormat, MetadataVersion metadataVersion) {
+    this(
+        writeLegacyIpcFormat,
+        metadataVersion,
+        CompressionUtil.CodecType.NO_COMPRESSION,
+        Optional.empty());
+  }
+
+  /**
+   * Create IPC write options with explicit legacy framing, metadata version, and body compression.
+   */
+  public IpcOption(
+      boolean writeLegacyIpcFormat,
+      MetadataVersion metadataVersion,
+      CompressionUtil.CodecType codecType,
+      Optional<Integer> compressionLevel) {
     this.write_legacy_ipc_format = writeLegacyIpcFormat;
-    this.metadataVersion = metadataVersion;
+    this.metadataVersion = Objects.requireNonNull(metadataVersion, "metadataVersion");
+    this.codecType = Objects.requireNonNull(codecType, "codecType");
+    this.compressionLevel = Objects.requireNonNull(compressionLevel, "compressionLevel");
+  }
+
+  /** Return a copy of these options with record and dictionary batch body compression enabled. */
+  public IpcOption withBodyCompression(CompressionUtil.CodecType codecType) {
+    return new IpcOption(write_legacy_ipc_format, metadataVersion, codecType, Optional.empty());
+  }
+
+  /**
+   * Return a copy of these options with record and dictionary batch body compression enabled and an
+   * explicit compression level.
+   */
+  public IpcOption withBodyCompression(
+      CompressionUtil.CodecType codecType, int compressionLevel) {
+    return new IpcOption(
+        write_legacy_ipc_format,
+        metadataVersion,
+        codecType,
+        Optional.of(compressionLevel));
   }
 
   public static final IpcOption DEFAULT = new IpcOption();
