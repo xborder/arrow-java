@@ -23,11 +23,17 @@ if [[ "${ARROW_JAVA_BUILD:-ON}" != "ON" ]]; then
   exit
 fi
 
-source_dir=${1}
+source_dir="$(cd "${1}" && pwd)"
 build_dir=${2}
 java_jni_dist_dir=${3}
 
-mvn="mvn -B -DskipTests -Drat.skip=true -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
+mvn="mvn -B -Drat.skip=true -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
+
+if [ "${ARROW_JAVA_BUILD_SKIP_TESTS:-ON}" = "ON" ]; then
+  mvn="${mvn} -DskipTests"
+else
+  mvn="${mvn} -Darrow.test.dataRoot=${source_dir}/testing/data"
+fi
 
 if [ "${ARROW_JAVA_SKIP_GIT_PLUGIN:-OFF}" = "ON" ]; then
   mvn="${mvn} -Dmaven.gitcommitid.skip=true"
