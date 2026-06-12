@@ -47,8 +47,7 @@ services:
       - ${DOCKER_VOLUME_PREFIX}maven-cache:/root/.m2:delegated
     command:
       /bin/bash -c "
-        /arrow-java/ci/scripts/build.sh /arrow-java /build /jni &&
-        /arrow-java/ci/scripts/test.sh /arrow-java /build /jni"
+        ARROW_JAVA_BUILD_SKIP_TESTS=OFF /arrow-java/ci/scripts/build.sh /arrow-java /build /jni"
 
   conda-jni-cdata:
     # Builds and tests just the C Data Interface JNI library and JARs.
@@ -81,8 +80,7 @@ services:
     command:
       /bin/bash -c "
         /arrow-java/ci/scripts/jni_build.sh /arrow-java /build/jni /build /jni &&
-        /arrow-java/ci/scripts/build.sh /arrow-java /build /jni &&
-        /arrow-java/ci/scripts/test.sh /arrow-java /build /jni"
+        ARROW_JAVA_BUILD_SKIP_TESTS=OFF /arrow-java/ci/scripts/build.sh /arrow-java /build /jni"
 
   vcpkg-jni:
     # Builds all the JNI libraries, but not the JARs.

@@ -104,16 +104,12 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
-      - name: Build
+      - name: Build and Test
         shell: bash
         env:
           DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          ARROW_JAVA_BUILD_SKIP_TESTS: "OFF"
         run: ci/scripts/build.sh . build jni
-      - name: Test
-        shell: bash
-        env:
-          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
-        run: ci/scripts/test.sh . build jni
 
   windows:
     name: AMD64 Windows Server 2022 Java JDK ${{ matrix.jdk }}
@@ -135,16 +131,12 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
-      - name: Build
+      - name: Build and Test
         shell: bash
         env:
           DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          ARROW_JAVA_BUILD_SKIP_TESTS: "OFF"
         run: ci/scripts/build.sh . build jni
-      - name: Test
-        shell: bash
-        env:
-          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
-        run: ci/scripts/test.sh . build jni
 
   integration:
     name: AMD64 integration
