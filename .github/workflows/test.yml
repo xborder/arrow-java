@@ -66,7 +66,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .docker
-          key: maven-${{ matrix.jdk }}-${{ matrix.maven }}-${{ hashFiles('compose.yaml', '**/pom.xml', '**/*.java') }}
+          key: maven-${{ matrix.jdk }}-${{ matrix.maven }}-${{ hashFiles('compose.yaml', '**/pom.xml') }}
           restore-keys: maven-${{ matrix.jdk }}-${{ matrix.maven }}-
       - name: Execute Docker Build
         env:
