@@ -28,6 +28,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  DOCKER_VOLUME_PREFIX: ".docker/"
+
 jobs:
   build-java:
     name: Build Java artifacts
@@ -167,14 +170,18 @@ jobs:
                 /arrow-java \
                 /arrow-java/.phase4-cdata/java-build \
                 /arrow-java/.phase4-cdata/jni-dist
+              mkdir -p /arrow-java/.phase4-cdata/m2-repository/org/apache
+              cp -a \
+                /root/.m2/repository/org/apache/arrow \
+                /arrow-java/.phase4-cdata/m2-repository/org/apache/
             '
-          sudo chown -R "$(id -u):$(id -g)" .phase4-cdata .docker
+          sudo chown -R "$(id -u):$(id -g)" .phase4-cdata
+          if [ -d .docker ]; then
+            sudo chown -R "$(id -u):$(id -g)" .docker
+          fi
       - name: Pack reusable C Data artifacts
         shell: bash
-        run: |
-          mkdir -p .phase4-cdata/m2-repository/org/apache
-          cp -a .docker/maven-cache/repository/org/apache/arrow .phase4-cdata/m2-repository/org/apache/
-          tar -czf phase4-cdata-build.tgz .phase4-cdata
+        run: tar -czf phase4-cdata-build.tgz .phase4-cdata
       - name: Upload reusable C Data artifacts
         uses: actions/upload-artifact@v5
         with:
