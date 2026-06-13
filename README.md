@@ -27,7 +27,7 @@ The following guides explain the fundamental data structures used in the Java im
 - [VectorSchemaRoot](https://arrow.apache.org/java/current/vector_schema_root.html#vectorschemaroot) is a container that can hold multiple vectors based on a schema.
 - The [Reading/Writing IPC formats](https://arrow.apache.org/java/current/ipc.html) guide explains how to stream record batches as well as serializing record batches to files.
 
-Generated javadoc documentation is available [here](https://arrow.apache.org/java/current/).
+Generated Javadoc documentation is available [here](https://arrow.apache.org/java/current/).
 
 ## Building from source
 
