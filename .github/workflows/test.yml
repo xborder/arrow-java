@@ -19,11 +19,8 @@ name: Test
 
 on:
   push:
-    branches:
-      - '**'
-      - '!dependabot/**'
-    tags:
-      - '**'
+    branches: [main, 'maintenance-**']
+    tags: ['**']
   pull_request:
 
 concurrency:
@@ -66,7 +63,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .docker
-          key: maven-${{ matrix.jdk }}-${{ matrix.maven }}-${{ hashFiles('compose.yaml', '**/pom.xml', '**/*.java') }}
+          key: maven-${{ matrix.jdk }}-${{ matrix.maven }}-${{ hashFiles('compose.yaml', '**/pom.xml') }}
           restore-keys: maven-${{ matrix.jdk }}-${{ matrix.maven }}-
       - name: Execute Docker Build
         env:
@@ -99,6 +96,7 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: ${{ matrix.jdk }}
+          cache: 'maven'
       - name: Checkout Arrow
         uses: actions/checkout@v6
         with:
@@ -130,6 +128,7 @@ jobs:
         with:
           java-version: ${{ matrix.jdk }}
           distribution: 'temurin'
+          cache: 'maven'
       - name: Checkout Arrow
         uses: actions/checkout@v6
         with:
@@ -149,6 +148,7 @@ jobs:
   integration:
     name: AMD64 integration
     runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
     timeout-minutes: 60
     steps:
       - name: Checkout Arrow
