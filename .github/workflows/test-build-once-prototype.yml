@@ -1,0 +1,127 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Test Build Once Prototype
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-java:
+    name: Build Java artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: 17
+          cache: 'maven'
+      - name: Checkout Arrow
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Build without tests
+        shell: bash
+        run: ci/scripts/build.sh . build jni
+      - name: Pack reusable artifacts
+        shell: bash
+        run: |
+          mkdir -p phase4-artifacts/m2-repository/org/apache
+          cp -a "${HOME}/.m2/repository/org/apache/arrow" phase4-artifacts/m2-repository/org/apache/
+          tar -czf phase4-java-build.tgz build phase4-artifacts
+      - name: Upload reusable artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: phase4-java-build
+          path: phase4-java-build.tgz
+          retention-days: 1
+
+  test-prebuilt-java:
+    name: Test prebuilt Java artifacts on ${{ matrix.os }} JDK ${{ matrix.jdk }}
+    needs: build-java
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            jdk: 17
+          - os: ubuntu-latest
+            jdk: 21
+          - os: ubuntu-latest
+            jdk: 23
+          - os: macos-latest
+            jdk: 17
+          - os: windows-latest
+            jdk: 17
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.jdk }}
+          cache: 'maven'
+      - name: Checkout Arrow
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Download reusable artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: phase4-java-build
+      - name: Restore reusable artifacts
+        shell: bash
+        run: |
+          tar -xzf phase4-java-build.tgz
+          mkdir -p "${HOME}/.m2/repository/org/apache"
+          cp -a phase4-artifacts/m2-repository/org/apache/arrow "${HOME}/.m2/repository/org/apache/"
+      - name: Run tests without compiler lifecycle
+        shell: bash
+        run: |
+          set -o pipefail
+          pushd build
+          mvn \
+            -B \
+            -T 2C \
+            -Darrow.test.dataRoot="${GITHUB_WORKSPACE}/testing/data" \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+            -DfailIfNoTests=false \
+            surefire:test | tee ../phase4-surefire.log
+          popd
+
+          if grep -E "Compiling [0-9]+ source files?" phase4-surefire.log; then
+            echo "Unexpected compilation occurred while running prebuilt tests."
+            exit 1
+          fi
+
+          if ! grep -q "Tests run:" phase4-surefire.log; then
+            echo "No surefire test summary found; tests may have been skipped."
+            exit 1
+          fi
