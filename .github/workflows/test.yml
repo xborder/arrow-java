@@ -34,15 +34,30 @@ env:
   DOCKER_VOLUME_PREFIX: ".docker/"
 
 jobs:
+  setup:
+    name: Setup test matrix
+    runs-on: ubuntu-latest
+    outputs:
+      jdk: ${{ steps.matrix.outputs.jdk }}
+    steps:
+      - id: matrix
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo 'jdk=[17,21]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'jdk=[17,21,23]' >> "$GITHUB_OUTPUT"
+          fi
+
   ubuntu:
     name: AMD64 ${{ matrix.name }} JDK ${{ matrix.jdk }} Maven ${{ matrix.maven }}
+    needs: setup
     runs-on: ubuntu-latest
     if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        jdk: [17, 21, 23]
+        jdk: ${{ fromJson(needs.setup.outputs.jdk) }}
         maven: [3.9.9]
         image: [ubuntu, conda-jni-cdata]
         include:
