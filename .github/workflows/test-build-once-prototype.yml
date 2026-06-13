@@ -125,3 +125,122 @@ jobs:
             echo "No surefire test summary found; tests may have been skipped."
             exit 1
           fi
+
+  build-cdata:
+    name: Build C Data artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JDK: 17
+      MAVEN: 3.9.9
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Cache Docker Volumes
+        uses: actions/cache@v5
+        with:
+          path: .docker
+          key: phase4-cdata-${{ env.JDK }}-${{ env.MAVEN }}-${{ hashFiles('compose.yaml', '**/pom.xml') }}
+          restore-keys: phase4-cdata-${{ env.JDK }}-${{ env.MAVEN }}-
+      - name: Build C Data without tests
+        shell: bash
+        run: |
+          rm -rf .phase4-cdata
+          mkdir -p .phase4-cdata
+          docker compose run \
+            --rm \
+            -e CI=true \
+            -e ARROW_JAVA_CDATA=ON \
+            conda-jni-cdata \
+            /bin/bash -lc '
+              set -euo pipefail
+              /arrow-java/ci/scripts/jni_build.sh \
+                /arrow-java \
+                /arrow-java/.phase4-cdata/jni-build \
+                /arrow-java/.phase4-cdata/build \
+                /arrow-java/.phase4-cdata/jni-dist
+              ARROW_JAVA_CDATA=ON \
+                /arrow-java/ci/scripts/build.sh \
+                /arrow-java \
+                /arrow-java/.phase4-cdata/java-build \
+                /arrow-java/.phase4-cdata/jni-dist
+            '
+          sudo chown -R "$(id -u):$(id -g)" .phase4-cdata .docker
+      - name: Pack reusable C Data artifacts
+        shell: bash
+        run: |
+          mkdir -p .phase4-cdata/m2-repository/org/apache
+          cp -a .docker/maven-cache/repository/org/apache/arrow .phase4-cdata/m2-repository/org/apache/
+          tar -czf phase4-cdata-build.tgz .phase4-cdata
+      - name: Upload reusable C Data artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: phase4-cdata-build
+          path: phase4-cdata-build.tgz
+          retention-days: 1
+
+  test-prebuilt-cdata:
+    name: Test prebuilt C Data artifacts
+    needs: build-cdata
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JDK: 17
+      MAVEN: 3.9.9
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Cache Docker Volumes
+        uses: actions/cache@v5
+        with:
+          path: .docker
+          key: phase4-cdata-test-${{ env.JDK }}-${{ env.MAVEN }}-${{ hashFiles('compose.yaml', '**/pom.xml') }}
+          restore-keys: phase4-cdata-test-${{ env.JDK }}-${{ env.MAVEN }}-
+      - name: Download reusable C Data artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: phase4-cdata-build
+      - name: Restore reusable C Data artifacts
+        shell: bash
+        run: tar -xzf phase4-cdata-build.tgz
+      - name: Run C Data tests without compiler lifecycle
+        shell: bash
+        run: |
+          docker compose run \
+            --rm \
+            -e CI=true \
+            -e ARROW_JAVA_CDATA=ON \
+            conda-jni-cdata \
+            /bin/bash -lc '
+              set -euo pipefail
+              mkdir -p /root/.m2/repository/org/apache
+              cp -a \
+                /arrow-java/.phase4-cdata/m2-repository/org/apache/arrow \
+                /root/.m2/repository/org/apache/
+              cd /arrow-java/.phase4-cdata/java-build
+              mvn \
+                -B \
+                -T 2C \
+                -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+                -DfailIfNoTests=false \
+                -Parrow-c-data \
+                -pl c \
+                -Darrow.c.jni.dist.dir=/arrow-java/.phase4-cdata/jni-dist \
+                surefire:test | tee /arrow-java/.phase4-cdata-cdata-surefire.log
+
+              if grep -E "Compiling [0-9]+ source files?" /arrow-java/.phase4-cdata-cdata-surefire.log; then
+                echo "Unexpected compilation occurred while running prebuilt C Data tests."
+                exit 1
+              fi
+
+              if ! grep -q "Tests run:" /arrow-java/.phase4-cdata-cdata-surefire.log; then
+                echo "No C Data surefire test summary found; tests may have been skipped."
+                exit 1
+              fi
+            '
