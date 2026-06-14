@@ -22,6 +22,13 @@ on:
     branches: [main, 'maintenance-**']
     tags: ['**']
   pull_request:
+  workflow_dispatch:
+    inputs:
+      skip_integration:
+        description: 'Skip integration tests for timing comparison'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
@@ -35,8 +42,270 @@ env:
   DOCKER_VOLUME_PREFIX: ".docker/"
 
 jobs:
-  ubuntu:
-    name: AMD64 ${{ matrix.name }} JDK ${{ matrix.jdk }} Maven ${{ matrix.maven }}
+  build-java:
+    name: Build Java artifacts
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: 17
+          cache: 'maven'
+      - name: Build without tests
+        shell: bash
+        run: ci/scripts/build.sh . build jni
+      - name: Pack reusable artifacts
+        shell: bash
+        run: |
+          mkdir -p test-artifacts/m2-repository/org/apache
+          cp -a "${HOME}/.m2/repository/org/apache/arrow" test-artifacts/m2-repository/org/apache/
+          tar -czf java-build.tgz build test-artifacts
+      - name: Upload reusable artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: java-build
+          path: java-build.tgz
+          retention-days: 1
+
+  test-java:
+    name: ${{ matrix.name }} JDK ${{ matrix.jdk }}
+    needs: build-java
+    runs-on: ${{ matrix.os }}
+    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: AMD64 Ubuntu
+            os: ubuntu-latest
+            jdk: 17
+          - name: AMD64 Ubuntu
+            os: ubuntu-latest
+            jdk: 21
+          - name: AMD64 Ubuntu
+            os: ubuntu-latest
+            jdk: 23
+          - name: AMD64 macOS 15-intel Java
+            os: macos-15-intel
+            jdk: 17
+          - name: AArch64 macOS latest Java
+            os: macos-latest
+            jdk: 17
+          - name: AMD64 Windows Server 2022 Java
+            os: windows-latest
+            jdk: 17
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.jdk }}
+          cache: 'maven'
+      - name: Download reusable artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: java-build
+      - name: Restore reusable artifacts
+        shell: bash
+        run: |
+          tar -xzf java-build.tgz
+          mkdir -p "${HOME}/.m2/repository/org/apache"
+          cp -a test-artifacts/m2-repository/org/apache/arrow "${HOME}/.m2/repository/org/apache/"
+      - name: Test without compiler lifecycle
+        shell: bash
+        run: |
+          set -o pipefail
+          pushd build
+          mvn \
+            -B \
+            -T 2C \
+            -Darrow.test.dataRoot="${GITHUB_WORKSPACE}/testing/data" \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+            -DfailIfNoTests=false \
+            surefire:test | tee ../surefire.log
+          popd
+
+          if grep -E "Compiling [0-9]+ source files?" surefire.log; then
+            echo "Unexpected compilation occurred while running prebuilt tests."
+            exit 1
+          fi
+
+          if ! grep -q "Tests run:" surefire.log; then
+            echo "No surefire test summary found; tests may have been skipped."
+            exit 1
+          fi
+
+  compile-check:
+    name: AMD64 Ubuntu compile check JDK ${{ matrix.jdk }}
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        jdk: [21, 23]
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.jdk }}
+          cache: 'maven'
+      - name: Compile without tests
+        shell: bash
+        run: mvn -B -T 2C -DskipTests test-compile
+
+  build-cdata-native:
+    name: Build C Data native artifacts
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
+    timeout-minutes: 30
+    env:
+      JDK: 17
+      MAVEN: 3.9.9
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Cache Docker Volumes
+        uses: actions/cache@v5
+        with:
+          path: .docker
+          key: cdata-${{ env.JDK }}-${{ env.MAVEN }}-${{ hashFiles('compose.yaml', '**/pom.xml') }}
+          restore-keys: cdata-${{ env.JDK }}-${{ env.MAVEN }}-
+      - name: Build C Data native library
+        shell: bash
+        run: |
+          rm -rf .cdata-native-artifacts
+          mkdir -p .cdata-native-artifacts
+          docker compose run \
+            --rm \
+            -e CI=true \
+            -e ARROW_JAVA_CDATA=ON \
+            conda-jni-cdata \
+            /bin/bash -lc '
+              set -euo pipefail
+              /arrow-java/ci/scripts/jni_build.sh \
+                /arrow-java \
+                /arrow-java/.cdata-native-artifacts/jni-build \
+                /arrow-java/.cdata-native-artifacts/build \
+                /arrow-java/.cdata-native-artifacts/jni-dist
+            '
+          sudo chown -R "$(id -u):$(id -g)" .cdata-native-artifacts
+          if [ -d .docker ]; then
+            sudo chown -R "$(id -u):$(id -g)" .docker
+          fi
+      - name: Pack reusable C Data native artifacts
+        shell: bash
+        run: tar -czf cdata-native-build.tgz .cdata-native-artifacts
+      - name: Upload reusable C Data native artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: cdata-native-build
+          path: cdata-native-build.tgz
+          retention-days: 1
+
+  build-cdata-java:
+    name: Build C Data Java artifacts
+    needs: [build-java, build-cdata-native]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
+    timeout-minutes: 30
+    env:
+      JDK: 17
+      MAVEN: 3.9.9
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Cache Docker Volumes
+        uses: actions/cache@v5
+        with:
+          path: .docker
+          key: cdata-java-${{ env.JDK }}-${{ env.MAVEN }}-${{ hashFiles('compose.yaml', '**/pom.xml') }}
+          restore-keys: cdata-java-${{ env.JDK }}-${{ env.MAVEN }}-
+      - name: Download reusable Java artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: java-build
+      - name: Download reusable C Data native artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: cdata-native-build
+      - name: Restore reusable artifacts
+        shell: bash
+        run: |
+          tar -xzf java-build.tgz
+          tar -xzf cdata-native-build.tgz
+      - name: Build C Data Java without tests
+        shell: bash
+        run: |
+          docker compose run \
+            --rm \
+            -e CI=true \
+            -e ARROW_JAVA_CDATA=ON \
+            conda-jni-cdata \
+            /bin/bash -lc '
+              set -euo pipefail
+              mkdir -p /root/.m2/repository/org/apache
+              cp -a \
+                /arrow-java/test-artifacts/m2-repository/org/apache/arrow \
+                /root/.m2/repository/org/apache/
+              cd /arrow-java/build
+              mvn \
+                -B \
+                -T 2C \
+                -DskipTests \
+                -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+                -Parrow-c-data \
+                -pl c \
+                -Darrow.c.jni.dist.dir=/arrow-java/.cdata-native-artifacts/jni-dist \
+                test-compile
+              mkdir -p /arrow-java/.cdata-java-artifacts/m2-repository/org/apache
+              cp -a \
+                /root/.m2/repository/org/apache/arrow \
+                /arrow-java/.cdata-java-artifacts/m2-repository/org/apache/
+            '
+          sudo chown -R "$(id -u):$(id -g)" build .cdata-java-artifacts
+          if [ -d .docker ]; then
+            sudo chown -R "$(id -u):$(id -g)" .docker
+          fi
+      - name: Pack reusable C Data Java artifacts
+        shell: bash
+        run: tar -czf cdata-java-build.tgz build .cdata-java-artifacts
+      - name: Upload reusable C Data Java artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: cdata-java-build
+          path: cdata-java-build.tgz
+          retention-days: 1
+
+  test-cdata:
+    name: AMD64 Conda JNI JDK ${{ matrix.jdk }} Maven ${{ matrix.maven }}
+    needs: [build-cdata-native, build-cdata-java]
     runs-on: ubuntu-latest
     if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
     timeout-minutes: 30
@@ -45,12 +314,6 @@ jobs:
       matrix:
         jdk: [17, 21, 23]
         maven: [3.9.9]
-        image: [ubuntu, conda-jni-cdata]
-        include:
-          - image: ubuntu
-            name: "Ubuntu"
-          - image: conda-jni-cdata
-            name: "Conda JNI"
     env:
       JDK: ${{ matrix.jdk }}
       MAVEN: ${{ matrix.maven }}
@@ -64,85 +327,56 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .docker
-          key: maven-${{ matrix.jdk }}-${{ matrix.maven }}-${{ hashFiles('compose.yaml', '**/pom.xml') }}
-          restore-keys: maven-${{ matrix.jdk }}-${{ matrix.maven }}-
-      - name: Execute Docker Build
-        env:
-          # Enables build caching, but not strictly required
-          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          key: cdata-test-${{ matrix.jdk }}-${{ matrix.maven }}-${{ hashFiles('compose.yaml', '**/pom.xml') }}
+          restore-keys: cdata-test-${{ matrix.jdk }}-${{ matrix.maven }}-
+      - name: Download reusable C Data native artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: cdata-native-build
+      - name: Download reusable C Data Java artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: cdata-java-build
+      - name: Restore reusable C Data artifacts
+        shell: bash
+        run: |
+          tar -xzf cdata-native-build.tgz
+          tar -xzf cdata-java-build.tgz
+      - name: Test C Data without compiler lifecycle
+        shell: bash
         run: |
           docker compose run \
+            --rm \
             -e CI=true \
-            -e "DEVELOCITY_ACCESS_KEY=$DEVELOCITY_ACCESS_KEY" \
-            ${{ matrix.image }}
+            -e ARROW_JAVA_CDATA=ON \
+            conda-jni-cdata \
+            /bin/bash -lc '
+              set -euo pipefail
+              mkdir -p /root/.m2/repository/org/apache
+              cp -a \
+                /arrow-java/.cdata-java-artifacts/m2-repository/org/apache/arrow \
+                /root/.m2/repository/org/apache/
+              cd /arrow-java/build
+              mvn \
+                -B \
+                -T 2C \
+                -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+                -DfailIfNoTests=false \
+                -Parrow-c-data \
+                -pl c \
+                -Darrow.c.jni.dist.dir=/arrow-java/.cdata-native-artifacts/jni-dist \
+                surefire:test | tee /arrow-java/cdata-surefire.log
 
-  macos:
-    name: ${{ matrix.arch }} macOS ${{ matrix.macos }} Java JDK ${{ matrix.jdk }}
-    runs-on: macos-${{ matrix.macos }}
-    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: AMD64
-            jdk: 17
-            macos: 15-intel
-          - arch: AArch64
-            jdk: 17
-            macos: latest
-    steps:
-      - name: Set up Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: 'temurin'
-          java-version: ${{ matrix.jdk }}
-      - name: Checkout Arrow
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          submodules: recursive
-      - name: Build
-        shell: bash
-        env:
-          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
-        run: ci/scripts/build.sh . build jni
-      - name: Test
-        shell: bash
-        env:
-          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
-        run: ci/scripts/test.sh . build jni
+              if grep -E "Compiling [0-9]+ source files?" /arrow-java/cdata-surefire.log; then
+                echo "Unexpected compilation occurred while running prebuilt C Data tests."
+                exit 1
+              fi
 
-  windows:
-    name: AMD64 Windows Server 2022 Java JDK ${{ matrix.jdk }}
-    runs-on: windows-latest
-    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        jdk: [17]
-    steps:
-      - name: Set up Java
-        uses: actions/setup-java@v5
-        with:
-          java-version: ${{ matrix.jdk }}
-          distribution: 'temurin'
-      - name: Checkout Arrow
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          submodules: recursive
-      - name: Build
-        shell: bash
-        env:
-          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
-        run: ci/scripts/build.sh . build jni
-      - name: Test
-        shell: bash
-        env:
-          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
-        run: ci/scripts/test.sh . build jni
+              if ! grep -q "Tests run:" /arrow-java/cdata-surefire.log; then
+                echo "No C Data surefire test summary found; tests may have been skipped."
+                exit 1
+              fi
+            '
 
   integration:
     name: AMD64 integration
@@ -155,6 +389,12 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
+            if (context.eventName === 'workflow_dispatch' && '${{ inputs.skip_integration }}' === 'true') {
+              core.setOutput('should_run', 'false');
+              core.notice('Manual run requested without integration tests.');
+              return;
+            }
+
             if (context.eventName !== 'pull_request') {
               core.setOutput('should_run', 'true');
               return;
