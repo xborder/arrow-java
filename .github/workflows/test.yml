@@ -22,6 +22,13 @@ on:
     branches: [main, 'maintenance-**']
     tags: ['**']
   pull_request:
+  workflow_dispatch:
+    inputs:
+      skip_integration:
+        description: 'Skip integration tests for timing comparison'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
@@ -308,6 +315,12 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
+            if (context.eventName === 'workflow_dispatch' && ${{ inputs.skip_integration }}) {
+              core.setOutput('should_run', 'false');
+              core.notice('Manual run requested without integration tests.');
+              return;
+            }
+
             if (context.eventName !== 'pull_request') {
               core.setOutput('should_run', 'true');
               return;
