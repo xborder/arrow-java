@@ -31,29 +31,40 @@ if [ -d "${java_jni_dist_dir}" ]; then
   java_jni_dist_dir="$(cd "${java_jni_dist_dir}" && pwd)"
 fi
 
-mvn="mvn -B -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
-# Use `2 * ncores` threads
-mvn="${mvn} -T 2C"
+mvn=(
+  mvn
+  -B
+  -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
+  -T
+  2C
+)
 
 run_tests() {
   local log_name=$1
   shift
 
   if [[ "${ARROW_JAVA_TEST_PREBUILT:-OFF}" = "ON" ]]; then
-    set -o pipefail
-    "${@}" -DfailIfNoTests=false surefire:test | tee "${source_dir}/${log_name}"
-
-    if grep -E "Compiling [0-9]+ source files?" "${source_dir}/${log_name}"; then
-      echo "Unexpected compilation occurred while running prebuilt tests."
-      exit 1
-    fi
-
-    if ! grep -q "Tests run:" "${source_dir}/${log_name}"; then
-      echo "No surefire test summary found; tests may have been skipped."
-      exit 1
-    fi
+    run_prebuilt_tests "${log_name}" "${@}" -DfailIfNoTests=false surefire:test
   else
     "${@}" test
+  fi
+}
+
+run_prebuilt_tests() {
+  local log_name=$1
+  shift
+
+  set -o pipefail
+  "${@}" | tee "${source_dir}/${log_name}"
+
+  if grep -E "Compiling [0-9]+ source files?" "${source_dir}/${log_name}"; then
+    echo "Unexpected compilation occurred while running prebuilt tests."
+    exit 1
+  fi
+
+  if ! grep -q "Tests run:" "${source_dir}/${log_name}"; then
+    echo "No surefire test summary found; tests may have been skipped."
+    exit 1
   fi
 }
 
@@ -62,8 +73,17 @@ pushd "${build_dir}"
 if [[ "${ARROW_JAVA_TEST_BASE:-ON}" = "ON" ]]; then
   run_tests \
     surefire.log \
-    ${mvn} \
+    "${mvn[@]}" \
     -Darrow.test.dataRoot="${source_dir}/testing/data"
+
+  if [[ "${ARROW_JAVA_TEST_PREBUILT:-OFF}" = "ON" ]]; then
+    run_prebuilt_tests \
+      opens-surefire.log \
+      "${mvn[@]}" \
+      -DfailIfNoTests=false \
+      -pl memory/memory-core \
+      org.apache.maven.plugins:maven-surefire-plugin:test@opens-tests
+  fi
 fi
 
 projects=()
@@ -75,7 +95,7 @@ fi
 if [ "${#projects[@]}" -gt 0 ]; then
   run_tests \
     jni-surefire.log \
-    ${mvn} \
+    "${mvn[@]}" \
     -Parrow-jni \
     -pl "$(
       IFS=,
@@ -87,7 +107,7 @@ fi
 if [ "${ARROW_JAVA_CDATA}" = "ON" ]; then
   run_tests \
     cdata-surefire.log \
-    ${mvn} \
+    "${mvn[@]}" \
     -Parrow-c-data \
     -pl c \
     -Darrow.c.jni.dist.dir="${java_jni_dist_dir}"
