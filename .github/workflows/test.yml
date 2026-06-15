@@ -162,14 +162,14 @@ jobs:
           cp -a .docker/jni-dist jni
           mkdir -p "${HOME}/.m2/repository/org/apache"
           cp -a .docker/maven-cache/repository/org/apache/arrow "${HOME}/.m2/repository/org/apache/"
-      - name: Test without compiler lifecycle
+      - name: Test prebuilt artifacts on macOS/Windows
         if: ${{ matrix.compose_service == '' }}
         shell: bash
         env:
           ARROW_JAVA_TEST_PREBUILT: "ON"
           DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
         run: ci/scripts/test.sh . build jni
-      - name: Test without compiler lifecycle in Docker
+      - name: Test prebuilt artifacts on Ubuntu Docker
         if: ${{ matrix.compose_service != '' }}
         shell: bash
         env:
