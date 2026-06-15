@@ -84,7 +84,7 @@ jobs:
           retention-days: 1
 
   test-java:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.name || format('AMD64 Ubuntu JDK {0} Maven {1}', matrix.jdk, matrix.maven) }}
     needs: build-java
     runs-on: ${{ matrix.os }}
     if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
@@ -92,33 +92,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        target: [ubuntu]
+        jdk: [17, 21, 23]
+        maven: [3.9.9]
         include:
-          - name: AMD64 Ubuntu JDK 17 Maven 3.9.9
+          - target: ubuntu
             os: ubuntu-latest
-            jdk: 17
-            maven: 3.9.9
             compose_service: ubuntu-test-prebuilt
-          - name: AMD64 Ubuntu JDK 21 Maven 3.9.9
-            os: ubuntu-latest
-            jdk: 21
-            maven: 3.9.9
-            compose_service: ubuntu-test-prebuilt
-          - name: AMD64 Ubuntu JDK 23 Maven 3.9.9
-            os: ubuntu-latest
-            jdk: 23
-            maven: 3.9.9
-            compose_service: ubuntu-test-prebuilt
-          - name: AMD64 macOS 15-intel Java JDK 17
+          - target: macos-intel
+            name: AMD64 macOS 15-intel Java JDK 17
             os: macos-15-intel
             jdk: 17
             maven: 3.9.9
             compose_service: ''
-          - name: AArch64 macOS latest Java JDK 17
+          - target: macos-arm
+            name: AArch64 macOS latest Java JDK 17
             os: macos-latest
             jdk: 17
             maven: 3.9.9
             compose_service: ''
-          - name: AMD64 Windows Server 2022 Java JDK 17
+          - target: windows
+            name: AMD64 Windows Server 2022 Java JDK 17
             os: windows-latest
             jdk: 17
             maven: 3.9.9
