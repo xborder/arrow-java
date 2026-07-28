@@ -45,7 +45,7 @@ run_tests() {
   shift
 
   if [[ "${ARROW_JAVA_TEST_PREBUILT:-OFF}" = "ON" ]]; then
-    run_prebuilt_tests "${log_name}" "${@}" -Pprebuilt-tests -DfailIfNoTests=false test
+    run_prebuilt_tests "${log_name}" "${@}" -DfailIfNoTests=false surefire:test
   else
     "${@}" test
   fi
@@ -76,6 +76,15 @@ if [[ "${ARROW_JAVA_TEST_BASE:-ON}" = "ON" ]]; then
     surefire.log \
     "${mvn[@]}" \
     -Darrow.test.dataRoot="${source_dir}/testing/data"
+
+  if [[ "${ARROW_JAVA_TEST_PREBUILT:-OFF}" = "ON" ]]; then
+    run_prebuilt_tests \
+      opens-surefire.log \
+      "${mvn[@]}" \
+      -DfailIfNoTests=false \
+      -pl memory/memory-core \
+      org.apache.maven.plugins:maven-surefire-plugin:test@opens-tests
+  fi
 fi
 
 projects=()
