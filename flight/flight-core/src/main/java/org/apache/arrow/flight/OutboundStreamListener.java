@@ -68,6 +68,13 @@ public interface OutboundStreamListener {
    * Start sending data, using the schema of the given {@link VectorSchemaRoot}.
    *
    * <p>This method must be called before all others, except {@link #putMetadata(ArrowBuf)}.
+   *
+   * <p>Compression can be enabled for record and dictionary batch bodies by passing an {@link
+   * IpcOption} configured with {@link
+   * IpcOption#withBodyCompression(org.apache.arrow.vector.compression.CompressionUtil.CodecType)}.
+   * Schema and metadata-only messages are never compressed. Compressed codecs are resolved from
+   * the runtime classpath or module path, so applications must include {@code arrow-compression}
+   * to use codecs beyond {@code NO_COMPRESSION}.
    */
   void start(VectorSchemaRoot root, DictionaryProvider dictionaries, IpcOption option);
 
