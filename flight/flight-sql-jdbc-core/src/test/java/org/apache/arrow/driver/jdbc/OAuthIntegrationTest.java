@@ -467,7 +467,7 @@ public class OAuthIntegrationTest {
     String authHeader =
         FLIGHT_SERVER_TEST_EXTENSION
             .getInterceptorFactory()
-            .getHeader(org.apache.arrow.flight.FlightMethod.GET_FLIGHT_INFO, "authorization");
+            .getHeader(org.apache.arrow.flight.FlightMethod.POLL_FLIGHT_INFO, "authorization");
     assertNotNull(authHeader, "Authorization header should be present in Flight requests");
     assertEquals("Bearer " + VALID_ACCESS_TOKEN, authHeader);
   }

@@ -17,7 +17,9 @@
 package org.apache.arrow.driver.jdbc;
 
 import java.sql.SQLException;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
+import org.apache.arrow.driver.jdbc.client.PollInfoOperation;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -27,6 +29,8 @@ import org.apache.calcite.avatica.Meta.StatementHandle;
 
 /** A SQL statement for querying data from an Arrow Flight server. */
 public class ArrowFlightStatement extends AvaticaStatement implements ArrowFlightInfoStatement {
+  private final AtomicReference<PollInfoOperation> activeOperation = new AtomicReference<>();
+  private volatile PollInfoOperation lastOperation;
 
   ArrowFlightStatement(
       final ArrowFlightConnection connection,
@@ -57,6 +61,30 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
         ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
     setSignature(signature);
 
-    return preparedStatement.executeQuery();
+    final PollInfoOperation operation = new PollInfoOperation(getQueryTimeout());
+    activeOperation.set(operation);
+    lastOperation = operation;
+    try {
+      return preparedStatement.executeQuery(operation);
+    } finally {
+      activeOperation.compareAndSet(operation, null);
+      operation.close();
+    }
+  }
+
+  @Override
+  public void cancel() throws SQLException {
+    final PollInfoOperation operation = activeOperation.get();
+    if (operation != null) {
+      operation.cancel();
+    }
+    super.cancel();
+  }
+
+  long remainingQueryTimeoutNanos() {
+    final PollInfoOperation operation = lastOperation;
+    return operation != null && operation.hasDeadline()
+        ? operation.remainingTimeoutNanos()
+        : Long.MAX_VALUE;
   }
 }
