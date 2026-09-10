@@ -21,6 +21,7 @@ import static org.apache.arrow.driver.jdbc.utils.FlightEndpointDataQueue.createN
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLTimeoutException;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.Optional;
@@ -32,6 +33,7 @@ import org.apache.arrow.driver.jdbc.utils.VectorSchemaRootTransformer;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightRuntimeException;
+import org.apache.arrow.flight.FlightStatusCode;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -73,7 +75,20 @@ public final class ArrowFlightJdbcFlightStreamResultSet
       throws SQLException {
     super(statement, state, signature, resultSetMetaData, timeZone, firstFrame);
     this.connection = (ArrowFlightConnection) statement.connection;
-    this.flightInfo = ((ArrowFlightInfoStatement) statement).executeFlightInfoQuery();
+    try {
+      this.flightInfo = ((ArrowFlightInfoStatement) statement).executeFlightInfoQuery();
+    } catch (FlightRuntimeException e) {
+      if (e.status().code() != FlightStatusCode.TIMED_OUT) {
+        throw e;
+      }
+      final SQLTimeoutException jdbcTimeout =
+          new SQLTimeoutException(
+              String.format(
+                  "Query timed out after %d %s",
+                  statement.getQueryTimeout(), TimeUnit.SECONDS));
+      jdbcTimeout.initCause(e);
+      throw jdbcTimeout;
+    }
   }
 
   /** Private constructor for fromFlightInfo. */
@@ -284,16 +299,42 @@ public final class ArrowFlightJdbcFlightStreamResultSet
       throws SQLException {
     try {
       if (canTimeout) {
-        final int statementTimeout = statement != null ? statement.getQueryTimeout() : 0;
-        return statementTimeout != 0
-            ? flightEndpointDataQueue.next(statementTimeout, TimeUnit.SECONDS)
-            : flightEndpointDataQueue.next();
-      } else {
-        return flightEndpointDataQueue.next();
+        final long remainingTimeoutNanos = remainingQueryTimeoutNanos();
+        if (remainingTimeoutNanos != Long.MAX_VALUE) {
+          if (remainingTimeoutNanos <= 0) {
+            throw new SQLTimeoutException("Query timed out before retrieving its first endpoint");
+          }
+          try {
+            return flightEndpointDataQueue.next(remainingTimeoutNanos, TimeUnit.NANOSECONDS);
+          } catch (SQLTimeoutException e) {
+            if (statement != null && e.getMessage().startsWith("Query timed out after")) {
+              final SQLTimeoutException jdbcTimeout =
+                  new SQLTimeoutException(
+                      String.format(
+                          "Query timed out after %d %s",
+                          statement.getQueryTimeout(), TimeUnit.SECONDS));
+              jdbcTimeout.initCause(e);
+              throw jdbcTimeout;
+            }
+            throw e;
+          }
+        }
       }
+      return flightEndpointDataQueue.next();
     } catch (final IllegalStateException e) {
       throw normalizeClosedQueueException(flightEndpointDataQueue, e);
     }
+  }
+
+  private long remainingQueryTimeoutNanos() throws SQLException {
+    if (statement instanceof ArrowFlightStatement) {
+      return ((ArrowFlightStatement) statement).remainingQueryTimeoutNanos();
+    }
+    if (statement instanceof ArrowFlightPreparedStatement) {
+      return ((ArrowFlightPreparedStatement) statement).remainingQueryTimeoutNanos();
+    }
+    final int statementTimeout = statement != null ? statement.getQueryTimeout() : 0;
+    return statementTimeout > 0 ? TimeUnit.SECONDS.toNanos(statementTimeout) : Long.MAX_VALUE;
   }
 
   static void enqueueEndpointData(

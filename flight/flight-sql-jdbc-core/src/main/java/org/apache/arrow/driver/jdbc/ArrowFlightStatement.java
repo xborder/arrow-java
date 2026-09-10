@@ -18,6 +18,8 @@ package org.apache.arrow.driver.jdbc;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.arrow.driver.jdbc.client.PollInfoOperation;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightRuntimeException;
@@ -34,6 +36,8 @@ import org.apache.calcite.avatica.Meta.StatementType;
 
 /** A SQL statement for querying data from an Arrow Flight server. */
 public class ArrowFlightStatement extends AvaticaStatement implements ArrowFlightInfoStatement {
+  private final AtomicReference<PollInfoOperation> activeOperation = new AtomicReference<>();
+  private volatile PollInfoOperation lastOperation;
 
   ArrowFlightStatement(
       final ArrowFlightConnection connection,
@@ -127,10 +131,51 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
       return flightInfo;
     }
 
-    // Direct Statement.executeQuery(String) / executeUpdate(String) path.
-    final FlightInfo flightInfo = connection.getClientHandler().getInfo(signature.sql);
+    // Direct Statement.executeQuery(String) path: CommandStatementQuery through PollFlightInfo.
+    final PollInfoOperation operation = new PollInfoOperation(getQueryTimeout());
+    activeOperation.set(operation);
+    lastOperation = operation;
+    final FlightInfo flightInfo;
+    try {
+      flightInfo = connection.getClientHandler().getInfo(signature.sql, operation);
+    } finally {
+      activeOperation.compareAndSet(operation, null);
+      operation.close();
+    }
     updateSignatureColumnsFromFlightInfo(signature, flightInfo);
     return flightInfo;
+  }
+
+  @Override
+  public void cancel() throws SQLException {
+    final PollInfoOperation operation = activeOperation.get();
+    if (operation != null) {
+      operation.cancel();
+    }
+    final ArrowFlightPreparedStatement delegate = preparedDelegate();
+    if (delegate != null) {
+      // Statement.execute(String) runs through a prepared statement sharing this handle.
+      delegate.cancelActivePollInfoOperation();
+    }
+    super.cancel();
+  }
+
+  long remainingQueryTimeoutNanos() {
+    final ArrowFlightPreparedStatement delegate = preparedDelegate();
+    if (delegate != null) {
+      return delegate.remainingQueryTimeoutNanos();
+    }
+    final PollInfoOperation operation = lastOperation;
+    return operation != null && operation.hasDeadline()
+        ? operation.remainingTimeoutNanos()
+        : Long.MAX_VALUE;
+  }
+
+  private ArrowFlightPreparedStatement preparedDelegate() {
+    final AvaticaStatement current = ((ArrowFlightConnection) connection).statementMap.get(handle.id);
+    return current instanceof ArrowFlightPreparedStatement
+        ? (ArrowFlightPreparedStatement) current
+        : null;
   }
 
   private void updateSignatureColumnsFromFlightInfo(
