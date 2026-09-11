@@ -121,13 +121,14 @@ public class PollInfoExecutionTest {
   }
 
   @Test
-  public void multiStepUsesEachDescriptorOnceAndOnlyFinalInfoFeedsResultSet() throws Exception {
+  public void multiStepPollsOnDemandAfterPublishedEndpointIsConsumed() throws Exception {
     producer.configure(Scenario.MULTI_STEP, STATEMENT_FAMILY);
     try (Connection connection = connect(true);
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery(DIRECT_QUERY)) {
       assertTrue(resultSet.next());
       assertEquals(42, resultSet.getInt(1));
+      assertFalse(resultSet.next());
     }
     final List<FlightDescriptor> descriptors = producer.pollDescriptors();
     assertEquals(3, descriptors.size());
@@ -149,6 +150,7 @@ public class PollInfoExecutionTest {
       try (ResultSet resultSet = statement.executeQuery()) {
         assertTrue(resultSet.next());
         assertEquals(7, resultSet.getInt(1));
+        assertFalse(resultSet.next());
       }
     }
     assertEquals(1, producer.parameterBindCount());
@@ -214,9 +216,11 @@ public class PollInfoExecutionTest {
   public void continuationUnimplementedDoesNotFallbackOrReexecute() throws Exception {
     producer.configure(Scenario.CONTINUATION_UNIMPLEMENTED, STATEMENT_FAMILY);
     try (Connection connection = connect(true);
-        Statement statement = connection.createStatement()) {
-      final Throwable failure =
-          assertThrows(Throwable.class, () -> statement.executeQuery(DIRECT_QUERY));
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(DIRECT_QUERY)) {
+      assertTrue(resultSet.next());
+      assertEquals(42, resultSet.getInt(1));
+      final Throwable failure = assertThrows(Throwable.class, resultSet::next);
       assertTrue(hasFlightStatus(failure, FlightStatusCode.UNIMPLEMENTED), failure.toString());
     }
     assertEquals(2, producer.pollDescriptors().size());
@@ -230,10 +234,13 @@ public class PollInfoExecutionTest {
     try (Connection connection = connect(true);
         Statement statement = connection.createStatement()) {
       statement.setQueryTimeout(1);
-      final Throwable failure =
-          assertThrows(Throwable.class, () -> statement.executeQuery(DIRECT_QUERY));
-      assertTrue(hasFlightStatus(failure, FlightStatusCode.TIMED_OUT), failure.toString());
-      assertJdbcTimeoutContract(failure, 1);
+      try (ResultSet resultSet = statement.executeQuery(DIRECT_QUERY)) {
+        assertTrue(resultSet.next());
+        assertEquals(42, resultSet.getInt(1));
+        final Throwable failure = assertThrows(Throwable.class, resultSet::next);
+        assertTrue(hasFlightStatus(failure, FlightStatusCode.TIMED_OUT), failure.toString());
+        assertJdbcTimeoutContract(failure, 1);
+      }
     }
     final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
     System.out.println("LOCAL_T8_ELAPSED_MILLIS " + elapsedMillis);
@@ -298,7 +305,7 @@ public class PollInfoExecutionTest {
   }
 
   @Test
-  public void avaticaHasNoResultSetTargetButStatementContextCancelsActivePoll() throws Exception {
+  public void statementCancelInterruptsContinuationAtReadBoundary() throws Exception {
     producer.configure(Scenario.CANCEL_OBSERVABLE, STATEMENT_FAMILY);
     try (Connection connection = connect(true);
         Statement statement = connection.createStatement()) {
@@ -307,8 +314,12 @@ public class PollInfoExecutionTest {
       final Thread execution =
           new Thread(
               () -> {
-                try (ResultSet ignored = statement.executeQuery(DIRECT_QUERY)) {
+                try (ResultSet resultSet = statement.executeQuery(DIRECT_QUERY)) {
                   resultSetCreated.set(true);
+                  if (!resultSet.next() || resultSet.getInt(1) != 42) {
+                    throw new AssertionError("missing published row");
+                  }
+                  resultSet.next();
                 } catch (Throwable e) {
                   failure.set(e);
                 }
@@ -316,15 +327,14 @@ public class PollInfoExecutionTest {
               "jdbc-pollinfo-cancellation-test");
       execution.start();
       assertTrue(producer.awaitActivePoll(2, TimeUnit.SECONDS));
-      // AvaticaStatement.cancel() can only reach openResultSet, which is still null at this point.
-      assertNull(statement.getResultSet());
+      assertNotNull(statement.getResultSet());
       final long cancelStart = System.nanoTime();
       statement.cancel();
       execution.join(TimeUnit.SECONDS.toMillis(2));
       final long cancelMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cancelStart);
       System.out.println("LOCAL_T9_CANCEL_MILLIS " + cancelMillis);
       assertFalse(execution.isAlive());
-      assertFalse(resultSetCreated.get(), "ResultSet must not exist while polling is active");
+      assertTrue(resultSetCreated.get(), "ResultSet should expose the first published endpoint");
       assertNotNull(failure.get());
       assertTrue(
           hasFlightStatus(failure.get(), FlightStatusCode.CANCELLED), failure.get().toString());

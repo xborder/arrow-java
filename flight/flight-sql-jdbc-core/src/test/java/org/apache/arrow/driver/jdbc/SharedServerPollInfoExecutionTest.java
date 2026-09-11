@@ -19,7 +19,6 @@ package org.apache.arrow.driver.jdbc;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -91,6 +90,10 @@ public class SharedServerPollInfoExecutionTest {
     assertCounters(state, 3, 0, 0, 1, 2, 0, 0, 3);
     assertTrue(state.contains("bdx-645-poll/v1/"));
     assertTrue(state.indexOf("/1\"") < state.indexOf("/2\""), state);
+    assertTrue(
+        state.indexOf("\"method\": \"DoGet\"")
+            < state.indexOf("\"descriptor_kind\": \"continuation\""),
+        state);
   }
 
   @Test
@@ -103,7 +106,7 @@ public class SharedServerPollInfoExecutionTest {
         assertEquals(Arrays.asList(41L, 42L), values(resultSet));
       }
     }
-    assertCounters(3, 0, 1, 1, 2, 0, 0, 1);
+    assertCounters(3, 0, 1, 1, 2, 0, 0, 2);
   }
 
   @Test
@@ -164,6 +167,20 @@ public class SharedServerPollInfoExecutionTest {
 
   @Test
   @Order(8)
+  public void t7LateErrorSurfacesAtNextReadBoundary() throws Exception {
+    try (Connection connection = connect(true);
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery("late-error")) {
+      assertTrue(resultSet.next());
+      assertEquals(1L, resultSet.getLong("value"));
+      final Throwable failure = assertThrows(Throwable.class, resultSet::next);
+      assertTrue(hasFlightStatus(failure, FlightStatusCode.INTERNAL), failure.toString());
+    }
+    assertCounters(2, 0, 0, 1, 1, 0, 0, 1);
+  }
+
+  @Test
+  @Order(9)
   public void t8TimeoutEndsBlockedPollAtTheSingleStatementDeadline() throws Exception {
     final long startNanos = System.nanoTime();
     try (Connection connection = connect(true);
@@ -182,8 +199,8 @@ public class SharedServerPollInfoExecutionTest {
   }
 
   @Test
-  @Order(9)
-  public void t9CancelBeforeResultSetCancelsPollAndFlightInfo() throws Exception {
+  @Order(10)
+  public void t9CancelWhileResultSetWaitsForMoreEndpoints() throws Exception {
     try (Connection connection = connect(true);
         Statement statement = connection.createStatement()) {
       final AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -191,8 +208,13 @@ public class SharedServerPollInfoExecutionTest {
       final Thread execution =
           new Thread(
               () -> {
-                try (ResultSet ignored = statement.executeQuery("cancel-observable")) {
+                try (ResultSet resultSet = statement.executeQuery("cancel-observable")) {
                   resultSetCreated.set(true);
+                  assertTrue(resultSet.next());
+                  assertEquals(1L, resultSet.getLong("value"));
+                  assertTrue(resultSet.next());
+                  assertEquals(2L, resultSet.getLong("value"));
+                  resultSet.next();
                 } catch (Throwable e) {
                   failure.set(e);
                 }
@@ -200,21 +222,34 @@ public class SharedServerPollInfoExecutionTest {
               "shared-server-jdbc-cancel");
       execution.start();
       awaitCounter("poll_flight_info", 2, Duration.ofSeconds(3));
-      assertNull(statement.getResultSet());
+      assertTrue(resultSetCreated.get());
+      assertNotNull(statement.getResultSet());
       final long cancelStart = System.nanoTime();
       statement.cancel();
       execution.join(TimeUnit.SECONDS.toMillis(2));
       final long cancelMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cancelStart);
       System.out.println("SHARED_T9_CANCEL_MILLIS " + cancelMillis);
       assertFalse(execution.isAlive());
-      assertFalse(resultSetCreated.get());
       assertNotNull(failure.get());
       assertTrue(
           hasFlightStatus(failure.get(), FlightStatusCode.CANCELLED), failure.get().toString());
       assertTrue(cancelMillis < 1000, "cancellation was not prompt: " + cancelMillis);
     }
     awaitCounter("cancellation", 1, Duration.ofSeconds(2));
-    assertCounters(2, 0, 0, 1, 1, 1, 1, 0);
+    assertCounters(2, 0, 0, 1, 1, 1, 1, 1);
+  }
+
+  @Test
+  @Order(11)
+  public void t9ClosingIncompleteResultAttemptsFlightInfoCancellation() throws Exception {
+    try (Connection connection = connect(true);
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery("cancel-observable")) {
+      assertTrue(resultSet.next());
+      assertEquals(1L, resultSet.getLong("value"));
+    }
+    awaitCounter("cancellation", 1, Duration.ofSeconds(2));
+    assertCounters(1, 0, 0, 1, 0, 1, 0, 1);
   }
 
   private static Connection connect(final boolean usePollInfo) throws Exception {

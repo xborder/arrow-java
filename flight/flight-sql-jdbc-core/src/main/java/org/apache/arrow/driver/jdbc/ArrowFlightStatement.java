@@ -132,15 +132,18 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     }
 
     // Direct Statement.executeQuery(String) path: CommandStatementQuery through PollFlightInfo.
-    final PollInfoOperation operation = new PollInfoOperation(getQueryTimeout());
+    final PollInfoOperation operation = new PollInfoOperation(getQueryTimeout(), true);
     activeOperation.set(operation);
     lastOperation = operation;
     final FlightInfo flightInfo;
     try {
       flightInfo = connection.getClientHandler().getInfo(signature.sql, operation);
-    } finally {
-      activeOperation.compareAndSet(operation, null);
-      operation.close();
+      if (!operation.hasContinuation()) {
+        finishPollInfoOperation(operation);
+      }
+    } catch (RuntimeException e) {
+      finishPollInfoOperation(operation);
+      throw e;
     }
     updateSignatureColumnsFromFlightInfo(signature, flightInfo);
     return flightInfo;
@@ -169,6 +172,21 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     return operation != null && operation.hasDeadline()
         ? operation.remainingTimeoutNanos()
         : Long.MAX_VALUE;
+  }
+
+  PollInfoOperation activePollInfoOperation() {
+    final ArrowFlightPreparedStatement delegate = preparedDelegate();
+    return delegate != null ? delegate.activePollInfoOperation() : activeOperation.get();
+  }
+
+  void finishPollInfoOperation(final PollInfoOperation operation) {
+    final ArrowFlightPreparedStatement delegate = preparedDelegate();
+    if (delegate != null) {
+      delegate.finishPollInfoOperation(operation);
+    }
+    if (operation != null && activeOperation.compareAndSet(operation, null)) {
+      operation.close();
+    }
   }
 
   private ArrowFlightPreparedStatement preparedDelegate() {
