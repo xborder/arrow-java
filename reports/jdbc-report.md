@@ -91,7 +91,7 @@ sequenceDiagram
             Poller->>Result: Final FlightInfo
         else Error other than initial UNIMPLEMENTED
             Server-->>Poller: UNAVAILABLE / auth / query / continuation error
-            Poller-->>API: Propagate error; no fallback
+            Poller-->>API: Propagate error, no fallback
             API-->>App: SQLException
         else Polling accepted
             Server-->>Poller: Cumulative PollInfo + continuation
