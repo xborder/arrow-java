@@ -2,7 +2,7 @@
 
 Baseline: Apache Arrow Java `91b4a2ca418ecb47cb8871d97588b19444337eb4`. The baseline `FlightSqlClient` had 14 `FlightClient.getInfo` call shapes representing 13 distinct Flight SQL command families; the two XDBC overloads share one wire command family. Schema-only `getSchema` calls, updates/ingest, actions, `DoPut`, and `DoGet` are not FlightInfo-producing call sites.
 
-The POC routes all 13 families through `FlightSqlClient.getInfo(FlightDescriptor, CallOption...)`. The default hook still makes one `GetFlightInfo` call. JDBC installs a polling subclass that drains PollInfo and returns only the final cumulative FlightInfo.
+The POC routes all 13 families through `FlightSqlClient.getInfo(FlightDescriptor, CallOption...)`. The default hook still makes one `GetFlightInfo` call. JDBC installs a polling subclass that can retain continuation state and append newly published endpoints to the existing ResultSet on demand.
 
 | # | Wire command family | Baseline `FlightSqlClient` API/call shape | JDBC exposure | POC routing and applicability |
 | --- | --- | --- | --- | --- |

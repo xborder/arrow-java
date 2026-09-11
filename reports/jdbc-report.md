@@ -4,13 +4,13 @@
 
 **Feasible with documented limitations**
 
-The unchanged JDBC interfaces can synchronously execute direct, prepared, and metadata Flight SQL operations through PollFlightInfo, follow continuations to completion, and give only the final cumulative FlightInfo to the existing ResultSet path. This was demonstrated with focused in-process producers and T1-T9 black-box runs against the shared real Flight SQL gRPC fixture. The limitation is production packaging: the POC introduces visible Java helper surfaces across the published `flight-sql` and `flight-sql-jdbc-core` artifacts; those surfaces need an intentional internal/public API design before landing.
+The unchanged JDBC interfaces can execute direct, prepared, and metadata Flight SQL operations through PollFlightInfo and expose newly published endpoints through the existing `ResultSet` before query completion. Continuation polling is demand-driven at `ResultSet.next()`. This was demonstrated with focused in-process producers and black-box runs against the shared real Flight SQL gRPC fixture. The limitation is production packaging: the POC introduces visible Java helper surfaces across the published `flight-sql` and `flight-sql-jdbc-core` artifacts; those surfaces need an intentional internal/public API design before landing.
 
 ## Question answered
 
 Can Arrow Java JDBC make PollInfo the transparent default without changing `java.sql` signatures or result types, while retaining initial-UNIMPLEMENTED-only fallback, per-family capability isolation, one timeout, cancellation before ResultSet construction, and a connection opt-out?
 
-The executable answer is yes. The POC remains experimental and uncommitted on local branch `bdx-645-pollinfo-poc`; nothing was pushed and no Jira/PR state was changed.
+The executable answer is yes. The POC is published for review on branch `bdx-645-pollinfo-poc` in `xborder/arrow-java` PR #21.
 
 ## Baseline and environment
 
@@ -43,7 +43,7 @@ Each JDBC connection installs a polling FlightSqlClient wrapper. For a FlightInf
 1. Derives the capability-cache key from the original Flight SQL `Any.type_url`.
 2. Sends the original descriptor to PollFlightInfo once.
 3. Sends every returned opaque continuation unchanged once until no continuation remains.
-4. Stores the latest cumulative FlightInfo only for cancellation and returns only the final cumulative FlightInfo to the existing endpoint queue/ResultSet path.
+4. Hands the first published endpoint to the existing ResultSet, retains the continuation, and appends only newly published endpoints when the reader asks for more rows.
 5. Falls back to GetFlightInfo only when the initial poll is `UNIMPLEMENTED`, then caches that family as unsupported on the connection. No continuation error and no other initial error falls back.
 
 Direct JDBC statements still use a prepared action for schema/type discovery, but with polling enabled their query-result execution uses `CommandStatementQuery`. With `usePollInfo=false`, the handler deliberately restores the exact pre-POC `CommandPreparedStatementQuery` execution path; both focused and shared-server T6 tests assert that command family. The update branch still invokes the existing prepared `executeUpdate`; the full `ArrowFlightStatementExecuteUpdateTest` passes. Explicit JDBC prepared queries retain `CommandPreparedStatementQuery`; their parameter `DoPut` occurs once before the single original poll descriptor.
@@ -62,66 +62,26 @@ Baseline Avatica has a real pre-ResultSet gap: its bytecode shows `AvaticaStatem
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    actor App as JDBC application
-    participant API as Statement / PreparedStatement / DatabaseMetaData
-    participant Client as ArrowFlightSqlClientHandler
-    participant Poller as PollInfoOperation + FlightSqlClient
+    participant App as JDBC application
+    participant Driver as JDBC driver
     participant Server as Flight SQL server
-    participant Result as Existing ResultSet / DoGet path
-
-    App->>API: executeQuery() or metadata call
-    API->>Client: Execute command with query timeout
-    opt Parameterized PreparedStatement
-        Client->>Server: DoPut(bound parameters) exactly once
-        Server-->>Client: Bound prepared handle
-    end
-    alt usePollInfo=false or family cached unsupported
-        Client->>Server: GetFlightInfo(original descriptor)
-        Server-->>Client: Final FlightInfo
-        Client->>Result: Final FlightInfo
-    else PollInfo enabled
-        Client->>Poller: Resolve original descriptor
-        Poller->>Server: PollFlightInfo(original descriptor)
-        alt Initial response is UNIMPLEMENTED
-            Server-->>Poller: UNIMPLEMENTED
-            Poller->>Poller: Cache command family as unsupported
-            Poller->>Server: GetFlightInfo(original descriptor)
-            Server-->>Poller: Final FlightInfo
-            Poller->>Result: Final FlightInfo
-        else Error other than initial UNIMPLEMENTED
-            Server-->>Poller: UNAVAILABLE / auth / query / continuation error
-            Poller-->>API: Propagate error, no fallback
-            API-->>App: SQLException
-        else Polling accepted
-            Server-->>Poller: Cumulative PollInfo + continuation
-            loop While continuation exists
-                Poller->>Server: PollFlightInfo(continuation descriptor)
-                Server-->>Poller: New cumulative PollInfo + next continuation
-            end
-            alt Polling completes
-                Poller->>Result: Final cumulative FlightInfo only
-            else Statement.cancel() or deadline during active poll
-                App->>API: cancel() or timeout expires
-                API->>Poller: Cancel operation context
-                Poller-->>Server: Cancel active PollFlightInfo RPC
-                opt A cumulative FlightInfo is known
-                    Poller->>Server: CancelFlightInfo(latest info), bounded cleanup
-                end
-                Poller-->>App: SQLException / SQLTimeoutException
-            end
-        end
-    end
-    opt Final FlightInfo was produced
-        loop Each final endpoint
-            Result->>Server: DoGet(ticket)
-            Server-->>Result: Arrow record batches
-        end
-        Result-->>App: Existing JDBC schema and rows
-    end
+    App->>Driver: executeQuery
+    Driver->>Server: PollFlightInfo original
+    Server-->>Driver: Endpoint 1 and continuation
+    Driver-->>App: Existing ResultSet
+    App->>Driver: next
+    Driver->>Server: DoGet endpoint 1
+    Server-->>Driver: Row 1
+    Driver-->>App: Row 1
+    App->>Driver: next
+    Driver->>Server: PollFlightInfo continuation
+    Server-->>Driver: Endpoint 1 plus endpoint 2
+    Driver->>Server: DoGet endpoint 2
+    Server-->>Driver: Row 2
+    Driver-->>App: Row 2
 ```
 
-The key JDBC boundary is the final-only handoff to the existing ResultSet path. Prepared binding occurs once inside the operation context, and `Statement.cancel()` can interrupt an active poll before a ResultSet exists.
+Prepared binding occurs once inside the operation context. A late continuation error is surfaced at the next `ResultSet.next()` boundary, and `Statement.cancel()` or closing an incomplete result attempts best-effort cancellation.
 
 ## T1-T10 results
 
@@ -130,14 +90,14 @@ Every T1-T9 case has shared-server evidence wherever the fixture supports the as
 | Test | Result | Evidence summary |
 | --- | --- | --- |
 | T1 immediate | PASS | Rows `[1,2]`; poll 1, GetFlightInfo 0, original 1, continuation 0, DoGet 1. |
-| T2 multi-step | PASS | Rows `[1,2,3]`; three polls are exactly one original plus two continuations; ordered descriptors `/op-000001/1`, then `/op-000001/2`; GetFlightInfo 0; DoGet 3. Partial cumulative endpoints were not consumed (otherwise DoGet would exceed 3). |
+| T2 progressive multi-step | PASS | Rows `[1,2,3]`; event order is `Poll, DoGet, Poll, DoGet, Poll, DoGet`, proving each published endpoint is consumed before the next continuation and before query completion. |
 | T3 prepared | PASS | Bound value 41 yielded `[41,42]`; bind 1; poll 3; original 1; continuation 2; GetFlightInfo 0. |
 | T4 metadata | PASS | `DatabaseMetaData.getCatalogs()` returned `bdx_catalog`; poll 3; original 1; continuation 2. |
 | T5 fallback/cache | PASS | Two direct executions produced direct poll 1/GetFlightInfo 2, proving connection cache reuse; metadata on the same connection still polled three times and never used GetFlightInfo. |
 | T6 opt-out | PASS | `usePollInfo=false`; poll 0, GetFlightInfo 1, normal rows `[1,2]`; the server records the legacy prepared command family. |
 | T7 non-fallback failure | PASS | Initial `UNAVAILABLE` propagated with poll 1/GetFlightInfo 0/DoGet 0. A focused continuation-`UNIMPLEMENTED` case propagated after two polls with GetFlightInfo 0. |
 | T8 timeout | PASS | Shared blocked poll ended at the one-second deadline with active termination 1 and the exact JDBC timeout contract. Focused two-poll and prepared blocked-bind cases prove the deadline does not reset and covers parameter upload. |
-| T9 cancellation | PASS | ResultSet was null during the active continuation; cancel returned in 9 ms shared/2 ms local; shared cancellation 1, active termination 1, GetFlightInfo 0. |
+| T9 cancellation and close | PASS | Cancellation works before result construction and while an existing ResultSet waits for another endpoint. Closing an incomplete ResultSet attempts one best-effort `CancelFlightInfo`. |
 | T10 regression/build | PASS | Flight SQL: 97 tests, zero failures/errors. Final JDBC core rerun after review corrections: 1,267 tests, zero failures/errors, 54 existing skips. |
 
 ## Regression details
@@ -168,7 +128,7 @@ All commands were run locally with RTK and no remote mutation.
 | --- | --- | --- |
 | `mvn -pl flight/flight-sql -DskipTests install` | 0; shared hook compiled, checked, installed locally | `reports/raw/install-flight-sql-hook.log` |
 | `mvn -pl flight/flight-sql-jdbc-core -Dtest=PollInfoExecutionTest test` | 0; final focused rerun 12/12 | original log plus orchestrator validation |
-| `mvn -pl flight/flight-sql-jdbc-core -Dtest=SharedServerPollInfoExecutionTest -Dpollinfo.shared.enabled=true -Dpollinfo.shared.flightPort=32347 -Dpollinfo.shared.controlPort=32348 test` | 0; 9/9 | `reports/raw/shared-server-t1-t9-final.log` |
+| `mvn -pl flight/flight-sql-jdbc-core -Dtest=SharedServerPollInfoExecutionTest -Dpollinfo.shared.enabled=true -Dpollinfo.shared.flightPort=32347 -Dpollinfo.shared.controlPort=32348 test` | 0; 11/11 | orchestrator final rerun |
 | `mvn -pl flight/flight-sql test` | 0; 97/97 | `reports/raw/t10-flight-sql-tests.log` |
 | `mvn -pl flight/flight-sql-jdbc-core test` | 0; final rerun 1,267 tests, 54 skipped | original log plus orchestrator validation |
 | `mvn -pl flight/flight-sql,flight/flight-sql-jdbc-core -DskipTests package` | 0; both artifacts compiled, formatted, checked, and packaged | `reports/raw/t10-final-package.log` |
@@ -216,7 +176,7 @@ Test/evidence support:
 ### Arrow Java Flight SQL shared library
 
 1. Define an intentional descriptor-resolution abstraction with compatibility review, avoiding an accidental protected-hook collision in `FlightSqlClient`.
-2. Place the PollInfo operation state/capability cache behind non-public or explicitly supported shared-library APIs, with final-only handoff and initial-UNIMPLEMENTED semantics covered at that layer.
+2. Place the PollInfo operation state/capability cache behind non-public or explicitly supported shared-library APIs, with progressive append-only endpoint handoff and initial-UNIMPLEMENTED semantics covered at that layer.
 3. Add shared-library unit tests for all command constructors, default producer completion, continuation validation, and optional bounded unchanged-response delay.
 
 ### JDBC integration and hardening

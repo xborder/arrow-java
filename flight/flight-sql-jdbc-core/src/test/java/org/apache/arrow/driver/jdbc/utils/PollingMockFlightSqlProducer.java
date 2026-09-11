@@ -28,12 +28,10 @@ import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.CancelFlightInfoRequest;
 import org.apache.arrow.flight.CancelStatus;
 import org.apache.arrow.flight.FlightDescriptor;
-import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.PollInfo;
 import org.apache.arrow.flight.PutResult;
-import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.flight.sql.impl.FlightSql.CommandPreparedStatementQuery;
 
 /** Controllable in-process PollInfo producer used by the JDBC POC conformance tests. */
@@ -238,9 +236,7 @@ public final class PollingMockFlightSqlProducer extends MockFlightSqlProducer {
     return new FlightInfo(
         finalInfo.getSchemaOptional().orElse(null),
         finalInfo.getDescriptor(),
-        Collections.singletonList(
-            new FlightEndpoint(
-                new Ticket("partial-must-not-be-read".getBytes(StandardCharsets.UTF_8)))),
+        new ArrayList<>(finalInfo.getEndpoints()),
         -1,
         -1);
   }

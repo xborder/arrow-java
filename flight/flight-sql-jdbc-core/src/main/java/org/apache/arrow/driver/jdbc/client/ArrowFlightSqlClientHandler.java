@@ -754,28 +754,38 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
         final CallOption[] options) {
       final String family = commandFamily(originalDescriptor);
       if (!pollInfoEnabled || unsupportedFamilies.contains(family)) {
-        return operation.call(() -> client.getInfo(originalDescriptor, operation.options(options)));
+        final FlightInfo flightInfo =
+            operation.call(() -> client.getInfo(originalDescriptor, operation.options(options)));
+        operation.complete(flightInfo);
+        return flightInfo;
       }
 
       org.apache.arrow.flight.FlightDescriptor descriptor = originalDescriptor;
       boolean initialPoll = true;
+      operation.configure(
+          descriptorForPoll ->
+              client.pollInfo(descriptorForPoll, operation.options(options)),
+          () -> cancelFlightInfoBestEffort(operation, options));
       try {
         while (true) {
-          final org.apache.arrow.flight.FlightDescriptor descriptorForPoll = descriptor;
-          final PollInfo pollInfo =
-              operation.call(() -> client.pollInfo(descriptorForPoll, operation.options(options)));
-          operation.remember(pollInfo.getFlightInfo());
-          if (!pollInfo.getFlightDescriptor().isPresent()) {
+          final PollInfo pollInfo = operation.poll(descriptor);
+          operation.remember(pollInfo);
+          if (operation.isComplete()
+              || (operation.isProgressive()
+                  && !pollInfo.getFlightInfo().getEndpoints().isEmpty())) {
             return pollInfo.getFlightInfo();
           }
-          descriptor = pollInfo.getFlightDescriptor().get();
+          descriptor = operation.continuationDescriptor();
           initialPoll = false;
         }
       } catch (FlightRuntimeException e) {
         if (initialPoll && e.status().code() == FlightStatusCode.UNIMPLEMENTED) {
           unsupportedFamilies.add(family);
-          return operation.call(
-              () -> client.getInfo(originalDescriptor, operation.options(options)));
+          final FlightInfo flightInfo =
+              operation.call(
+                  () -> client.getInfo(originalDescriptor, operation.options(options)));
+          operation.complete(flightInfo);
+          return flightInfo;
         }
         if (operation.isCancelled()
             || e.status().code() == FlightStatusCode.CANCELLED

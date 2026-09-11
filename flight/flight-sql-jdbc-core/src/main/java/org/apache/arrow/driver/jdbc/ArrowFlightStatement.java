@@ -61,14 +61,18 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
         ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
     setSignature(signature);
 
-    final PollInfoOperation operation = new PollInfoOperation(getQueryTimeout());
+    final PollInfoOperation operation = new PollInfoOperation(getQueryTimeout(), true);
     activeOperation.set(operation);
     lastOperation = operation;
     try {
-      return preparedStatement.executeQuery(operation);
-    } finally {
-      activeOperation.compareAndSet(operation, null);
-      operation.close();
+      final FlightInfo flightInfo = preparedStatement.executeQuery(operation);
+      if (!operation.hasContinuation()) {
+        finishPollInfoOperation(operation);
+      }
+      return flightInfo;
+    } catch (RuntimeException | SQLException e) {
+      finishPollInfoOperation(operation);
+      throw e;
     }
   }
 
@@ -86,5 +90,15 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     return operation != null && operation.hasDeadline()
         ? operation.remainingTimeoutNanos()
         : Long.MAX_VALUE;
+  }
+
+  PollInfoOperation activePollInfoOperation() {
+    return activeOperation.get();
+  }
+
+  void finishPollInfoOperation(final PollInfoOperation operation) {
+    if (operation != null && activeOperation.compareAndSet(operation, null)) {
+      operation.close();
+    }
   }
 }
