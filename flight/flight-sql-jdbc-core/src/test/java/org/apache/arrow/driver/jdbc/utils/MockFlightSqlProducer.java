@@ -90,7 +90,7 @@ import org.apache.calcite.avatica.Meta.StatementType;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /** An ad-hoc {@link FlightSqlProducer} for tests. */
-public final class MockFlightSqlProducer implements FlightSqlProducer {
+public class MockFlightSqlProducer implements FlightSqlProducer {
 
   private final Map<String, Entry<Schema, List<UUID>>> queryResults = new HashMap<>();
   private final Map<UUID, Consumer<ServerStreamListener>> selectResultProviders = new HashMap<>();

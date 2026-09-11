@@ -17,6 +17,8 @@
 package org.apache.arrow.driver.jdbc.client;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.protobuf.Any;
+import com.google.protobuf.InvalidProtocolBufferException;
 import io.grpc.netty.NettyChannelBuilder;
 import io.netty.channel.ChannelOption;
 import java.io.IOException;
@@ -32,6 +34,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import org.apache.arrow.driver.jdbc.client.oauth.OAuthConfiguration;
 import org.apache.arrow.driver.jdbc.client.oauth.OAuthCredentialWriter;
 import org.apache.arrow.driver.jdbc.client.oauth.OAuthTokenProvider;
@@ -40,6 +45,7 @@ import org.apache.arrow.driver.jdbc.client.utils.FlightClientCache;
 import org.apache.arrow.driver.jdbc.client.utils.FlightLocationQueue;
 import org.apache.arrow.flight.CallOption;
 import org.apache.arrow.flight.CallStatus;
+import org.apache.arrow.flight.CancelFlightInfoRequest;
 import org.apache.arrow.flight.CloseSessionRequest;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightClientMiddleware;
@@ -50,6 +56,7 @@ import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStatusCode;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.LocationSchemes;
+import org.apache.arrow.flight.PollInfo;
 import org.apache.arrow.flight.SessionOptionValueFactory;
 import org.apache.arrow.flight.SetSessionOptionsRequest;
 import org.apache.arrow.flight.SetSessionOptionsResult;
@@ -120,7 +127,12 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
       final @Nullable FlightClientCache flightClientCache) {
     final ArrowFlightSqlClientHandler handler =
         new ArrowFlightSqlClientHandler(
-            cacheKey, new FlightSqlClient(client), builder, options, catalog, flightClientCache);
+            cacheKey,
+            new PollingFlightSqlClient(client, builder.usePollInfo),
+            builder,
+            options,
+            catalog,
+            flightClientCache);
     handler.setSetCatalogInSessionIfPresent();
     return handler;
   }
@@ -360,6 +372,9 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
      */
     FlightInfo executeQuery() throws SQLException;
 
+    /** Execute using a statement-owned timeout/cancellation operation. */
+    FlightInfo executeQuery(PollInfoOperation operation) throws SQLException;
+
     /**
      * Executes a {@link StatementType#UPDATE} query.
      *
@@ -449,12 +464,42 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
    * @return a new prepared statement.
    */
   public PreparedStatement prepare(final String query) {
+    return prepare(query, false);
+  }
+
+  /** Prepare for schema discovery, but execute through CommandStatementQuery. */
+  public PreparedStatement prepareDirect(final String query) {
+    // The opt-out must preserve the exact legacy JDBC wire path, which executes direct JDBC
+    // statements through CommandPreparedStatementQuery.
+    return prepare(query, builder.usePollInfo);
+  }
+
+  private PreparedStatement prepare(final String query, final boolean directExecution) {
     final FlightSqlClient.PreparedStatement preparedStatement =
         sqlClient.prepare(query, getOptions());
     return new PreparedStatement() {
       @Override
       public FlightInfo executeQuery() throws SQLException {
-        return preparedStatement.execute(getOptions());
+        return directExecution
+            ? sqlClient.execute(query, getOptions())
+            : preparedStatement.execute(getOptions());
+      }
+
+      @Override
+      public FlightInfo executeQuery(final PollInfoOperation operation) throws SQLException {
+        if (sqlClient instanceof PollingFlightSqlClient) {
+          final CallOption[] operationOptions = operation.options(getOptions());
+          return ((PollingFlightSqlClient) sqlClient)
+              .withOperation(
+                  operation,
+                  () ->
+                      directExecution
+                          ? sqlClient.execute(query, operationOptions)
+                          : preparedStatement.execute(operationOptions));
+        }
+        return directExecution
+            ? sqlClient.execute(query, getOptions())
+            : preparedStatement.execute(getOptions());
       }
 
       @Override
@@ -653,6 +698,137 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
         getOptions());
   }
 
+  /** Flight SQL client that resolves descriptors through synchronous PollFlightInfo. */
+  private static final class PollingFlightSqlClient extends FlightSqlClient {
+    private static final String UNKNOWN_COMMAND_FAMILY = "unknown-command";
+
+    private final FlightClient client;
+    private final boolean pollInfoEnabled;
+    private final Set<String> unsupportedFamilies = ConcurrentHashMap.newKeySet();
+    private final ThreadLocal<PollInfoOperation> currentOperation = new ThreadLocal<>();
+
+    private PollingFlightSqlClient(final FlightClient client, final boolean pollInfoEnabled) {
+      super(client);
+      this.client = client;
+      this.pollInfoEnabled = pollInfoEnabled;
+    }
+
+    private FlightInfo withOperation(
+        final PollInfoOperation operation, final Supplier<FlightInfo> action) {
+      final PollInfoOperation previous = currentOperation.get();
+      currentOperation.set(operation);
+      try {
+        // Enter the statement-owned cancellable context before prepared parameter upload as well
+        // as descriptor polling. This lets timeout/cancel terminate a blocked DoPut.
+        return operation.call(action::get);
+      } finally {
+        if (previous == null) {
+          currentOperation.remove();
+        } else {
+          currentOperation.set(previous);
+        }
+      }
+    }
+
+    @Override
+    protected FlightInfo getInfo(
+        final org.apache.arrow.flight.FlightDescriptor originalDescriptor,
+        final CallOption... options) {
+      PollInfoOperation operation = currentOperation.get();
+      final boolean ownsOperation = operation == null;
+      if (ownsOperation) {
+        operation = new PollInfoOperation(0);
+      }
+      try {
+        return getInfo(operation, originalDescriptor, options);
+      } finally {
+        if (ownsOperation) {
+          operation.close();
+        }
+      }
+    }
+
+    private FlightInfo getInfo(
+        final PollInfoOperation operation,
+        final org.apache.arrow.flight.FlightDescriptor originalDescriptor,
+        final CallOption[] options) {
+      final String family = commandFamily(originalDescriptor);
+      if (!pollInfoEnabled || unsupportedFamilies.contains(family)) {
+        final FlightInfo flightInfo =
+            operation.call(() -> client.getInfo(originalDescriptor, operation.options(options)));
+        operation.complete(flightInfo);
+        return flightInfo;
+      }
+
+      org.apache.arrow.flight.FlightDescriptor descriptor = originalDescriptor;
+      boolean initialPoll = true;
+      operation.configure(
+          descriptorForPoll ->
+              client.pollInfo(descriptorForPoll, operation.options(options)),
+          () -> cancelFlightInfoBestEffort(operation, options));
+      try {
+        while (true) {
+          final PollInfo pollInfo = operation.poll(descriptor);
+          operation.remember(pollInfo);
+          if (operation.isComplete()
+              || (operation.isProgressive()
+                  && !pollInfo.getFlightInfo().getEndpoints().isEmpty())) {
+            return pollInfo.getFlightInfo();
+          }
+          descriptor = operation.continuationDescriptor();
+          initialPoll = false;
+        }
+      } catch (FlightRuntimeException e) {
+        if (initialPoll && e.status().code() == FlightStatusCode.UNIMPLEMENTED) {
+          unsupportedFamilies.add(family);
+          final FlightInfo flightInfo =
+              operation.call(
+                  () -> client.getInfo(originalDescriptor, operation.options(options)));
+          operation.complete(flightInfo);
+          return flightInfo;
+        }
+        if (operation.isCancelled()
+            || e.status().code() == FlightStatusCode.CANCELLED
+            || e.status().code() == FlightStatusCode.TIMED_OUT) {
+          cancelFlightInfoBestEffort(operation, options);
+        }
+        throw e;
+      }
+    }
+
+    private void cancelFlightInfoBestEffort(
+        final PollInfoOperation operation, final CallOption[] options) {
+      if (!operation.beginCancelFlightInfoAttempt()) {
+        return;
+      }
+      final CallOption[] cancelOptions = Arrays.copyOf(options, options.length + 1);
+      cancelOptions[options.length] =
+          org.apache.arrow.flight.CallOptions.timeout(1, TimeUnit.SECONDS);
+      try {
+        // The primary statement context is already cancelled/timed out. Use a fresh root context
+        // for this bounded best-effort cleanup action so it can reach the server.
+        io.grpc.Context.ROOT.run(
+            () ->
+                client.cancelFlightInfo(
+                    new CancelFlightInfoRequest(operation.latestFlightInfo()), cancelOptions));
+      } catch (RuntimeException e) {
+        LOGGER.debug("Best-effort CancelFlightInfo failed", e);
+      }
+    }
+
+    private static String commandFamily(final org.apache.arrow.flight.FlightDescriptor descriptor) {
+      if (!descriptor.isCommand()) {
+        return "path";
+      }
+      try {
+        final String typeUrl = Any.parseFrom(descriptor.getCommand()).getTypeUrl();
+        return typeUrl.isEmpty() ? UNKNOWN_COMMAND_FAMILY : typeUrl;
+      } catch (InvalidProtocolBufferException e) {
+        return UNKNOWN_COMMAND_FAMILY;
+      }
+    }
+  }
+
   /** Builder for {@link ArrowFlightSqlClientHandler}. */
   public static final class Builder {
     static final String USER_AGENT_TEMPLATE = "JDBC Flight SQL Driver %s";
@@ -697,6 +873,8 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
 
     @VisibleForTesting @Nullable Duration connectTimeout;
 
+    @VisibleForTesting boolean usePollInfo = true;
+
     @VisibleForTesting @Nullable OAuthConfiguration oauthConfig;
 
     // These two middleware are for internal use within build() and should not be
@@ -739,6 +917,7 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
       this.allocator = original.allocator;
       this.catalog = original.catalog;
       this.oauthConfig = original.oauthConfig;
+      this.usePollInfo = original.usePollInfo;
 
       if (original.retainCookies) {
         this.cookieFactory = original.cookieFactory;
@@ -994,6 +1173,12 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
 
     public Builder withConnectTimeout(Duration connectTimeout) {
       this.connectTimeout = connectTimeout;
+      return this;
+    }
+
+    /** Select PollFlightInfo (default) or legacy GetFlightInfo descriptor resolution. */
+    public Builder withPollInfo(final boolean usePollInfo) {
+      this.usePollInfo = usePollInfo;
       return this;
     }
 
