@@ -58,6 +58,71 @@ The focused two-poll timeout scenario delays the first poll by 700 ms, blocks th
 
 Baseline Avatica has a real pre-ResultSet gap: its bytecode shows `AvaticaStatement.cancel()` only invokes `openResultSet.cancel()` when that field is non-null, then sets a flag. The focused and shared cancellation tests block a continuation, assert `Statement.getResultSet()` is still null, and then call the unchanged public `Statement.cancel()` method. The statement-owned context terminated the calls in 2 ms locally and 9 ms against the shared server. Shared counters were two polls (one original plus one continuation), one active-call termination, one standard CancelFlightInfo action, zero GetFlightInfo calls, and zero DoGet calls. CancelFlightInfo is best effort and is attempted once only when a cumulative FlightInfo has already been received.
 
+## Request flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor App as JDBC application
+    participant API as Statement / PreparedStatement / DatabaseMetaData
+    participant Client as ArrowFlightSqlClientHandler
+    participant Poller as PollInfoOperation + FlightSqlClient
+    participant Server as Flight SQL server
+    participant Result as Existing ResultSet / DoGet path
+
+    App->>API: executeQuery() or metadata call
+    API->>Client: Execute command with query timeout
+    opt Parameterized PreparedStatement
+        Client->>Server: DoPut(bound parameters) exactly once
+        Server-->>Client: Bound prepared handle
+    end
+    alt usePollInfo=false or family cached unsupported
+        Client->>Server: GetFlightInfo(original descriptor)
+        Server-->>Client: Final FlightInfo
+        Client->>Result: Final FlightInfo
+    else PollInfo enabled
+        Client->>Poller: Resolve original descriptor
+        Poller->>Server: PollFlightInfo(original descriptor)
+        alt Initial response is UNIMPLEMENTED
+            Server-->>Poller: UNIMPLEMENTED
+            Poller->>Poller: Cache command family as unsupported
+            Poller->>Server: GetFlightInfo(original descriptor)
+            Server-->>Poller: Final FlightInfo
+            Poller->>Result: Final FlightInfo
+        else Error other than initial UNIMPLEMENTED
+            Server-->>Poller: UNAVAILABLE / auth / query / continuation error
+            Poller-->>API: Propagate error; no fallback
+            API-->>App: SQLException
+        else Polling accepted
+            Server-->>Poller: Cumulative PollInfo + continuation
+            loop While continuation exists
+                Poller->>Server: PollFlightInfo(continuation descriptor)
+                Server-->>Poller: New cumulative PollInfo + next continuation
+            end
+            alt Polling completes
+                Poller->>Result: Final cumulative FlightInfo only
+            else Statement.cancel() or deadline during active poll
+                App->>API: cancel() or timeout expires
+                API->>Poller: Cancel operation context
+                Poller-->>Server: Cancel active PollFlightInfo RPC
+                opt A cumulative FlightInfo is known
+                    Poller->>Server: CancelFlightInfo(latest info), bounded cleanup
+                end
+                Poller-->>App: SQLException / SQLTimeoutException
+            end
+        end
+    end
+    opt Final FlightInfo was produced
+        loop Each final endpoint
+            Result->>Server: DoGet(ticket)
+            Server-->>Result: Arrow record batches
+        end
+        Result-->>App: Existing JDBC schema and rows
+    end
+```
+
+The key JDBC boundary is the final-only handoff to the existing ResultSet path. Prepared binding occurs once inside the operation context, and `Statement.cancel()` can interrupt an active poll before a ResultSet exists.
+
 ## T1-T10 results
 
 Every T1-T9 case has shared-server evidence wherever the fixture supports the assertion. The focused producer supplements T8 with the required multi-call no-reset proof. Exact machine-readable observations are in `reports/evidence.jsonl`.
