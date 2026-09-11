@@ -98,7 +98,7 @@ Every T1-T9 case has shared-server evidence wherever the fixture supports the as
 | T7 non-fallback failure | PASS | Initial `UNAVAILABLE` propagated with poll 1/GetFlightInfo 0/DoGet 0. A focused continuation-`UNIMPLEMENTED` case propagated after two polls with GetFlightInfo 0. |
 | T8 timeout | PASS | Shared blocked poll ended at the one-second deadline with active termination 1 and the exact JDBC timeout contract. Focused two-poll and prepared blocked-bind cases prove the deadline does not reset and covers parameter upload. |
 | T9 cancellation and close | PASS | Cancellation works before result construction and while an existing ResultSet waits for another endpoint. Closing an incomplete ResultSet attempts one best-effort `CancelFlightInfo`. |
-| T10 regression/build | PASS | Flight SQL: 97 tests, zero failures/errors. Final JDBC core rerun after review corrections: 1,267 tests, zero failures/errors, 54 existing skips. |
+| T10 regression/build | PASS | Flight SQL: 97 tests, zero failures/errors. Final JDBC core rerun after progressive changes: 1,269 tests, zero failures/errors, 56 skips. |
 
 ## Regression details
 
@@ -130,7 +130,7 @@ All commands were run locally with RTK and no remote mutation.
 | `mvn -pl flight/flight-sql-jdbc-core -Dtest=PollInfoExecutionTest test` | 0; final focused rerun 12/12 | original log plus orchestrator validation |
 | `mvn -pl flight/flight-sql-jdbc-core -Dtest=SharedServerPollInfoExecutionTest -Dpollinfo.shared.enabled=true -Dpollinfo.shared.flightPort=32347 -Dpollinfo.shared.controlPort=32348 test` | 0; 11/11 | orchestrator final rerun |
 | `mvn -pl flight/flight-sql test` | 0; 97/97 | `reports/raw/t10-flight-sql-tests.log` |
-| `mvn -pl flight/flight-sql-jdbc-core test` | 0; final rerun 1,267 tests, 54 skipped | original log plus orchestrator validation |
+| `mvn -pl flight/flight-sql-jdbc-core test` | 0; final rerun 1,269 tests, 56 skipped | final orchestrator validation |
 | `mvn -pl flight/flight-sql,flight/flight-sql-jdbc-core -DskipTests package` | 0; both artifacts compiled, formatted, checked, and packaged | `reports/raw/t10-final-package.log` |
 | focused OAuth/TLS rerun | 0; 50/50 after expected-method fix and test-data initialization | `reports/raw/t10-prior-failures-rerun.log` |
 | `git diff --check` | 0 | final command output/working-tree check |
