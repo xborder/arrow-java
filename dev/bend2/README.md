@@ -27,7 +27,10 @@ Written against Bend 2.0.21, commit `c15a75f8` of
 The `prepared_statement/` directory next to this file holds a small,
 checked Bend 2 model of the Flight SQL prepared-statement lifecycle that
 was built while writing these notes. It is the concrete evidence behind
-the assessment in section 4.
+the assessment in section 4. `DIFFERENTIAL_TESTING.md` explains how
+that model is used as a test oracle for the Java servers in
+`flight-sql`, which is the bridge from "the model is proven" to "the
+Java is checked against it".
 
 ## 1. Summary
 
@@ -43,12 +46,16 @@ For Arrow the realistic fit today is **executable, machine-checked
 specification** of protocol semantics: the lifecycles and invariants
 that the Flight and Flight SQL specs express in prose ("the server
 should return an error if the client does not use the updated
-handle"). The prototype in this directory states five such laws about
+handle"). The prototype in this directory states six such laws about
 prepared statements, proves them, checks in 0.2 seconds, and rejects
-three injected bugs. Bend has no Java target, no stable foreign ABI,
-no 64-bit integers and no float64, so it is not a candidate for
-production code inside `arrow-java`, and its `LAWS.bend` mechanism
-cannot constrain Java code, only Bend code.
+three injected bugs. A generator turns the proven model into 1085
+request traces, and a JUnit test replays them against both example
+Flight SQL servers: the stateful one matches the model on all 4221
+steps, the stateless one deviates in three documented ways. Bend has
+no Java target, no stable foreign ABI, no 64-bit integers and no
+float64, so it is not a candidate for production code inside
+`arrow-java`, and its `LAWS.bend` mechanism cannot constrain Java code,
+only Bend code; the differential test is what connects the two.
 
 Recommendation: treat Bend 2 as a modelling and specification tool in
 the same family as TLA+ or Alloy, with the differences that its models
@@ -226,9 +233,10 @@ Writing the prototype gave a feel for the effort:
 
 | Item | Lines |
 | --- | ---: |
-| Model (`main.bend`) | 139 |
-| Laws (`LAWS.bend`, 5 laws) | 63 |
-| Proofs (`PROOF.bend`) | 240 |
+| Model (`main.bend`) | 181 |
+| Laws (`LAWS.bend`, 6 laws) | 94 |
+| Proofs (`PROOF.bend`) | 298 |
+| Trace generator (`traces.bend`) | 212 |
 
 Roughly two lines of proof per line of model, for a model whose
 invariant is a simple list bound. Most of the proof file is generic
@@ -266,24 +274,31 @@ and bound parameters into the rotated handle.
 
 `main.bend` models the server as a list of live handles plus a
 counter, with four requests (`ACreate`, `ABind`, `AExec`, `AClose`)
-and two responses (`ROk{h}`, `RErr`). `ABind` on a live handle retires
-it and issues the counter as the new handle. `replay` runs a trace.
+and two responses (`ROk{h}`, `RErr`). The spec says a server "may
+return an updated handle" on bind, so the model takes a policy flag:
+under the rotating policy `ABind` on a live handle retires it and
+issues the counter as the new handle, under the keeping policy the
+handle stays. `replay` runs a trace and `responses` lists every answer.
 
 ### 4.2 The laws
 
-`LAWS.bend` states five laws over arbitrary server states:
+`LAWS.bend` states six laws over arbitrary server states:
 
-1. `closed_never_executes`: after `AClose{h}`, `AExec{h}` answers `RErr`.
+1. `closed_never_executes`: after `AClose{h}`, `AExec{h}` answers
+   `RErr`, under either policy.
 2. `created_handle_executes`: the handle returned by `ACreate` executes
    with `ROk`. This is the anti-vacuity law; without it a server that
    rejects every request satisfies law 1.
-3. `stale_handle_rejected`: after `ABind{h}` rotates the handle,
-   `AExec{h}` on the old handle answers `RErr`. This is the spec
-   sentence quoted above.
-4. `fresh_start` and 5. `fresh_kept`: the initial state is fresh (all
+3. `stale_handle_rejected`: under the rotating policy, after `ABind{h}`
+   rotates the handle, `AExec{h}` on the old handle answers `RErr`.
+   This is the spec sentence quoted above.
+4. `kept_handle_executes`: under the keeping policy, after `ABind{h}`
+   on a live handle, `AExec{h}` still answers `ROk{h}`.
+5. `fresh_start` and 6. `fresh_kept`: the initial state is fresh (all
    live handles are below the counter) and every request preserves
-   freshness. Law 3 is stated for fresh states, and laws 4 and 5 show
-   every reachable state is fresh, so together they cover every trace.
+   freshness under either policy. Law 3 is stated for fresh states, and
+   laws 5 and 6 show every reachable state is fresh, so together they
+   cover every trace.
 
 ### 4.3 Results
 
@@ -305,7 +320,28 @@ diagnosis of why is left to the human or agent.
 
 The model compiles to a 16 KB JavaScript file and a 1.1 MB native
 binary, both of which run the sample trace (create, bind, execute the
-stale handle) and print `Err`.
+pre-bind handle) and print `Err` for the rotating policy and `Ok(0)`
+for the keeping one.
+
+### 4.4 From model to Java: the differential test
+
+`traces.bend` enumerates 1085 request sequences, runs each through the
+proven model under both policies, and prints the expected response to
+every request. The file is checked in under
+`flight/flight-sql/src/test/resources/bend2/` and
+`TestFlightSqlBendConformance` replays every trace against the two
+example servers through the raw Flight client:
+
+| Server | Steps compared | Deviations from the model |
+| --- | ---: | --- |
+| `FlightSqlExample` (keeps handles) | 4221 | none |
+| `FlightSqlStatelessExample` (rotates handles) | 4221 | executes and binds stale or closed handles; cannot bind a rotated handle again |
+
+The stateless deviations are the example encoding the query into the
+handle and validating nothing server-side. They are recorded as a
+known-deviation set in the test, so the test passes today and fails
+the day the example is fixed or regresses further. `DIFFERENTIAL_TESTING.md`
+documents the design, the chain of trust and the limits.
 
 ## 5. Where Bend 2 could fit around Arrow
 
@@ -336,20 +372,18 @@ Cost: the proofs are hand-written, and the first model of each area
 pays for its own lemma library. Expect the proof to be two to three
 times the size of the model, as in section 3.3.
 
-### 5.2 Test oracles for the Java implementation (good fit, some work)
+### 5.2 Test oracles for the Java implementation (done for prepared statements)
 
-Because the model compiles to JavaScript, and `bend2/main.ts` doubles
-as a bun and node loader (`import Model from "./main.bend"` exposes
-every non-IO def with constructors as `{$: "Name", ...}` and `Nat` as
-`BigInt`), a Bend model can drive or check traces. A differential
-test would generate request traces, run them through the model to get
-the expected responses, and replay them against `FlightSqlClient` and
-a producer such as `FlightSqlStatelessExample`, comparing the
-`Ok`/error outcome per step. `TestFlightSqlStateless` is the natural
-home. This needs a small bridge (a JSON trace format, a node step in
-the test, or committing generated expectations), and the oracle is
-only as good as the model, but it turns the prose rules into a
-regression test.
+A differential test generates request traces, runs them through the
+proven model to get the expected responses, and replays them against a
+real server, comparing the success-or-error outcome per step. This is
+implemented for the prepared-statement model (section 4.4 and
+`DIFFERENTIAL_TESTING.md`): the generator is written in Bend and its
+output is committed as a text resource, so the Java build needs no
+Bend or node toolchain. The oracle is only as good as the model, which
+is why every law quotes the spec sentence it encodes, but it turns the
+prose rules into a regression test and it found three ways the
+stateless example departs from them.
 
 ### 5.3 Columnar and IPC structural invariants (feasible, expensive)
 
@@ -432,10 +466,13 @@ code should do, and section 5.2 turns that into tests.
    action per state as laws.
 2. Model `PollFlightInfo` (descriptor reuse, monotone progress,
    expiration, cancel) the same way.
-3. Build the differential harness in 5.2 against
-   `FlightSqlStatelessExample` and `FlightSqlExample`, starting with
-   the prepared-statement traces the model already generates.
-4. Revisit runtime integration only if a Python or JVM target or a
+3. Give each new model a `responses` function and a trace generator,
+   and add a replayer test as in `DIFFERENTIAL_TESTING.md`, so every
+   model validates the Java servers rather than only itself.
+4. Decide whether the stateless example should be fixed to reject
+   stale and closed handles and to accept a rotated handle on a second
+   bind; the conformance test's known-deviation set is the checklist.
+5. Revisit runtime integration only if a Python or JVM target or a
    stable FFI appears in the Bend changelog.
 
 ## 8. Sources

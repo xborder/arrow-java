@@ -18,9 +18,10 @@
 # A model of the Arrow Flight SQL prepared-statement lifecycle, written
 # in Bend 2 to see what its laws and proofs cost on a protocol shaped
 # like Flight SQL. Handles are Nats issued by a counter; the server
-# keeps the list of live handles. This is the "stateless" server style
-# from the Flight SQL spec: binding parameters (DoPut) may rotate the
-# handle, and the client must use the rotated one afterwards.
+# keeps the list of live handles. The spec says a server "may return an
+# updated handle" when parameters are bound (DoPut), and the client must
+# use it afterwards; the policy flag `rot` picks that stateless style
+# (True) or the stateful one that keeps the handle (False).
 #
 #   bend main.bend         # checks the model and runs the sample trace in main
 #   bend PROOF.bend        # checks LAWS.bend against this model
@@ -92,21 +93,29 @@ def exec(+h: Nat, live: List<&2, Nat>, +next: Nat, ok: Bool) -> Server & Resp:
     case False{}:
       (Server{live, next}, RErr{})
 
-# Bind: on a live handle, retire it and issue a fresh one; else Err
-def bind(+h: Nat, +live: List<&2, Nat>, +next: Nat, ok: Bool) -> Server & Resp:
-  match ok:
+# Bind on a live handle: rotate it (retire h, issue next) or keep it
+def bind.ok(+h: Nat, +live: List<&2, Nat>, +next: Nat, rot: Bool) -> Server & Resp:
+  match rot:
     case True{}:
       (Server{next <> remove(h, live), 1n+next}, ROk{next})
     case False{}:
+      (Server{live, next}, ROk{h})
+
+# Bind: on a live handle follow the policy; else Err
+def bind(+h: Nat, +live: List<&2, Nat>, +next: Nat, rot: Bool, ok: Bool) -> Server & Resp:
+  match ok:
+    case True{}:
+      bind.ok(h, live, next, rot)
+    case False{}:
       (Server{live, next}, RErr{})
 
-# one request against one state
-def step(a: Act, +live: List<&2, Nat>, +next: Nat) -> Server & Resp:
+# one request against one state, under the bind policy rot
+def step(a: Act, +live: List<&2, Nat>, +next: Nat, rot: Bool) -> Server & Resp:
   match a:
     case ACreate{}:
       (Server{next <> live, 1n+next}, ROk{next})
     case ABind{+h}:
-      bind(h, live, next, has(h, live))
+      bind(h, live, next, rot, has(h, live))
     case AExec{+h}:
       exec(h, live, next, has(h, live))
     case AClose{+h}:
@@ -122,24 +131,37 @@ def resp(sr: Server & Resp) -> Resp:
   r
 
 # a request against a whole server
-def step_s(a: Act, s: Server) -> Server & Resp:
+def step_s(a: Act, s: Server, rot: Bool) -> Server & Resp:
   Server{live, next} = s
-  step(a, live, next)
+  step(a, live, next, rot)
 
 def start() -> Server:
   Server{Nil{}, 0n}
 
 # a whole trace, threading the state and the last response
-def run(acts: List<Act>, sr: Server & Resp) -> Server & Resp:
+def run(acts: List<Act>, sr: Server & Resp, +rot: Bool) -> Server & Resp:
   match acts:
     case Nil{}:
       sr
     case a <> rest:
       (s, last) = sr
-      run(rest, step_s(a, s))
+      run(rest, step_s(a, s, rot), rot)
 
-def replay(acts: List<Act>) -> Server & Resp:
-  run(acts, (start(), RErr{}))
+def replay(acts: List<Act>, +rot: Bool) -> Server & Resp:
+  run(acts, (start(), RErr{}), rot)
+
+# the response of one step, followed by the rest of the trace
+def emit(sr: Server & Resp, rec: Server -> List<&2, Resp>) -> List<&2, Resp>:
+  (s, r) = sr
+  r <> rec(s)
+
+# every response of a trace, in order, as a function of the start state
+def responses(acts: List<&2, Act>, +rot: Bool) -> Server -> List<&2, Resp>:
+  match acts:
+    case Nil{}:
+      s => Nil{}
+    case a <> rest:
+      s => emit(step_s(a, s, rot), responses(rest, rot))
 
 # Show
 # ----
@@ -151,6 +173,9 @@ def Resp.show(r: Resp) -> String:
     case RErr{}:
       "Err"
 
-# create, bind (handle 0 -> 1), execute the stale 0: Err
+# create, bind, execute the pre-bind handle 0: Err when the bind
+# rotated the handle (stateless server), Ok(0) when it kept it
 def main() -> IO(Unit):
-  IO.print(Resp.show(resp(replay([ACreate{}, ABind{0n}, AExec{0n}]))))
+  do IO<Unit>:
+    IO.print(Resp.show(resp(replay([ACreate{}, ABind{0n}, AExec{0n}], True{}))))
+    IO.print(Resp.show(resp(replay([ACreate{}, ABind{0n}, AExec{0n}], False{}))))

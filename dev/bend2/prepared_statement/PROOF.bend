@@ -57,11 +57,11 @@ def eq_refl(n: Nat) -> {True{} == Nat.is_eq(n, n) : Bool}:
 # Laws
 # ----
 
-def Laws.closed_never_executes(h, live, next):
+def Laws.closed_never_executes(h, live, next, rot):
   %has_remove(h, live) : {PS.resp(PS.exec(h, PS.remove(h, live), next, _)) == PS.RErr{} : PS.Resp}
   {==}
 
-def Laws.created_handle_executes(live, next):
+def Laws.created_handle_executes(live, next, rot):
   %eq_refl(next) : {PS.resp(PS.exec(next, next <> live, 1n+next, (_ || PS.has(next, live)))) == PS.ROk{next} : PS.Resp}
   {==}
 
@@ -84,6 +84,22 @@ def disc(b: Bool) -> Type:
 def true_ne_false(e: {True{} == False{} : Bool}) -> Empty:
   %e : disc(_)
   Unit{}
+
+def ndisc(b: Bool) -> Type:
+  match b:
+    case True{}:
+      Empty
+    case False{}:
+      Unit
+
+# T(b) with b known False is Empty
+def false_T(b: Bool, e: {False{} == b : Bool}, w: Laws.T(b)) -> Empty:
+  match b:
+    case True{}:
+      %e : ndisc(_)
+      Unit{}
+    case False{}:
+      w
 
 # T(c && b) splits into T(c) and T(b); c is a parameter so it can be matched
 def split.fin(c: Bool, -b: Bool, w: Laws.T(c && b), -P: Type, k: Laws.T(c) -> Laws.T(b) -> P) -> P:
@@ -207,13 +223,22 @@ def has_lt(+h: Nat, xs: List<&2, Nat>, +n: Nat) -> Laws.T(PS.has(h, xs)) -> Laws
 def Laws.fresh_start():
   Unit{}
 
-# the Bind arm, over the verdict c of has(h, live)
-def kept_bind.fin(c: Bool, +h: Nat, +live: List<&2, Nat>, +next: Nat, w: Laws.Fresh(live, next))
-  -> Laws.Fresh_s(PS.state(PS.bind(h, live, next, c))):
-  match c:
+# the Bind arm on a live handle, over the policy rot
+def kept_bind.ok(rot: Bool, +h: Nat, +live: List<&2, Nat>, +next: Nat, w: Laws.Fresh(live, next))
+  -> Laws.Fresh_s(PS.state(PS.bind.ok(h, live, next, rot))):
+  match rot:
     case True{}:
       join.fin(Nat.is_lt(next, 1n+next), PS.all_lt(PS.remove(h, live), 1n+next),
         lt_succ(next), mono(PS.remove(h, live), next, remove_lt(h, live, next, w)))
+    case False{}:
+      w
+
+# the Bind arm, over the verdict c of has(h, live)
+def kept_bind.fin(c: Bool, rot: Bool, +h: Nat, +live: List<&2, Nat>, +next: Nat, w: Laws.Fresh(live, next))
+  -> Laws.Fresh_s(PS.state(PS.bind(h, live, next, rot, c))):
+  match c:
+    case True{}:
+      kept_bind.ok(rot, h, live, next, w)
     case False{}:
       w
 
@@ -226,12 +251,12 @@ def kept_exec.fin(c: Bool, +h: Nat, +live: List<&2, Nat>, +next: Nat, w: Laws.Fr
     case False{}:
       w
 
-def Laws.fresh_kept(a, live, next, w):
+def Laws.fresh_kept(a, live, next, rot, w):
   match a:
     case PS.ACreate{}:
       join.fin(Nat.is_lt(next, 1n+next), PS.all_lt(live, 1n+next), lt_succ(next), mono(live, next, w))
     case PS.ABind{+h}:
-      kept_bind.fin(PS.has(h, live), h, live, next, w)
+      kept_bind.fin(PS.has(h, live), rot, h, live, next, w)
     case PS.AExec{+h}:
       kept_exec.fin(PS.has(h, live), h, live, next, w)
     case PS.AClose{+h}:
@@ -242,7 +267,7 @@ def Laws.fresh_kept(a, live, next, w):
 
 # over the verdict c of has(h, live), with its equation
 def stale.fin(+h: Nat, +live: List<&2, Nat>, +next: Nat, c: Bool, e: {c == PS.has(h, live) : Bool}, w: Laws.Fresh(live, next))
-  -> {PS.resp(PS.step_s(PS.AExec{h}, PS.state(PS.bind(h, live, next, c)))) == PS.RErr{} : PS.Resp}:
+  -> {PS.resp(PS.step_s(PS.AExec{h}, PS.state(PS.bind(h, live, next, True{}, c)), True{})) == PS.RErr{} : PS.Resp}:
   match c:
     case True{}:
       ne = lt_ne(h, next, has_lt(h, live, next)(true_T(PS.has(h, live), e), w))
@@ -255,3 +280,19 @@ def stale.fin(+h: Nat, +live: List<&2, Nat>, +next: Nat, c: Bool, e: {c == PS.ha
 
 def Laws.stale_handle_rejected(h, live, next, w):
   stale.fin(h, live, next, PS.has(h, live), {==}, w)
+
+# Kept handles
+# ------------
+
+# over the verdict c of has(h, live), with its equation
+def kept.fin(+h: Nat, +live: List<&2, Nat>, +next: Nat, c: Bool, e: {c == PS.has(h, live) : Bool}, hw: Laws.T(PS.has(h, live)))
+  -> {PS.resp(PS.step_s(PS.AExec{h}, PS.state(PS.bind(h, live, next, False{}, c)), False{})) == PS.ROk{h} : PS.Resp}:
+  match c:
+    case True{}:
+      %e : {PS.resp(PS.exec(h, live, next, _)) == PS.ROk{h} : PS.Resp}
+      {==}
+    case False{}:
+      Empty.absurd({PS.resp(PS.exec(h, live, next, PS.has(h, live))) == PS.ROk{h} : PS.Resp}, false_T(PS.has(h, live), e, hw))
+
+def Laws.kept_handle_executes(h, live, next, hw):
+  kept.fin(h, live, next, PS.has(h, live), {==}, hw)

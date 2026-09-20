@@ -41,40 +41,54 @@ def Fresh_s(s: PS.Server) -> Data:
 
 # LAW: "Closes server resources associated with the prepared statement
 # handle." Once a handle is closed, executing it is an error, from any
-# server state.
+# server state and under either bind policy.
 law closed_never_executes:
   for +h    : Nat
   for +live : List<&2, Nat>
   for +next : Nat
-  {PS.resp(PS.step_s(PS.AExec{h}, PS.state(PS.step(PS.AClose{h}, live, next)))) == PS.RErr{} : PS.Resp}
+  for  rot  : Bool
+  {PS.resp(PS.step_s(PS.AExec{h}, PS.state(PS.step(PS.AClose{h}, live, next, rot)), rot)) == PS.RErr{} : PS.Resp}
 
 # LAW (anti-vacuity): a server that rejects everything satisfies the law
 # above. This one rules that out: the handle a Create returns executes.
 law created_handle_executes:
   for +live : List<&2, Nat>
   for +next : Nat
-  {PS.resp(PS.step_s(PS.AExec{next}, PS.state(PS.step(PS.ACreate{}, live, next)))) == PS.ROk{next} : PS.Resp}
+  for  rot  : Bool
+  {PS.resp(PS.step_s(PS.AExec{next}, PS.state(PS.step(PS.ACreate{}, live, next, rot)), rot)) == PS.ROk{next} : PS.Resp}
 
 # LAW: "The server is responsible for detecting the case where the
 # client does not use the updated handle and should return an error."
-# After a bind rotates h, executing the stale h is an error. This needs
-# the freshness invariant, so it is stated for fresh states only, and
-# the two laws below show every reachable state is fresh.
+# Under the rotating policy, after a bind rotates h, executing the
+# stale h is an error. This needs the freshness invariant, so it is
+# stated for fresh states only, and the two laws below show every
+# reachable state is fresh.
 law stale_handle_rejected:
   for +h    : Nat
   for +live : List<&2, Nat>
   for +next : Nat
   for  w    : Fresh(live, next)
-  {PS.resp(PS.step_s(PS.AExec{h}, PS.state(PS.step(PS.ABind{h}, live, next)))) == PS.RErr{} : PS.Resp}
+  {PS.resp(PS.step_s(PS.AExec{h}, PS.state(PS.step(PS.ABind{h}, live, next, True{})), True{})) == PS.RErr{} : PS.Resp}
+
+# LAW: a server that does not return an updated handle keeps the bound
+# handle valid: under the keeping policy, after a bind of a live h,
+# executing h succeeds.
+law kept_handle_executes:
+  for +h    : Nat
+  for +live : List<&2, Nat>
+  for +next : Nat
+  for  hw   : T(PS.has(h, live))
+  {PS.resp(PS.step_s(PS.AExec{h}, PS.state(PS.step(PS.ABind{h}, live, next, False{})), False{})) == PS.ROk{h} : PS.Resp}
 
 # LAW: the initial state is fresh
 law fresh_start:
   Fresh_s(PS.start())
 
-# LAW: every request keeps the state fresh
+# LAW: every request keeps the state fresh, under either policy
 law fresh_kept:
   for  a    : PS.Act
   for +live : List<&2, Nat>
   for +next : Nat
+  for  rot  : Bool
   for  w    : Fresh(live, next)
-  Fresh_s(PS.state(PS.step(a, live, next)))
+  Fresh_s(PS.state(PS.step(a, live, next, rot)))
