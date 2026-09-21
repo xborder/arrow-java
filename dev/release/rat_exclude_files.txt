@@ -19,3 +19,4 @@
 .github/pull_request_template.md
 dataset/src/test/resources/data/student.csv
 docs/Makefile
+docs/investigations/jev/examples/ci_failure_triage.jsonl
