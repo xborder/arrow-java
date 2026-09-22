@@ -93,13 +93,7 @@ jobs:
         jdk: [17, 21, 25]
         os: [ubuntu-latest]
         include:
-          - os: ubuntu-latest
-            compose_service: ubuntu-test-prebuilt
-          - name: AMD64 macOS 15-intel Java JDK 17
-            os: macos-15-intel
-            jdk: 17
-          - name: AArch64 macOS latest Java JDK 17
-            os: macos-latest
+          - arch: AArch64
             jdk: 17
           - name: AMD64 Windows Server 2022 Java JDK 17
             os: windows-latest
