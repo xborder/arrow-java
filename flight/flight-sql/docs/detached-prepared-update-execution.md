@@ -176,13 +176,13 @@ sequenceDiagram
 
     rect rgb(255, 245, 235)
         Note over C,S: Phase 2: execute (new dispatch branch)
-        alt synchronous
+        alt GetFlightInfo
             C->>S: GetFlightInfo(cmd=CommandPreparedStatementUpdate{handle})
-            S->>S: getFlightInfoPreparedStatementUpdate: run the update
-            S-->>C: FlightInfo{endpoints=[], app_metadata=DoPutUpdateResult{record_count}}
-        else asynchronous
+            S->>S: getFlightInfoPreparedStatementUpdate: start (or run) the update
+            S-->>C: FlightInfo{schema=UPDATE_RESULT, endpoints=[ticket...]}
+        else PollFlightInfo for long-running updates
             C->>S: PollFlightInfo(cmd=CommandPreparedStatementUpdate{handle})
-            S-->>C: PollInfo{info=FlightInfo{...partial}, flight_descriptor=retry, expiration_time}
+            S-->>C: PollInfo{info=FlightInfo{endpoints so far}, flight_descriptor=retry, expiration_time}
             loop until flight_descriptor is unset
                 C->>S: PollFlightInfo(retry descriptor)
                 S-->>C: PollInfo{...}
@@ -193,31 +193,76 @@ sequenceDiagram
         end
     end
 
-    alt FlightInfo.app_metadata is non-empty
-        C->>C: record_count = DoPutUpdateResult.parseFrom(app_metadata)
-    else endpoints present
-        loop each endpoint
-            C->>S: DoGet(ticket)
-            S-->>C: stream with schema {record_count: int64}
-        end
-        C->>C: record_count = sum over rows
+    loop each endpoint
+        C->>S: DoGet(ticket)
+        S->>S: getStreamPreparedStatementUpdate: wait for the update to finish if it has not
+        S-->>C: stream with schema {record_count: int64}
     end
+    C->>C: record_count = sum over all rows
     C-->>App: record_count
 ```
 
-Result delivery has two allowed shapes so that simple servers stay simple
-and distributed servers get endpoints:
+#### Where does the row count go?
 
-1. **Inline.** `FlightInfo.endpoints` is empty and `FlightInfo.app_metadata`
-   holds a serialized `DoPutUpdateResult`. One round trip, no `DoGet`.
-   `FlightInfo.app_metadata` already exists in `Flight.proto` and is exposed
-   by the Java `FlightInfo` class.
-2. **Streamed.** `FlightInfo.endpoints` is non-empty; each `DoGet` returns a
-   stream with a fixed schema, proposed as
-   `Schemas.UPDATE_RESULT_SCHEMA = {record_count: int64 not null}`, and the
-   client sums `record_count` across all rows of all endpoints. This is what
-   lets `PollFlightInfo` hand back partial results, and lets a coordinator
-   point the client at the node that ran the statement.
+Once execution sits behind `GetFlightInfo`, the count has to travel back
+through something `FlightInfo`-shaped. Three channels are available; none
+needs a new protobuf field.
+
+1. **`DoGet` stream (recommended).** `FlightInfo.endpoints` is non-empty and
+   each `DoGet` returns a stream with a fixed schema, proposed as
+   `Schemas.UPDATE_RESULT_SCHEMA = {record_count: int64 not null}`. The
+   client sums `record_count` across all rows of all endpoints. This is the
+   query path verbatim: the count is *data*, `GetSchema` has an obvious
+   answer, `PollFlightInfo` can hand back endpoints as partitions finish, and
+   the endpoint `location` can point at the node that actually ran the
+   statement. It also gives a cheap asynchronous mode without polling:
+   `GetFlightInfo` may return as soon as the update is *started*, and the
+   `DoGet` blocks until the count is known, which keeps the long wait on a
+   streaming RPC that Flight already designs for. The schema can grow later
+   (per-statement counts, generated keys) without touching `FlightInfo`.
+2. **`FlightInfo.total_records`.** Existing field, documented as "set to -1
+   if unknown", which matches the `DoPutUpdateResult` convention exactly.
+   Endpoints empty, one round trip, zero new fields or schemas. The cost is
+   semantic overloading: the field means "records in this flight", and a
+   flight with no endpoints and a positive `total_records` is a shape no
+   client or proxy expects today. It can carry exactly one number, and
+   `GetFlightInfo` must block until execution completes.
+3. **`FlightInfo.app_metadata`** holding a serialized `DoPutUpdateResult`.
+   One round trip and a structured, extensible payload, but it mixes a result
+   into a control-plane message, forces clients to implement two result paths
+   if endpoints are also allowed, and the field only exists since Flight
+   13.0.0, so intermediaries built on older Flight libraries drop it.
+
+| | `DoGet` stream | `total_records` | `app_metadata` |
+| --- | --- | --- | --- |
+| Extra RPC after `GetFlightInfo` | one `DoGet` per endpoint | none | none |
+| New proto fields | none | none | none |
+| New schema constant | yes | no | no |
+| `GetFlightInfo` may return before execution finishes | yes | no | no |
+| Partial results via `PollFlightInfo` | yes | no | no |
+| Redirect to the executing node | yes, via endpoint location | no | no |
+| Client result paths | one, shared with queries | one | one, or two if endpoints are also allowed |
+| Semantic fit | count is data | overloads an existing field | result inside metadata |
+
+The rest of this document assumes the `DoGet` stream as the single mandated
+shape, so that clients have one result path and it is the same one they use
+for queries. The extra `DoGet` costs one round trip on top of the `DoPut`
+and `GetFlightInfo` already spent; a server that wants to shave it can later
+offer `DoExchange` as a fast path (Option D). If the extra round trip is
+judged unacceptable, `total_records` is the fallback that adds no fields at
+all.
+
+Two consequences of "the count is a stream" are worth writing into the spec:
+
+- **Tickets for updates must be idempotent or single-use.** A query ticket
+  can usually be replayed, but replaying a `DoGet` that *runs* an update
+  would apply it twice. Either the server executes during `GetFlightInfo`
+  (or in the background) and the ticket only *reads* the outcome, or the
+  server executes during `DoGet` and rejects a second `DoGet` for the same
+  ticket. The former is the safer default and is what the stateless
+  walk-through in Option F assumes.
+- **`-1` propagates.** If any row of any endpoint reports `-1`, the total is
+  `-1`, matching today's "unknown count" semantics.
 
 Capability discovery: a new boolean `SqlInfo` value, provisionally named
 `FLIGHT_SQL_SERVER_UPDATE_VIA_GET_FLIGHT_INFO`, mirrors how
@@ -272,8 +317,7 @@ Pros:
   execute RPC, same `FlightInfo` object, and therefore `PollFlightInfo`,
   `CancelFlightInfo`, `RenewFlightEndpoint` and endpoint redirection for free.
 - No new message types. Only doc comments on an existing message, one new
-  `SqlInfo` enum value, one schema constant, and one convention on
-  `FlightInfo.app_metadata`.
+  `SqlInfo` enum value and one schema constant for the `DoGet` stream.
 - Every existing client keeps working with no change and no version check on
   the server side.
 - Server implementers are not forced to do anything: the new
@@ -361,8 +405,8 @@ message DoPutUpdateResult {
 
 The execution phase is identical to Option B: `GetFlightInfo` (or
 `PollFlightInfo`) with `CommandPreparedStatementUpdate` returns a
-`FlightInfo` whose `app_metadata` carries the row count inline, or whose
-endpoints stream it.
+`FlightInfo` whose endpoints stream the row count with the `UPDATE_RESULT`
+schema, exactly as a query streams its result set.
 
 ```mermaid
 sequenceDiagram
@@ -380,9 +424,13 @@ sequenceDiagram
         S-->>C: PutResult(DoPutUpdateResult{record_count=-1, execution_deferred=true, prepared_statement_handle=handle'?})
         C->>C: if handle' present then handle = handle'
         C->>S: GetFlightInfo(cmd=CommandPreparedStatementUpdate{handle})  (or PollFlightInfo)
-        S->>S: execute
-        S-->>C: FlightInfo{app_metadata=DoPutUpdateResult{record_count}} or endpoints
-        C->>C: record_count from app_metadata, else DoGet each endpoint and sum
+        S->>S: start or run the update
+        S-->>C: FlightInfo{schema=UPDATE_RESULT, endpoints=[ticket...]}
+        loop each endpoint
+            C->>S: DoGet(ticket)
+            S-->>C: stream {record_count: int64}
+        end
+        C->>C: record_count = sum over rows
     else old server (flag ignored) or new server that declines to defer
         S->>S: bind and execute (legacy path)
         S-->>C: PutResult(DoPutUpdateResult{record_count})
@@ -430,7 +478,11 @@ sequenceDiagram
         S->>S: decode handle' into query and parameters
         S->>DB: prepare(query), bind each row, executeBatch()
         DB-->>S: update counts
-        S-->>C: FlightInfo{endpoints=[], app_metadata=DoPutUpdateResult{record_count}}
+        S-->>C: FlightInfo{schema=UPDATE_RESULT, endpoints=[ticket = encode{record_count}]}
+        Note over S: The outcome travels inside the ticket, so DoGet is a pure read and safe to replay
+        C->>S: DoGet(ticket)
+        S->>S: decode ticket
+        S-->>C: stream {record_count}
     else long-running, PollFlightInfo
         C->>S: PollFlightInfo(cmd=CommandPreparedStatementUpdate{handle'})
         S->>S: decode handle', submit the update as a job
@@ -440,16 +492,20 @@ sequenceDiagram
         loop until flight_descriptor is unset
             C->>S: PollFlightInfo(cmd{handle''})
             S->>DB: status(job_id)
-            DB-->>S: running or finished(record_count)
+            DB-->>S: running or finished
             S-->>C: PollInfo{info, flight_descriptor still set while running}
         end
-        S-->>C: PollInfo{info=FlightInfo{app_metadata=DoPutUpdateResult{record_count}}, flight_descriptor unset}
+        S-->>C: PollInfo{info=FlightInfo{endpoints=[ticket = encode{job_id}]}, flight_descriptor unset}
         opt client cancels
             C->>S: DoAction CancelFlightInfo(info)
             S->>DB: cancel(job_id)
         end
+        C->>S: DoGet(ticket = encode{job_id})
+        S->>DB: result(job_id)
+        DB-->>S: record_count
+        S-->>C: stream {record_count}
     end
-    C->>C: record_count from app_metadata
+    C->>C: record_count = sum over rows
 
     C->>S: DoAction ClosePreparedStatement{handle}
     S-->>C: onCompleted (no-op, nothing to release)
@@ -467,8 +523,17 @@ Points specific to the stateless case:
   the same requirement `PollFlightInfo` already imposes on queries.
 - **Any node can serve any step.** Because `GetFlightInfo` receives the query
   and parameters inside the handle, the node that executes the update need
-  not be the node that accepted the `DoPut`. This is the "redirection" benefit
-  from section 1, realised without endpoints.
+  not be the node that accepted the `DoPut`, and the endpoint `location` can
+  send the `DoGet` to a third node. This is the "redirection" benefit from
+  section 1.
+- **Execute in `GetFlightInfo`, not in `DoGet`.** The synchronous branch runs
+  the statement while answering `GetFlightInfo` and folds the resulting count
+  into the ticket, so a replayed `DoGet` re-reads the outcome instead of
+  re-applying the update. Running the statement inside `DoGet`, as the
+  stateless example does for queries, would make the ticket a one-shot
+  trigger and the server would have to reject its reuse. The polling branch
+  gets the same property from the job identifier: `DoGet` only fetches the
+  result of a job that already ran.
 - **Handle size.** Parameter batches are copied into the handle and sent back
   and forth twice. This is the same trade-off `FlightSqlStatelessExample`
   makes for queries; servers with large parameter sets can instead persist
@@ -555,10 +620,12 @@ a requirement.
     *    server honours it, execute the update in one call. The server MUST reply
     *    with a PutResult carrying DoPutUpdateResult. A stream with zero rows
     *    executes with the parameters most recently bound to the handle.
-    *  - GetFlightInfo: execute the prepared update. If the returned FlightInfo has no
-    *    endpoints, its app_metadata MUST contain a serialized DoPutUpdateResult.
-    *    Otherwise each endpoint yields a stream with the UPDATE_RESULT schema and the
-    *    client sums record_count over all rows.
+    *  - GetFlightInfo: execute (or start) the prepared update. Each endpoint of the
+    *    returned FlightInfo yields a DoGet stream with the UPDATE_RESULT schema
+    *    (record_count: int64 not null); the client sums record_count over all rows
+    *    of all endpoints, and -1 in any row makes the total -1. Tickets MUST be safe
+    *    to replay or MUST be rejected on reuse; a DoGet MUST NOT apply the update
+    *    a second time.
     *  - PollFlightInfo: as GetFlightInfo, for long-running updates.
     *  - GetSchema: return the UPDATE_RESULT schema.
     * A server that sets DoPutUpdateResult.execution_deferred MUST accept this
@@ -614,9 +681,11 @@ Server side (`flight-sql`):
 - `FlightSqlProducer.getSchema`: return `Schemas.UPDATE_RESULT_SCHEMA` for
   `CommandPreparedStatementUpdate`.
 - `FlightSqlProducer.getStream`: dispatch a `CommandPreparedStatementUpdate`
-  ticket to a new default `getStreamPreparedStatementUpdate(...)`, for
-  servers that choose the streamed result shape and reuse the command as the
-  ticket, as `FlightSqlExample` does for queries.
+  ticket to a new default `getStreamPreparedStatementUpdate(...)` that emits
+  the `UPDATE_RESULT` stream, for servers that reuse the command as the
+  ticket, as `FlightSqlExample` does for queries. Servers that fold the
+  outcome or a job identifier into an opaque ticket handle it in their own
+  `getStream` before delegating to the default dispatch.
 - `FlightSqlProducer.acceptPutPreparedStatementUpdate`: contract unchanged;
   document the zero-row rule from Option A.
 - `SqlInfoBuilder`: accept the new key.
@@ -631,8 +700,8 @@ Client side (`flight-sql`):
 - `FlightSqlClient.PreparedStatement.executeUpdate()`: set
   `defer_execution = true` on the command, parse the ack as today, and if
   `execution_deferred` is set adopt any rotated handle and continue with
-  `GetFlightInfo(CommandPreparedStatementUpdate{handle})`, turning the
-  `FlightInfo` into a row count with the inline-or-streamed rule. Against an
+  `GetFlightInfo(CommandPreparedStatementUpdate{handle})`, then `DoGet` on
+  each endpoint and sum the `record_count` column. Against an
   old server the marker is absent and the method returns the count exactly as
   it does now, so callers see no behavioural change. A constructor flag can
   keep the request flag off for users who want the pure legacy wire shape.
@@ -665,7 +734,8 @@ Tests:
   by the subsequent `GetFlightInfo` and `ClosePreparedStatement`.
 - A stateless round trip: bind via `CommandPreparedStatementQuery`, observe
   the rotated handle, execute via `GetFlightInfo(CommandPreparedStatementUpdate)`
-  with that handle, and read the count from `app_metadata`.
+  with that handle, read the count from the `DoGet` stream, and assert that
+  replaying the same `DoGet` does not apply the update again.
 
 ## 6. Open questions to settle in the spec proposal
 
@@ -696,5 +766,6 @@ Tests:
 - arrow-adbc issue [#4074](https://github.com/apache/arrow-adbc/issues/4074)
   and PR [#4161](https://github.com/apache/arrow-adbc/pull/4161): Go ADBC
   driver choosing the update command from `is_update`.
-- `Flight.proto` `PollFlightInfo` and `PollInfo` definitions, and
-  `FlightInfo.app_metadata`, in [`arrow-format/Flight.proto`](../../../arrow-format/Flight.proto).
+- `Flight.proto` `PollFlightInfo` and `PollInfo` definitions, and the
+  `FlightInfo.total_records` and `FlightInfo.app_metadata` fields, in
+  [`arrow-format/Flight.proto`](../../../arrow-format/Flight.proto).
