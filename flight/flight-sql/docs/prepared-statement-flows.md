@@ -438,3 +438,7 @@ flowchart TD
 | Client method | `PreparedStatement.execute()` then `getStream(ticket)` | `PreparedStatement.executeUpdate()` |
 | Server methods | `acceptPutPreparedStatementQuery`, `getFlightInfoPreparedStatement`, `getStreamPreparedStatement` | `acceptPutPreparedStatementUpdate` |
 | Handle may change | yes, via `DoPutPreparedStatementResult` | no |
+
+See [detached-prepared-update-execution.md](detached-prepared-update-execution.md)
+for options to separate parameter binding from execution for
+`CommandPreparedStatementUpdate` while staying compatible with existing clients.
