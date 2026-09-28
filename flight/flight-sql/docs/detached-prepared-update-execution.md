@@ -398,6 +398,84 @@ ignore the unknown field, report "unknown row count", and never issue the
 `GetFlightInfo`. The update would silently never run. With the flag, a
 server only defers for callers that asked for it (C1, C3).
 
+#### Stateless server walk-through
+
+The rotated handle is what makes Option F work without any per-statement
+state on the server, in the same way `FlightSqlStatelessExample` handles
+queries today: the initial handle is just the SQL text, the bind step folds
+the serialized parameter batch into a new handle, and every later RPC
+decodes whatever it needs from the handle it receives.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as FlightSqlClient.PreparedStatement
+    participant S as Stateless server
+    participant DB as Database
+
+    C->>S: DoAction CreatePreparedStatement{query}
+    S->>DB: prepare(query) to derive schemas, then discard
+    S-->>C: ActionCreatePreparedStatementResult{handle = query bytes, parameter_schema, is_update=true}
+    Note over S: Nothing retained on the server
+
+    C->>S: DoPut(cmd=CommandPreparedStatementUpdate{handle = query bytes, defer_execution=true}, parameter batch)
+    S->>S: serialize the batch as an Arrow IPC file
+    S->>S: handle' = encode{query, parameters}
+    S-->>C: PutResult(DoPutUpdateResult{record_count=-1, execution_deferred=true, prepared_statement_handle=handle'})
+    Note over S: Still nothing retained: the bound parameters travel inside handle'
+    C->>C: handle = handle'
+
+    alt synchronous GetFlightInfo
+        C->>S: GetFlightInfo(cmd=CommandPreparedStatementUpdate{handle'})
+        S->>S: decode handle' into query and parameters
+        S->>DB: prepare(query), bind each row, executeBatch()
+        DB-->>S: update counts
+        S-->>C: FlightInfo{endpoints=[], app_metadata=DoPutUpdateResult{record_count}}
+    else long-running, PollFlightInfo
+        C->>S: PollFlightInfo(cmd=CommandPreparedStatementUpdate{handle'})
+        S->>S: decode handle', submit the update as a job
+        S->>DB: start job(query, parameters)
+        DB-->>S: job_id
+        S-->>C: PollInfo{info=FlightInfo{endpoints=[]}, flight_descriptor=cmd{handle'' = encode{job_id}}, expiration_time}
+        loop until flight_descriptor is unset
+            C->>S: PollFlightInfo(cmd{handle''})
+            S->>DB: status(job_id)
+            DB-->>S: running or finished(record_count)
+            S-->>C: PollInfo{info, flight_descriptor still set while running}
+        end
+        S-->>C: PollInfo{info=FlightInfo{app_metadata=DoPutUpdateResult{record_count}}, flight_descriptor unset}
+        opt client cancels
+            C->>S: DoAction CancelFlightInfo(info)
+            S->>DB: cancel(job_id)
+        end
+    end
+    C->>C: record_count from app_metadata
+
+    C->>S: DoAction ClosePreparedStatement{handle}
+    S-->>C: onCompleted (no-op, nothing to release)
+```
+
+Points specific to the stateless case:
+
+- **Two handle rotations.** The bind step rotates the handle to carry the
+  parameters, and the `PollFlightInfo` variant rotates it again so the retry
+  descriptor carries the job identifier. Both are opaque to the client, which
+  simply uses whatever descriptor the server hands back.
+- **The database is the only state.** For the synchronous path the server
+  needs nothing between RPCs. For the polling path the in-flight job must be
+  addressable by an identifier the server can resolve from any node, which is
+  the same requirement `PollFlightInfo` already imposes on queries.
+- **Any node can serve any step.** Because `GetFlightInfo` receives the query
+  and parameters inside the handle, the node that executes the update need
+  not be the node that accepted the `DoPut`. This is the "redirection" benefit
+  from section 1, realised without endpoints.
+- **Handle size.** Parameter batches are copied into the handle and sent back
+  and forth twice. This is the same trade-off `FlightSqlStatelessExample`
+  makes for queries; servers with large parameter sets can instead persist
+  the batch and put only a reference in the handle.
+- **`ClosePreparedStatement` is a no-op**, as it already is for stateless
+  queries, because there is nothing to release.
+
 Why the response fields are enough for discovery: an old server ignores
 `defer_execution`, executes as before, and returns a plain
 `DoPutUpdateResult` with no `execution_deferred`. The new client reads the
