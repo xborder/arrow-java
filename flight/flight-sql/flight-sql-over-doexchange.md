@@ -94,11 +94,11 @@ direction is a `FlightData`, with four optional parts:
 - `app_metadata`, bytes defined by the application.
 
 A gRPC call closes each direction separately. The client **half-closes** when it has nothing more
-to send but still expects an answer. On the wire, a half-close is the END_STREAM flag on the
-client's last HTTP/2 frame, so it costs no extra message and no extra round trip. The server ends
-the call with its **status**, sent as gRPC trailers. RPCs with a single request, such as
-`GetFlightInfo` and `DoGet`, half-close automatically. With `DoPut` and `DoExchange`, the client
-decides when it has finished sending.
+to send but still expects an answer. On the wire, a half-close is HTTP/2's END_STREAM flag, set
+on the client's last data frame or on an empty frame sent right after it. It is not a gRPC message
+and it costs no round trip. The server ends the call with its **status**, sent as gRPC trailers.
+RPCs with a single request, such as `GetFlightInfo` and `DoGet`, half-close automatically. With
+`DoPut` and `DoExchange`, the client decides when it has finished sending.
 
 Flight SQL defines no RPCs of its own. Its commands are protobuf messages packed in
 `google.protobuf.Any` and placed in a descriptor, a ticket or an action body. The specification
@@ -146,10 +146,11 @@ executes the request.
 request returns rows, then the status, in that order. It MUST NOT interleave result messages with
 the result stream.
 
-**R6.** Results are the Flight SQL messages that classic Flight SQL returns from `DoPut` and
-`DoAction`, for example `DoPutUpdateResult` and `ActionCreatePreparedStatementResult`. They are
-always `Any`-packed, including where classic `DoPut` sends them unpacked, because an exchange's
-replies are not typed by the RPC.
+**R6.** Flight SQL results are the messages that classic Flight SQL returns from `DoPut` and
+`DoAction`, for example `DoPutUpdateResult` and `ActionCreatePreparedStatementResult`. Over
+`DoExchange` they are always `Any`-packed, including where classic `DoPut` sends them unpacked,
+because an exchange's replies are not typed by the RPC. The results of other Flight actions pass
+through unchanged (R14).
 
 **R7.** A result stream is one Arrow IPC stream. The server MUST send its schema even when no rows
 follow. For results that span several endpoints, see R15.
@@ -195,9 +196,9 @@ the classic Java client does with `DoPut`.
 back as a result message. Commands keep carrying `transaction_id` exactly as they do today. Any
 other Flight action MAY be sent as an `Any`-packed `arrow.flight.protocol.Action`. The server then
 runs it as `DoAction` would and returns each non-empty `Result` body, unchanged, as a result
-message.
+message; the packing rule of R6 does not apply to those bodies.
 
-### Results with several endpoints
+### Several endpoints
 
 **R15.** When a result spans several endpoints, the server MUST do one of two things:
 
@@ -636,7 +637,7 @@ implementations behave as follows:
 
 | Implementation | Second schema on one stream |
 | --- | --- |
-| Java `FlightStream` (reader) | Corrupts the stream, including the result set still being read |
+| Java `FlightStream` (reader) | Timing-dependent. The second schema is applied on the gRPC thread as soon as it arrives: the batches that follow it are loaded into a root the client never sees and are lost, or, if it overtakes batches still queued for the reader, `next()` fails on the first result set with `no more buffers for field b: Utf8` |
 | C++ / pyarrow 25.0.1 writer | Rejected: `This writer has already been started`; a batch with another schema fails with `Tried to write record batch with different schema` |
 | C++ / pyarrow 25.0.1 reader | Error: `Header-type of flatbuffer-encoded Message is not RecordBatch` |
 | Rust `arrow-flight`, `FlightDataDecoder` (low-level) | Supported: "The schema is (re-)set. Dictionaries are cleared" |
@@ -688,6 +689,10 @@ but it copies every buffer and bypasses Flight's zero-copy path.
    needed to replace `PollFlightInfo`?
 5. Dictionary-encoded results that span endpoints need dictionary replacement within one stream.
    Should R15 require the `FlightInfo` answer in that case?
+6. R13 does not cover a `CommandPreparedStatementUpdate` that arrives with no input at all. The
+   prototype answers it with OK and no `DoPutUpdateResult`, and executes nothing
+   ([Appendix B](#appendix-b-validation-of-the-message-flows)). Should the server reject such a
+   request, or run the statement once, as it does for an empty batch?
 
 ## Next steps
 
@@ -769,7 +774,7 @@ every scenario.
 | R10 cancellation | yes | capture H2; unit test |
 | R11 parameters on ad hoc statements | yes | captures B, D, H; unit test for cleanup after a failure (cleanup after a cancel is not tested) |
 | R12 binding prepared queries | yes | captures E, E2, E3 (stateless server, new handle) |
-| R13 prepared updates | yes | captures F, F2 |
+| R13 prepared updates | yes; a request with no input at all is accepted and does nothing (open question 6) | captures F, F2, F3 |
 | R14 transactions and actions | yes | captures G (stub producer), N |
 | R15 several endpoints | inline only; the `FlightInfo` answer is not implemented | capture J |
 | R16 discovery | fallback on `UNIMPLEMENTED` only; no `SqlInfo` value yet | capture I |
@@ -791,8 +796,9 @@ timing checks ran on every capture:
 Transactions ran against a stub producer, since the example server does not implement them.
 Cancellation and several endpoints ran against a test producer that serves several endpoints or
 blocks until cancelled. The cancel capture therefore used a statement without parameters, so it
-checks the messages on the wire but not the cleanup of a one-shot statement. All 18 scenarios
-match their flows.
+checks the messages on the wire but not the cleanup of a one-shot statement. One scenario, `F3`,
+probes a case the rules do not cover rather than a diagram. All 19 scenarios match their expected
+flows.
 
 | Diagram | Capture | Observed flow (client → server), per call | Result |
 | --- | --- | --- | --- |
@@ -807,6 +813,7 @@ match their flows.
 | Prepared SELECT, stateless server | `E3_stateless_new_handle` | DoExchange: descriptor `Any(ActionCreatePreparedStatementRequest)`, half-close → `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoExchange: descriptor `Any(CommandPreparedStatementQuery)`, Schema, RecordBatch, half-close → `Any(DoPutPreparedStatementResult)`, Schema, RecordBatch ×2, status OK<br>DoExchange: descriptor `Any(ActionClosePreparedStatementRequest)`, half-close → status OK | matches |
 | Prepared INSERT, UPDATE or DELETE, with parameters | `F_prepared_update` | DoExchange: descriptor `Any(ActionCreatePreparedStatementRequest)`, half-close → `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoExchange: descriptor `Any(CommandPreparedStatementUpdate)`, Schema, RecordBatch, half-close → `Any(DoPutUpdateResult)`, status OK<br>DoExchange: descriptor `Any(ActionClosePreparedStatementRequest)`, half-close → status OK | matches |
 | Prepared INSERT, UPDATE or DELETE, without parameters | `F2_prepared_update_no_params` | DoExchange: descriptor `Any(ActionCreatePreparedStatementRequest)`, half-close → `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoExchange: descriptor `Any(CommandPreparedStatementUpdate)`, Schema, RecordBatch, half-close → `Any(DoPutUpdateResult)`, status OK<br>DoExchange: descriptor `Any(ActionClosePreparedStatementRequest)`, half-close → status OK | matches |
+| Probe, no diagram: prepared update with no input (open question 6) | `F3_prepared_update_no_input` | DoExchange: descriptor `Any(ActionCreatePreparedStatementRequest)`, half-close → `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoExchange: descriptor `Any(CommandPreparedStatementUpdate)`, half-close → status OK<br>DoExchange: descriptor `Any(ActionClosePreparedStatementRequest)`, half-close → status OK | matches |
 | Transactions | `G_transactions` | DoExchange: descriptor `Any(ActionBeginTransactionRequest)`, half-close → `Any(ActionBeginTransactionResult)`, status OK<br>DoExchange: descriptor `Any(CommandStatementUpdate)`, half-close → `Any(DoPutUpdateResult)`, status OK<br>DoExchange: descriptor `Any(CommandStatementUpdate)`, half-close → `Any(DoPutUpdateResult)`, status OK<br>DoExchange: descriptor `Any(ActionEndTransactionRequest)`, half-close → status OK | matches |
 | Errors and cancellation: failure | `H_failure` | DoExchange: descriptor `Any(CommandStatementQuery)`, Schema, RecordBatch, half-close → status INTERNAL | matches |
 | Errors and cancellation: cancel | `H2_cancel` | DoExchange: descriptor `Any(CommandStatementQuery)`, half-close, RST_STREAM CANCEL → Schema, RecordBatch | matches |
@@ -819,8 +826,11 @@ The captures also settled details that the rules now state:
 
 - **Repeated descriptors (R1).** Both the C++ and the Java client send the descriptor alone as the
   first message, then repeat it on the schema message.
-- **The half-close is free (R3).** When the client has no input, it follows the descriptor within
-  about 0.1 ms, in the same burst.
+- **The half-close is free (R3).** The C++ client sends it as an empty DATA frame with END_STREAM,
+  about 0.1 ms after the descriptor and in the same burst; the Java client sets the flag on its
+  last data frame.
+- **No input is not an empty batch (R13).** A prepared update sent with only the half-close was
+  answered OK with no result, and nothing ran (`F3`, open question 6).
 - **Errors are status-only replies (R9).** The failed bind in `H_failure` came back as headers and
   `grpc-status 13` (INTERNAL), with no data.
 - **Cancellation is `RST_STREAM(CANCEL)` (R10).** After it, the server sends no status.
