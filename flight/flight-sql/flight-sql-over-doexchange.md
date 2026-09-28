@@ -147,26 +147,7 @@ A few rules make the stream unambiguous:
 
 ### Walkthroughs
 
-Arrows show messages on the one `DoExchange` call. `Any(X)` is an `Any`-packed `X`.
-
-**SELECT, plain statement**
-
-```
-C→S  descriptor = Any(CommandStatementQuery{query: "SELECT * FROM intTable"}); half-close
-S→C  Schema(ID, KEYNAME, VALUE, FOREIGNID)
-S→C  RecordBatch ...
-S→C  status OK
-```
-
-**SELECT with parameters**
-
-```
-C→S  descriptor = Any(CommandStatementQuery{query: "SELECT * FROM intTable WHERE id = ?"})
-C→S  Schema(id: int32), RecordBatch[id = 2]; half-close
-     (server, in-process: CreatePreparedStatement, bind, GetFlightInfo, DoGet, ClosePreparedStatement)
-S→C  Schema(ID, KEYNAME, VALUE, FOREIGNID), RecordBatch ...
-S→C  status OK
-```
+A SELECT with one parameter, in classic Flight SQL and over DoExchange:
 
 ```mermaid
 sequenceDiagram
@@ -188,40 +169,232 @@ sequenceDiagram
     S-->>C: schema + batches + OK
 ```
 
-**INSERT / UPDATE / DELETE, plain statement**
+The diagrams follow each scenario message by message. **Client** and **Server** talk over one
+`DoExchange` call, which is all the network carries. The third column stands for the producer's
+existing Flight SQL handlers (`getFlightInfo`, `getStream`, `acceptPut`, `doAction`), which
+`FlightSqlExchangeProducer` calls in-process. Solid arrows are requests and calls, dotted arrows are
+replies, and the numbers give the order. `Any(X)` is an `Any`-packed `X`; on the arrow that opens a
+call, it is the command in the call's descriptor.
 
-```
-C→S  descriptor = Any(CommandStatementUpdate{query: "DELETE FROM intTable WHERE keyName = 'x'"}); half-close
-S→C  app_metadata = Any(DoPutUpdateResult{record_count: 1})
-S→C  status OK
-```
+#### SELECT, plain statement
 
-**INSERT / UPDATE / DELETE with parameter sets**
-
-```
-C→S  descriptor = Any(CommandStatementUpdate{query: "UPDATE intTable SET value = ? WHERE keyName = ?"})
-C→S  Schema(value: int32, keyName: utf8), RecordBatch[10 rows]; half-close
-     (server: CreatePreparedStatement, DoPut CommandPreparedStatementUpdate, ClosePreparedStatement)
-S→C  app_metadata = Any(DoPutUpdateResult{record_count: 10})
-S→C  status OK
-```
-
-**Reusable prepared statement** (one call per step)
-
-```
-call 1  C→S  Any(ActionCreatePreparedStatementRequest{query}); half-close
-        S→C  app_metadata = Any(ActionCreatePreparedStatementResult{handle, dataset_schema, parameter_schema})
-call 2  C→S  Any(CommandPreparedStatementQuery{handle}), Schema + RecordBatch[parameters]; half-close
-        S→C  app_metadata = Any(DoPutPreparedStatementResult{[new handle]})
-        S→C  Schema, RecordBatch ...
-call n  (same as call 2, with the latest handle; CommandPreparedStatementUpdate for DML)
-last    C→S  Any(ActionClosePreparedStatementRequest{handle}); half-close
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server<br/>FlightSqlExchangeProducer
+    participant P as Producer handlers<br/>(in-process)
+    C->>S: DoExchange<br/>Any(CommandStatementQuery)
+    C->>S: half-close, no parameters
+    S->>P: getFlightInfo(same descriptor)
+    P-->>S: FlightInfo, one ticket per endpoint
+    loop every endpoint, in order
+        S->>P: getStream(ticket)
+        P-->>S: record batches
+        S-->>C: Schema (first endpoint only)<br/>RecordBatch …
+    end
+    S-->>C: status OK
 ```
 
-**Transactions.** `BeginTransaction` and `EndTransaction` take one exchange each, and the
-statements in between carry `transaction_id` in their commands, exactly like classic Flight SQL.
-A transaction of *n* statements therefore takes *n* + 2 calls. Classic Flight SQL takes more
-whenever one of the statements is a query or has parameters.
+Only steps 1, 2, 7 and 8 cross the network. In classic Flight SQL, steps 3 and 5 are separate RPCs,
+`GetFlightInfo` and then `DoGet`, and `DoGet` has to wait for the ticket. Here the endpoints reach
+the client in order, as one stream with one schema.
+
+#### SELECT with parameters
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server<br/>FlightSqlExchangeProducer
+    participant P as Producer handlers<br/>(in-process)
+    C->>S: DoExchange<br/>Any(CommandStatementQuery)
+    C->>S: Schema + RecordBatch<br/>parameter sets
+    C->>S: half-close
+    Note over S: parameters were sent, so it runs<br/>a one-shot prepared statement
+    S->>P: doAction(CreatePreparedStatement)
+    P-->>S: handle
+    S->>P: acceptPut with<br/>CommandPreparedStatementQuery<br/>binds the parameters
+    P-->>S: DoPutPreparedStatementResult<br/>may carry a new handle
+    S->>P: getFlightInfo, then getStream<br/>for every endpoint
+    P-->>S: record batches
+    S-->>C: Schema, RecordBatch …
+    S->>P: doAction(ClosePreparedStatement)
+    S-->>C: status OK
+```
+
+The client sends the query, the parameters and the half-close without waiting for a reply. Steps 4
+to 9 and step 11 stay inside the server. In classic Flight SQL they are five dependent RPCs:
+`CreatePreparedStatement`, `DoPut`, `GetFlightInfo`, `DoGet` and `ClosePreparedStatement`.
+
+#### INSERT / UPDATE / DELETE, plain statement
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server<br/>FlightSqlExchangeProducer
+    participant P as Producer handlers<br/>(in-process)
+    C->>S: DoExchange<br/>Any(CommandStatementUpdate)
+    C->>S: half-close, no parameters
+    S->>P: acceptPut(same descriptor)
+    P-->>S: PutResult with DoPutUpdateResult
+    S-->>C: Any(DoPutUpdateResult)<br/>in app_metadata
+    S-->>C: status OK
+```
+
+Classic Flight SQL also needs a single `DoPut` call here, so this case saves nothing, but it lets a
+client send every statement through the same RPC.
+
+#### INSERT / UPDATE / DELETE with parameter sets
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server<br/>FlightSqlExchangeProducer
+    participant P as Producer handlers<br/>(in-process)
+    C->>S: DoExchange<br/>Any(CommandStatementUpdate)
+    C->>S: Schema + RecordBatch<br/>one row per execution
+    C->>S: half-close
+    S->>P: doAction(CreatePreparedStatement)
+    P-->>S: handle
+    S->>P: acceptPut with<br/>CommandPreparedStatementUpdate<br/>executes once per row
+    P-->>S: DoPutUpdateResult (row count)
+    S-->>C: Any(DoPutUpdateResult)<br/>in app_metadata
+    S->>P: doAction(ClosePreparedStatement)
+    S-->>C: status OK
+```
+
+Each row of the batch is one execution of the statement. Steps 4 to 7 and step 9 stay inside the
+server. In classic Flight SQL they are three dependent RPCs: `CreatePreparedStatement`, `DoPut` and
+`ClosePreparedStatement`.
+
+#### Prepared SELECT, reused
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server<br/>FlightSqlExchangeProducer
+    participant P as Producer handlers<br/>(in-process)
+    Note over C,P: call 1, prepare
+    C->>S: DoExchange, then half-close<br/>Any(ActionCreatePreparedStatementRequest)
+    S->>P: doAction(CreatePreparedStatement)
+    P-->>S: Result
+    S-->>C: Any(ActionCreatePreparedStatementResult)<br/>in app_metadata: handle and schemas
+    S-->>C: status OK
+    Note over C,P: call 2, execute, as often as needed
+    C->>S: DoExchange<br/>Any(CommandPreparedStatementQuery{handle})
+    C->>S: Schema + RecordBatch (parameters)<br/>then half-close
+    S->>P: acceptPut(same descriptor)<br/>binds the parameters
+    P-->>S: DoPutPreparedStatementResult
+    S-->>C: Any(DoPutPreparedStatementResult)<br/>exactly one, may carry a new handle
+    S->>P: getFlightInfo(latest handle), then<br/>getStream for every endpoint
+    P-->>S: record batches
+    S-->>C: Schema, RecordBatch …
+    S-->>C: status OK
+    Note over C,P: call 3, close
+    C->>S: DoExchange, then half-close<br/>Any(ActionClosePreparedStatementRequest)
+    S->>P: doAction(ClosePreparedStatement)
+    S-->>C: status OK
+```
+
+The client keeps the handle and repeats call 2 as often as it needs, one round trip each time. With
+parameters, classic Flight SQL needs three dependent RPCs per execution: `DoPut`, `GetFlightInfo`
+and `DoGet`. If step 10 carries a new handle, the client uses it from then on. Without parameters
+the client sends only the half-close in step 7, and steps 8 to 10 are skipped.
+
+#### Prepared INSERT / UPDATE / DELETE, reused
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server<br/>FlightSqlExchangeProducer
+    participant P as Producer handlers<br/>(in-process)
+    Note over C,P: call 1, prepare
+    C->>S: DoExchange, then half-close<br/>Any(ActionCreatePreparedStatementRequest)
+    S->>P: doAction(CreatePreparedStatement)
+    P-->>S: Result
+    S-->>C: Any(ActionCreatePreparedStatementResult)<br/>in app_metadata: handle and schemas
+    S-->>C: status OK
+    Note over C,P: call 2, execute, once per batch of parameter sets
+    C->>S: DoExchange<br/>Any(CommandPreparedStatementUpdate{handle})
+    C->>S: Schema + RecordBatch (parameter sets,<br/>or one empty batch), then half-close
+    S->>P: acceptPut(same descriptor)<br/>executes the statement
+    P-->>S: DoPutUpdateResult (row count)
+    S-->>C: Any(DoPutUpdateResult)<br/>in app_metadata
+    S-->>C: status OK
+    Note over C,P: call 3, close
+    C->>S: DoExchange, then half-close<br/>Any(ActionClosePreparedStatementRequest)
+    S->>P: doAction(ClosePreparedStatement)
+    S-->>C: status OK
+```
+
+Call 2 does the work of the classic `DoPut`, one round trip either way. Without parameters the
+client sends one empty batch, as the classic Java client does.
+
+#### Transactions
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server<br/>FlightSqlExchangeProducer
+    participant P as Producer handlers<br/>(in-process)
+    Note over C,P: call 1, begin
+    C->>S: DoExchange, then half-close<br/>Any(ActionBeginTransactionRequest)
+    S->>P: doAction(BeginTransaction)
+    P-->>S: Result
+    S-->>C: Any(ActionBeginTransactionResult)<br/>in app_metadata: the transaction_id
+    S-->>C: status OK
+    loop one call per statement
+        C->>S: DoExchange, with a command that<br/>carries the transaction_id
+        Note over S,P: runs as in the diagrams above
+        S-->>C: results, then status OK
+    end
+    Note over C,P: last call, commit or roll back
+    C->>S: DoExchange, then half-close<br/>Any(ActionEndTransactionRequest)
+    S->>P: doAction(EndTransaction)
+    S-->>C: status OK
+```
+
+`BeginTransaction` and `EndTransaction` take one call each, and every statement in between carries
+the `transaction_id` in its command, exactly as in classic Flight SQL. A transaction of *n*
+statements therefore takes *n* + 2 calls. Classic Flight SQL takes more whenever a statement is a
+query or has parameters.
+
+#### Failure and cancellation
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server<br/>FlightSqlExchangeProducer
+    participant P as Producer handlers<br/>(in-process)
+    C->>S: DoExchange<br/>Any(CommandStatementQuery)
+    C->>S: parameters, then half-close
+    S->>P: doAction(CreatePreparedStatement)
+    P-->>S: handle
+    S->>P: bind with acceptPut, then<br/>getFlightInfo and getStream
+    alt a handler fails
+        P-->>S: error
+        S->>P: doAction(ClosePreparedStatement)
+        S-->>C: error status with the handler's code
+    else the client stops reading early
+        P-->>S: record batches
+        S-->>C: Schema, RecordBatch …
+        C-xS: cancel the call
+        Note over S,P: getStream sees isCancelled() and stops
+        S->>P: doAction(ClosePreparedStatement)
+    end
+```
+
+The server closes the one-shot prepared statement on every path. If a handler fails, the client gets
+the same status code as in classic Flight SQL. If the client cancels, a `getStream` handler that
+checks `isCancelled()` can stop early, and the statement is still closed. The handle never leaves
+the server, so a client that dies cannot leak the statement.
 
 ## Measurements
 
