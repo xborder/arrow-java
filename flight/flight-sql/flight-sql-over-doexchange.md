@@ -17,55 +17,41 @@
   under the License.
 -->
 
-# Flight SQL over a single DoExchange call (exploration)
+# Flight SQL over DoExchange: protocol proposal
 
-**Status:** experimental prototype and design notes, not part of the Flight SQL specification.
+**Status:** draft proposal for discussion. It is not part of the Flight SQL specification. The key
+words MUST, MUST NOT, SHOULD and MAY are to be interpreted as described in
+[RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
 
 ## Summary
 
-Flight SQL defines its commands (`CommandStatementQuery`, `CommandPreparedStatementUpdate`, ...)
-for use with `GetFlightInfo`, `DoGet`, `DoPut` and `DoAction`. A single statement often needs
-several of those calls one after the other: 2 for a query, 5 for a query with parameters. This
-exploration drops all of them in favour of `DoExchange`, a bidirectional stream, and sends the
-**same Flight SQL messages** over it:
+Flight SQL spreads one statement over several dependent RPCs: two for a query, five for a query
+with parameters. This proposal lets a client run **any Flight SQL request as a single `DoExchange`
+call**. The request travels in the call's descriptor and its input (parameters, or rows to ingest)
+follows on the same call. The server answers on the same call with the usual Flight SQL results
+and the result set.
 
-- The client opens `DoExchange` with the Flight SQL command as the descriptor. If the statement has
-  parameters (or data to ingest), it streams them on the same call, then half-closes.
-- The server answers on the same call with the result set and/or the usual Flight SQL result
-  messages (`DoPutUpdateResult`, ...), carried in `app_metadata`.
+- **Nothing changes in Flight.** `DoExchange`, command descriptors and metadata-only messages
+  are already part of Flight.
+- **Flight SQL gains a "When used with DoExchange" mode** for its commands and actions, one
+  `SqlInfo` value and one new capability: parameters on ad hoc statements. All existing messages
+  are reused as they are, and the classic RPCs keep working unchanged.
+- **Each request takes one round trip**, instead of up to five. At 50 ms of round-trip time, a
+  SELECT with a parameter drops from 270 ms to 55 ms in the prototype.
+- **The unit is one request, not one session.** An exchange for a whole session would need changes
+  to Arrow IPC and to every Flight implementation, and it would not be faster.
 
-Results of the prototype in this branch:
+The rules below are prototyped in Java on this branch, except the `FlightInfo` answer of R15 and
+the `SqlInfo` value of R16, and an independent pyarrow (C++) client exercised them. Every message
+flow in this document was checked against captured network traffic, except the one marked as not
+prototyped ([Appendix B](#appendix-b-validation-of-the-message-flows)).
 
-- **Every statement takes exactly one RPC and one round trip.** This covers SELECT, INSERT,
-  UPDATE, DELETE, statements with parameters, prepared statements, catalog metadata, bulk ingest
-  and transactions. The tests check it by counting the RPCs the server receives.
-- **Latency follows the RPC count.** At 50 ms RTT, a parameterized SELECT drops from 270 ms to
-  55 ms, re-executing a prepared SELECT from 160 ms to 54 ms, and a batched INSERT from 163 ms to
-  57 ms (see [Measurements](#measurements)).
-- **Existing servers need no new handler code.** `FlightSqlExchangeProducer` wraps any Flight SQL
-  producer and translates each exchange into in-process calls to its existing `getFlightInfo`,
-  `getStream`, `acceptPut` and `doAction` handlers. Classic clients keep working unchanged: the
-  whole `TestFlightSql` suite passes against the wrapped server.
-- **It works with stock Flight clients.** A pyarrow (C++) client using protobuf classes generated
-  from the official `FlightSql.proto` ran every scenario against the Java server.
-- **The unit of an exchange is one statement, not one session.** Every Flight implementation tested
-  carries at most one Arrow schema per direction per stream. Running many statements with
-  different result schemas over a single long-lived call would need changes to the Flight
-  implementations themselves; see [One exchange per session?](#one-exchange-per-session).
+## Motivation
 
-Prior art: [apache/arrow#37741](https://github.com/apache/arrow/issues/37741) proposes using
-`DoExchange` to bind parameters and execute prepared statements in one round trip. The issue is
-still open, and it names the main trade-off: the results come back from the server that received
-the call. The [DuckDB Airport extension](https://airport.query.farm/) already uses `DoExchange`
-for INSERT, UPDATE and DELETE.
-
-## Where the round trips go today
-
-HTTP/2 already multiplexes all of a client's gRPC calls over one connection. Flight SQL
-therefore uses one connection, unless `FlightInfo` sends the client to other locations. The cost
-of classic Flight SQL is the chain of *dependent* calls: each call needs the answer of the
-previous one (a ticket, a handle), so each one adds a full round trip. The table shows what
-`FlightSqlClient` does today; the RPC counts are the ones the tests and the benchmark record.
+HTTP/2 already carries all of a client's gRPC calls on one connection, so classic Flight SQL
+needs no extra connections. It pays for the chain of *dependent* calls instead: each call needs a
+value from the previous answer (a prepared-statement handle, a ticket) before it can start, so
+each one adds a full round trip.
 
 | Scenario | Classic Flight SQL calls | Round trips | Over DoExchange |
 | --- | --- | ---: | ---: |
@@ -79,333 +65,685 @@ previous one (a ticket, a handle), so each one adds a full round trip. The table
 | Bulk ingest | `DoPut` | 1 | 1 |
 | Begin / commit / rollback | `DoAction` | 1 each | 1 each |
 
-Splitting a statement across calls has two more costs, beyond latency:
+Splitting a statement across calls has two more costs:
 
-- **State between calls.** An L7 load balancer can route each call to a different server, so the
-  prepared statement, the bound parameters and the query behind a ticket must be shared between
-  servers, or pinned with sticky routing. Stateless servers work around it by encoding the bound
-  parameters in the prepared-statement handle, which is why `DoPutPreparedStatementResult` exists
+- **State between calls.** An L7 load balancer can route each call to a different server. The
+  prepared statement, the bound parameters and the query behind a ticket must therefore be shared
+  between servers, or pinned with sticky routing. Stateless servers work around it by encoding the
+  bound parameters in the handle, which is why `DoPutPreparedStatementResult` exists
   ([apache/arrow#37720](https://github.com/apache/arrow/issues/37720)).
 - **Leaks.** A client that dies between `CreatePreparedStatement` and `ClosePreparedStatement`
   leaves the statement open until the server's timeout expires.
 
-## The protocol
+Prior art: [apache/arrow#37741](https://github.com/apache/arrow/issues/37741) proposes using
+`DoExchange` to bind parameters and execute a prepared statement in one round trip. The issue is
+still open, and it names the main trade-off: the results come back from the server that received
+the call. The [DuckDB Airport extension](https://airport.query.farm/) already uses `DoExchange`
+for INSERT, UPDATE and DELETE.
 
-The Flight specification describes `DoExchange` as follows: "The `FlightDescriptor` is included
-with the first message, as with `DoPut`. At this point, both the client and the server may
-simultaneously stream data to the other side." The prototype defines a Flight SQL exchange like
-this:
+## Background
 
-1. **Request.** The client calls `DoExchange` with a command `FlightDescriptor`. Its `cmd` is an
-   `Any`-packed Flight SQL request: any `Command*` message, any Flight SQL `Action*Request`
-   message, or a Flight `Action` (for any other action).
-2. **Input.** If the statement has input, the client streams **one** Arrow stream: parameter
-   values with one row per parameter set, or rows to ingest. The client must then **half-close**
-   its side of the call, even when it sent nothing. For requests that may carry parameters, the
-   server waits for the half-close (or the first batch) before it starts. Clients send the
-   half-close right after the request, without waiting for the server, so it costs no round trip.
-3. **Output.** The server replies on the same call:
-   - **Metadata-only messages** whose `app_metadata` is an `Any`-packed Flight SQL result: the
-     same messages classic Flight SQL returns from `DoPut` and `DoAction`.
-   - For commands that produce rows, **one** Arrow stream holding the result set. The schema is
-     always sent, even for an empty result. All endpoints of the underlying `FlightInfo` are
-     concatenated in order.
-   - The **call status**: OK means the statement succeeded. Errors use the same status codes as
-     classic Flight SQL.
+`DoExchange` is Flight's bidirectional streaming RPC. The Flight specification says: "The
+`FlightDescriptor` is included with the first message, as with `DoPut`. At this point, both the
+client and the server may simultaneously stream data to the other side." Every message in either
+direction is a `FlightData`, with four optional parts:
 
-| Request in the descriptor | Client streams | Server replies | Replaces |
+- `flight_descriptor`;
+- `data_header`, the header of an Arrow IPC schema, record batch or dictionary batch message;
+- `data_body`, the buffers of that message;
+- `app_metadata`, bytes defined by the application.
+
+A gRPC call closes each direction separately. The client **half-closes** when it has nothing more
+to send but still expects an answer. On the wire, a half-close is the END_STREAM flag on the
+client's last HTTP/2 frame, so it costs no extra message and no extra round trip. The server ends
+the call with its **status**, sent as gRPC trailers. RPCs with a single request, such as
+`GetFlightInfo` and `DoGet`, half-close automatically. With `DoPut` and `DoExchange`, the client
+decides when it has finished sending.
+
+Flight SQL defines no RPCs of its own. Its commands are protobuf messages packed in
+`google.protobuf.Any` and placed in a descriptor, a ticket or an action body. The specification
+says what each command does "when used with" `GetFlightInfo`, `GetSchema` or `DoPut`, and which
+requests go with `DoAction`. It never mentions `DoExchange`, so this proposal conflicts with
+nothing.
+
+## Terminology
+
+- **Exchange:** one `DoExchange` call that carries one Flight SQL request.
+- **Request:** the `Any`-packed Flight SQL message in the exchange's descriptor.
+- **Input:** the Arrow IPC stream the client sends after the request: one schema, then record
+  batches.
+- **Result message:** a `FlightData` that has only `app_metadata` set, holding an `Any`-packed
+  Flight SQL result.
+- **Result stream:** the Arrow IPC stream of rows that the server sends: one schema, then record
+  batches.
+
+## Specification
+
+### Request
+
+**R1.** The client MUST open the exchange with a `FlightData` whose `flight_descriptor` has type
+`CMD` and whose `cmd` is a `google.protobuf.Any` packing one of the requests listed in
+[Requests](#requests). The server MUST take the request from the first message. Clients MAY
+repeat the descriptor on the message that carries the input schema, as the Java and C++ Flight
+clients do; the server MUST ignore repeated descriptors.
+
+### Input
+
+**R2.** After the first message, the client MAY send one input stream, and MUST NOT send more than
+one. What the input holds depends on the request: parameter values with one row per parameter
+set, or the rows to ingest.
+
+**R3.** The client MUST half-close after its input, or right after the first message when it has
+no input. It SHOULD send the whole request, half-close included, without waiting for the server.
+
+**R4.** A request carries parameters if and only if its input schema has at least one field. For
+requests that accept input, the server MUST read the input up to the half-close before it
+executes the request.
+
+### Output
+
+**R5.** The server replies with zero or more result messages, then the result stream if the
+request returns rows, then the status, in that order. It MUST NOT interleave result messages with
+the result stream.
+
+**R6.** Results are the Flight SQL messages that classic Flight SQL returns from `DoPut` and
+`DoAction`, for example `DoPutUpdateResult` and `ActionCreatePreparedStatementResult`. They are
+always `Any`-packed, including where classic `DoPut` sends them unpacked, because an exchange's
+replies are not typed by the RPC.
+
+**R7.** A result stream is one Arrow IPC stream. The server MUST send its schema even when no rows
+follow. For results that span several endpoints, see R15.
+
+**R8.** An update returns one or more `DoPutUpdateResult` messages. The number of affected rows is
+the sum of their `record_count` values, or unknown if any of them is -1.
+
+### Status, errors and cancellation
+
+**R9.** The status is the outcome of the request. OK means success. For a failure, the server
+MUST use the status code that classic Flight SQL would return for the same request. Rows or
+results received before an error status belong to a failed request. A server MAY fail a request
+before the client half-closes, for example when it does not support the request.
+
+**R10.** A client cancels a request by cancelling the call. The server MUST then stop the request
+and release everything it holds for it. `CancelFlightInfo` does not apply, since the exchange
+creates no `FlightInfo`.
+
+### Parameters on ad hoc statements
+
+**R11.** Over `DoExchange`, `CommandStatementQuery` and `CommandStatementUpdate` accept
+parameters, which classic Flight SQL allows only on prepared statements. The server executes such
+a request as a one-shot prepared statement: it prepares the statement, binds the parameters,
+executes it and closes it within the call. An update executes once per parameter row. The handle
+never reaches the client. The server MUST close the statement when the call ends, whether the
+request succeeded, failed or was cancelled.
+
+### Prepared statements
+
+**R12.** When a `CommandPreparedStatementQuery` carries parameters, the server MUST send exactly
+one `DoPutPreparedStatementResult` before the result stream, so that the client knows how many
+result messages precede the rows. If that message sets `prepared_statement_handle`, the client
+MUST use the new handle from then on, as with `DoPut` today. Without parameters, the server sends
+no `DoPutPreparedStatementResult`.
+
+**R13.** A `CommandPreparedStatementUpdate` executes once per parameter row. To execute a statement
+that has no parameters, the client sends an input with no fields and one batch with zero rows, as
+the classic Java client does with `DoPut`.
+
+### Transactions, savepoints and other actions
+
+**R14.** Flight SQL action requests travel in the descriptor, and each result of the action comes
+back as a result message. Commands keep carrying `transaction_id` exactly as they do today. Any
+other Flight action MAY be sent as an `Any`-packed `arrow.flight.protocol.Action`. The server then
+runs it as `DoAction` would and returns each non-empty `Result` body, unchanged, as a result
+message.
+
+### Results with several endpoints
+
+**R15.** When a result spans several endpoints, the server MUST do one of two things:
+
+- stream all of them, in order, as one result stream, since they share a single schema; or
+- answer with a single result message holding an `Any`-packed `arrow.flight.protocol.FlightInfo`,
+  and no result stream.
+
+In the second case, the client fetches the endpoints with `DoGet` as in classic Flight SQL, and
+keeps every `FlightInfo` feature: locations, parallel fetch, expiration, `CancelFlightInfo` and
+`RenewFlightEndpoint`. Clients MUST support both answers.
+
+### Discovery and compatibility
+
+**R16.** A server that supports this proposal SHOULD advertise it with a new `SqlInfo` value,
+`FLIGHT_SQL_SERVER_DO_EXCHANGE = true`. A server without support answers `UNIMPLEMENTED`, which
+is what a Flight server does when it does not implement `DoExchange`. A client MAY try an exchange
+and fall back to the classic RPCs on `UNIMPLEMENTED`; it SHOULD remember the answer for that
+server. An exchange whose descriptor does not hold a Flight SQL request keeps whatever meaning the
+server gives it. Flight SQL requests are recognised by their `Any` type: a message in the
+`arrow.flight.protocol.sql` package, or `arrow.flight.protocol.Action`.
+
+### Requests
+
+| Request in the descriptor | Client input | Server output | Replaces |
 | --- | --- | --- | --- |
-| `CommandStatementQuery` | nothing | result set | `GetFlightInfo` + `DoGet` |
-| `CommandStatementQuery` | parameters | result set | `DoAction` + `DoPut` + `GetFlightInfo` + `DoGet` + `DoAction` |
-| `CommandStatementUpdate` | nothing | `DoPutUpdateResult` | `DoPut` |
-| `CommandStatementUpdate` | parameters (one execution per row) | `DoPutUpdateResult` (one or more; the client adds them up) | `DoAction` + `DoPut` + `DoAction` |
-| `CommandStatementIngest` | rows to ingest | `DoPutUpdateResult` | `DoPut` |
-| `ActionCreatePreparedStatementRequest` | nothing | `ActionCreatePreparedStatementResult` | `DoAction` |
-| `CommandPreparedStatementQuery` | parameters, optional | exactly one `DoPutPreparedStatementResult` if parameters were sent, then the result set | `DoPut` + `GetFlightInfo` + `DoGet` |
-| `CommandPreparedStatementUpdate` | parameters (or one empty batch) | `DoPutUpdateResult` | `DoPut` |
-| `ActionClosePreparedStatementRequest` | nothing | nothing | `DoAction` |
-| `CommandGet*`, `CommandStatementSubstraitPlan` | nothing | result set | `GetFlightInfo` + `DoGet` |
-| `ActionBeginTransactionRequest`, `ActionEndTransactionRequest`, savepoints | nothing | `ActionBeginTransactionResult`, ... | `DoAction` |
-| Flight `Action` (for example `SetSessionOptions`) | nothing | each result body | `DoAction` |
+| `CommandStatementQuery` | none, or parameters (R11) | result stream | `GetFlightInfo` + `DoGet`; with parameters, 5 calls |
+| `CommandStatementSubstraitPlan` | none | result stream | `GetFlightInfo` + `DoGet` |
+| `CommandStatementUpdate` | none, or parameter sets (R11) | `DoPutUpdateResult`, one or more (R8) | `DoPut`; with parameters, 3 calls |
+| `CommandStatementIngest` | the rows to ingest | `DoPutUpdateResult` | `DoPut` |
+| `CommandPreparedStatementQuery` | none, or parameters | with parameters, exactly one `DoPutPreparedStatementResult` (R12); then the result stream | `DoPut` + `GetFlightInfo` + `DoGet` |
+| `CommandPreparedStatementUpdate` | parameter sets, or no fields and one zero-row batch (R13) | `DoPutUpdateResult`, one or more (R8) | `DoPut` |
+| `CommandGetCatalogs`, `CommandGetDbSchemas`, `CommandGetTables`, `CommandGetTableTypes`, `CommandGetSqlInfo`, `CommandGetXdbcTypeInfo`, `CommandGetPrimaryKeys`, `CommandGetExportedKeys`, `CommandGetImportedKeys`, `CommandGetCrossReference` | none | result stream | `GetFlightInfo` + `DoGet` |
+| `ActionCreatePreparedStatementRequest`, `ActionCreatePreparedSubstraitPlanRequest` | none | `ActionCreatePreparedStatementResult` | `DoAction` |
+| `ActionClosePreparedStatementRequest` | none | nothing | `DoAction` |
+| `ActionBeginTransactionRequest`, `ActionBeginSavepointRequest` | none | `ActionBeginTransactionResult`, `ActionBeginSavepointResult` | `DoAction` |
+| `ActionEndTransactionRequest`, `ActionEndSavepointRequest` | none | nothing | `DoAction` |
+| `arrow.flight.protocol.Action`, for any other action | none | each non-empty result body, unchanged (R14) | `DoAction` |
 
-A few rules make the stream unambiguous:
+Where the table says "result stream", R15 also allows the server to answer with a `FlightInfo`.
 
-- **Parameters are present if and only if the client sent a schema with at least one field.** The
-  classic protocol encodes intent in the choice of RPC; here the intent has to come from the
-  request and its input.
-- **Parameters on plain statements.** `CommandStatementQuery` and `CommandStatementUpdate` accept
-  parameters, which classic Flight SQL only allows on prepared statements. The server prepares the
-  statement, binds the parameters, executes it and closes it within the call. It closes the
-  statement even if execution fails or the client cancels.
-- **Binding a prepared query.** `CommandPreparedStatementQuery` with parameters is answered with
-  exactly one `DoPutPreparedStatementResult` before the result set, so the client knows how many
-  metadata messages to read. If the server returned a new handle (for example a stateless server
-  that encodes the parameters in it), the message carries it and the client uses it from then on,
-  as the specification requires.
-- **Cancellation** is gRPC cancellation of the call. `CancelFlightInfo` is not needed, since there
-  is no `FlightInfo`.
+## Message flows
 
-### Walkthroughs
+The diagrams show only what crosses the network, between the client and the server:
 
-A SELECT with one parameter, in classic Flight SQL and over DoExchange:
+- Each arrow is a message on the exchange, unless it names another RPC.
+- `descriptor: Any(X)` is the first message of the call.
+- `app_metadata: Any(X)` is a result message.
+- `Schema` and `RecordBatch` are Arrow IPC messages.
+- `half-close` is the client ending its side of the call.
+- `status` is the gRPC status that ends the call.
+- Notes describe what the server does; they are not messages.
+- Solid arrows come from the client, dotted arrows from the server.
+- Numbers give the order of the messages.
+
+[Appendix B](#appendix-b-validation-of-the-message-flows) lists the captured traffic that each
+diagram was checked against.
+
+### Classic Flight SQL and DoExchange compared
+
+A SELECT with one parameter:
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant S as Server
-    Note over C,S: Classic Flight SQL: 5 dependent round trips
-    C->>S: DoAction CreatePreparedStatement(sql)
-    S-->>C: ActionCreatePreparedStatementResult(handle)
-    C->>S: DoPut CommandPreparedStatementQuery(handle) + parameters
-    S-->>C: DoPutPreparedStatementResult
-    C->>S: GetFlightInfo CommandPreparedStatementQuery(handle)
-    S-->>C: FlightInfo(ticket)
+    participant S as Flight SQL server
+    Note over C,S: Classic Flight SQL: 5 calls, each waits for the previous answer
+    C->>S: DoAction CreatePreparedStatement
+    S-->>C: Result: Any(ActionCreatePreparedStatementResult), status OK
+    C->>S: DoPut: descriptor Any(CommandPreparedStatementQuery)<br/>Schema, RecordBatch, half-close
+    S-->>C: optional DoPutPreparedStatementResult, status OK
+    C->>S: GetFlightInfo: Any(CommandPreparedStatementQuery)
+    S-->>C: FlightInfo with a ticket, status OK
     C->>S: DoGet(ticket)
-    S-->>C: schema + batches
-    C->>S: DoAction ClosePreparedStatement(handle)
-    S-->>C: done
-    Note over C,S: Over DoExchange: 1 round trip
-    C->>S: DoExchange CommandStatementQuery(sql) + parameters + half-close
-    S-->>C: schema + batches + OK
+    S-->>C: Schema, RecordBatch …, status OK
+    C->>S: DoAction ClosePreparedStatement
+    S-->>C: status OK
+    Note over C,S: Over DoExchange: 1 call
+    C->>S: DoExchange: descriptor Any(CommandStatementQuery)<br/>Schema, RecordBatch, half-close
+    S-->>C: Schema, RecordBatch …, status OK
 ```
 
-The diagrams follow each scenario message by message. **Client** and **Server** talk over one
-`DoExchange` call, which is all the network carries. The third column stands for the producer's
-existing Flight SQL handlers (`getFlightInfo`, `getStream`, `acceptPut`, `doAction`), which
-`FlightSqlExchangeProducer` calls in-process. Solid arrows are requests and calls, dotted arrows are
-replies, and the numbers give the order. `Any(X)` is an `Any`-packed `X`; on the arrow that opens a
-call, it is the command in the call's descriptor.
+Classic calls 2 to 5 cannot start early: they need the handle from call 1, and `DoGet` needs the
+ticket from `GetFlightInfo`. Over `DoExchange`, the client sends everything at once.
 
-#### SELECT, plain statement
+### SELECT
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Client
-    participant S as Server<br/>FlightSqlExchangeProducer
-    participant P as Producer handlers<br/>(in-process)
-    C->>S: DoExchange<br/>Any(CommandStatementQuery)
-    C->>S: half-close, no parameters
-    S->>P: getFlightInfo(same descriptor)
-    P-->>S: FlightInfo, one ticket per endpoint
-    loop every endpoint, in order
-        S->>P: getStream(ticket)
-        P-->>S: record batches
-        S-->>C: Schema (first endpoint only)<br/>RecordBatch …
+    participant S as Flight SQL server
+    C->>S: DoExchange<br/>descriptor: Any(CommandStatementQuery)
+    C->>S: half-close
+    Note over S: no input, so no parameters: runs the query
+    S-->>C: Schema
+    S-->>C: RecordBatch …
+    S-->>C: status OK
+```
+
+The half-close (step 2) tells the server that no parameters are coming (R4). The catalog commands
+(`CommandGetTables`, ...) and `CommandStatementSubstraitPlan` follow the same flow.
+
+### SELECT with parameters
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Flight SQL server
+    C->>S: DoExchange<br/>descriptor: Any(CommandStatementQuery)
+    C->>S: Schema of the parameters
+    C->>S: RecordBatch, one row per parameter set
+    C->>S: half-close
+    Note over S: one-shot prepared statement (R11):<br/>prepare, bind, execute, close
+    S-->>C: Schema
+    S-->>C: RecordBatch …
+    S-->>C: status OK
+```
+
+The client sends steps 1 to 4 without waiting for the server. The five classic calls become
+server-internal steps.
+
+### INSERT, UPDATE or DELETE
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Flight SQL server
+    C->>S: DoExchange<br/>descriptor: Any(CommandStatementUpdate)
+    C->>S: half-close
+    Note over S: executes the statement once
+    S-->>C: app_metadata: Any(DoPutUpdateResult)
+    S-->>C: status OK
+```
+
+Classic Flight SQL also needs a single `DoPut` call here, so the gain is only that every request
+now uses the same RPC.
+
+### INSERT, UPDATE or DELETE with parameter sets
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Flight SQL server
+    C->>S: DoExchange<br/>descriptor: Any(CommandStatementUpdate)
+    C->>S: Schema of the parameters
+    C->>S: RecordBatch, one row per execution
+    C->>S: half-close
+    Note over S: one-shot prepared statement (R11):<br/>prepare, execute once per row, close
+    S-->>C: app_metadata: Any(DoPutUpdateResult), one or more
+    S-->>C: status OK
+```
+
+The client adds up the `record_count` values of all `DoPutUpdateResult` messages (R8).
+
+### Prepared SELECT
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Flight SQL server
+    Note over C,S: call 1: prepare
+    C->>S: DoExchange<br/>descriptor: Any(ActionCreatePreparedStatementRequest)
+    C->>S: half-close
+    S-->>C: app_metadata: Any(ActionCreatePreparedStatementResult)<br/>handle, dataset schema, parameter schema
+    S-->>C: status OK
+    Note over C,S: call 2: execute, as often as needed
+    C->>S: DoExchange<br/>descriptor: Any(CommandPreparedStatementQuery{handle})
+    opt the statement has parameters
+        C->>S: Schema of the parameters
+        C->>S: RecordBatch of parameter values
     end
-    S-->>C: status OK
-```
-
-Only steps 1, 2, 7 and 8 cross the network. In classic Flight SQL, steps 3 and 5 are separate RPCs,
-`GetFlightInfo` and then `DoGet`, and `DoGet` has to wait for the ticket. Here the endpoints reach
-the client in order, as one stream with one schema.
-
-#### SELECT with parameters
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant S as Server<br/>FlightSqlExchangeProducer
-    participant P as Producer handlers<br/>(in-process)
-    C->>S: DoExchange<br/>Any(CommandStatementQuery)
-    C->>S: Schema + RecordBatch<br/>parameter sets
     C->>S: half-close
-    Note over S: parameters were sent, so it runs<br/>a one-shot prepared statement
-    S->>P: doAction(CreatePreparedStatement)
-    P-->>S: handle
-    S->>P: acceptPut with<br/>CommandPreparedStatementQuery<br/>binds the parameters
-    P-->>S: DoPutPreparedStatementResult<br/>may carry a new handle
-    S->>P: getFlightInfo, then getStream<br/>for every endpoint
-    P-->>S: record batches
-    S-->>C: Schema, RecordBatch …
-    S->>P: doAction(ClosePreparedStatement)
+    opt parameters were sent
+        S-->>C: app_metadata: Any(DoPutPreparedStatementResult)<br/>exactly one, may carry a new handle (R12)
+    end
+    S-->>C: Schema
+    S-->>C: RecordBatch …
     S-->>C: status OK
-```
-
-The client sends the query, the parameters and the half-close without waiting for a reply. Steps 4
-to 9 and step 11 stay inside the server. In classic Flight SQL they are five dependent RPCs:
-`CreatePreparedStatement`, `DoPut`, `GetFlightInfo`, `DoGet` and `ClosePreparedStatement`.
-
-#### INSERT / UPDATE / DELETE, plain statement
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant S as Server<br/>FlightSqlExchangeProducer
-    participant P as Producer handlers<br/>(in-process)
-    C->>S: DoExchange<br/>Any(CommandStatementUpdate)
-    C->>S: half-close, no parameters
-    S->>P: acceptPut(same descriptor)
-    P-->>S: PutResult with DoPutUpdateResult
-    S-->>C: Any(DoPutUpdateResult)<br/>in app_metadata
-    S-->>C: status OK
-```
-
-Classic Flight SQL also needs a single `DoPut` call here, so this case saves nothing, but it lets a
-client send every statement through the same RPC.
-
-#### INSERT / UPDATE / DELETE with parameter sets
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant S as Server<br/>FlightSqlExchangeProducer
-    participant P as Producer handlers<br/>(in-process)
-    C->>S: DoExchange<br/>Any(CommandStatementUpdate)
-    C->>S: Schema + RecordBatch<br/>one row per execution
+    Note over C,S: call 3: close
+    C->>S: DoExchange<br/>descriptor: Any(ActionClosePreparedStatementRequest{handle})
     C->>S: half-close
-    S->>P: doAction(CreatePreparedStatement)
-    P-->>S: handle
-    S->>P: acceptPut with<br/>CommandPreparedStatementUpdate<br/>executes once per row
-    P-->>S: DoPutUpdateResult (row count)
-    S-->>C: Any(DoPutUpdateResult)<br/>in app_metadata
-    S->>P: doAction(ClosePreparedStatement)
     S-->>C: status OK
 ```
 
-Each row of the batch is one execution of the statement. Steps 4 to 7 and step 9 stay inside the
-server. In classic Flight SQL they are three dependent RPCs: `CreatePreparedStatement`, `DoPut` and
-`ClosePreparedStatement`.
+Each execution takes one round trip instead of three (`DoPut`, `GetFlightInfo`, `DoGet`). A
+stateless server can return a new handle in the `DoPutPreparedStatementResult`, and the client
+then uses it for later calls.
 
-#### Prepared SELECT, reused
+### Prepared INSERT, UPDATE or DELETE
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Client
-    participant S as Server<br/>FlightSqlExchangeProducer
-    participant P as Producer handlers<br/>(in-process)
-    Note over C,P: call 1, prepare
-    C->>S: DoExchange, then half-close<br/>Any(ActionCreatePreparedStatementRequest)
-    S->>P: doAction(CreatePreparedStatement)
-    P-->>S: Result
-    S-->>C: Any(ActionCreatePreparedStatementResult)<br/>in app_metadata: handle and schemas
+    participant S as Flight SQL server
+    Note over C,S: call 1: prepare
+    C->>S: DoExchange<br/>descriptor: Any(ActionCreatePreparedStatementRequest)
+    C->>S: half-close
+    S-->>C: app_metadata: Any(ActionCreatePreparedStatementResult)
     S-->>C: status OK
-    Note over C,P: call 2, execute, as often as needed
-    C->>S: DoExchange<br/>Any(CommandPreparedStatementQuery{handle})
-    C->>S: Schema + RecordBatch (parameters)<br/>then half-close
-    S->>P: acceptPut(same descriptor)<br/>binds the parameters
-    P-->>S: DoPutPreparedStatementResult
-    S-->>C: Any(DoPutPreparedStatementResult)<br/>exactly one, may carry a new handle
-    S->>P: getFlightInfo(latest handle), then<br/>getStream for every endpoint
-    P-->>S: record batches
-    S-->>C: Schema, RecordBatch …
+    Note over C,S: call 2: execute, as often as needed
+    C->>S: DoExchange<br/>descriptor: Any(CommandPreparedStatementUpdate{handle})
+    alt the statement has parameters
+        C->>S: Schema of the parameters
+        C->>S: RecordBatch, one row per execution
+    else no parameters (R13)
+        C->>S: Schema with no fields
+        C->>S: RecordBatch with zero rows, for one execution
+    end
+    C->>S: half-close
+    S-->>C: app_metadata: Any(DoPutUpdateResult), one or more
     S-->>C: status OK
-    Note over C,P: call 3, close
-    C->>S: DoExchange, then half-close<br/>Any(ActionClosePreparedStatementRequest)
-    S->>P: doAction(ClosePreparedStatement)
+    Note over C,S: call 3: close
+    C->>S: DoExchange<br/>descriptor: Any(ActionClosePreparedStatementRequest{handle})
+    C->>S: half-close
     S-->>C: status OK
 ```
 
-The client keeps the handle and repeats call 2 as often as it needs, one round trip each time. With
-parameters, classic Flight SQL needs three dependent RPCs per execution: `DoPut`, `GetFlightInfo`
-and `DoGet`. If step 10 carries a new handle, the client uses it from then on. Without parameters
-the client sends only the half-close in step 7, and steps 8 to 10 are skipped.
+Call 2 does the work of the classic `DoPut`, in one round trip either way.
 
-#### Prepared INSERT / UPDATE / DELETE, reused
+### Transactions
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Client
-    participant S as Server<br/>FlightSqlExchangeProducer
-    participant P as Producer handlers<br/>(in-process)
-    Note over C,P: call 1, prepare
-    C->>S: DoExchange, then half-close<br/>Any(ActionCreatePreparedStatementRequest)
-    S->>P: doAction(CreatePreparedStatement)
-    P-->>S: Result
-    S-->>C: Any(ActionCreatePreparedStatementResult)<br/>in app_metadata: handle and schemas
-    S-->>C: status OK
-    Note over C,P: call 2, execute, once per batch of parameter sets
-    C->>S: DoExchange<br/>Any(CommandPreparedStatementUpdate{handle})
-    C->>S: Schema + RecordBatch (parameter sets,<br/>or one empty batch), then half-close
-    S->>P: acceptPut(same descriptor)<br/>executes the statement
-    P-->>S: DoPutUpdateResult (row count)
-    S-->>C: Any(DoPutUpdateResult)<br/>in app_metadata
-    S-->>C: status OK
-    Note over C,P: call 3, close
-    C->>S: DoExchange, then half-close<br/>Any(ActionClosePreparedStatementRequest)
-    S->>P: doAction(ClosePreparedStatement)
-    S-->>C: status OK
-```
-
-Call 2 does the work of the classic `DoPut`, one round trip either way. Without parameters the
-client sends one empty batch, as the classic Java client does.
-
-#### Transactions
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant S as Server<br/>FlightSqlExchangeProducer
-    participant P as Producer handlers<br/>(in-process)
-    Note over C,P: call 1, begin
-    C->>S: DoExchange, then half-close<br/>Any(ActionBeginTransactionRequest)
-    S->>P: doAction(BeginTransaction)
-    P-->>S: Result
-    S-->>C: Any(ActionBeginTransactionResult)<br/>in app_metadata: the transaction_id
+    participant S as Flight SQL server
+    Note over C,S: call 1: begin
+    C->>S: DoExchange<br/>descriptor: Any(ActionBeginTransactionRequest)
+    C->>S: half-close
+    S-->>C: app_metadata: Any(ActionBeginTransactionResult)<br/>with the transaction_id
     S-->>C: status OK
     loop one call per statement
-        C->>S: DoExchange, with a command that<br/>carries the transaction_id
-        Note over S,P: runs as in the diagrams above
-        S-->>C: results, then status OK
+        C->>S: DoExchange<br/>descriptor: Any(Command… with transaction_id)
+        C->>S: input, if any, then half-close
+        S-->>C: results as in the diagrams above, then status OK
     end
-    Note over C,P: last call, commit or roll back
-    C->>S: DoExchange, then half-close<br/>Any(ActionEndTransactionRequest)
-    S->>P: doAction(EndTransaction)
+    Note over C,S: last call: commit or roll back
+    C->>S: DoExchange<br/>descriptor: Any(ActionEndTransactionRequest)<br/>transaction_id, COMMIT or ROLLBACK
+    C->>S: half-close
     S-->>C: status OK
 ```
 
-`BeginTransaction` and `EndTransaction` take one call each, and every statement in between carries
-the `transaction_id` in its command, exactly as in classic Flight SQL. A transaction of *n*
-statements therefore takes *n* + 2 calls. Classic Flight SQL takes more whenever a statement is a
-query or has parameters.
+A transaction of *n* statements takes *n* + 2 calls. Classic Flight SQL takes more whenever a
+statement is a query or has parameters. Savepoints work the same way.
 
-#### Failure and cancellation
+### Errors and cancellation
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Client
-    participant S as Server<br/>FlightSqlExchangeProducer
-    participant P as Producer handlers<br/>(in-process)
-    C->>S: DoExchange<br/>Any(CommandStatementQuery)
-    C->>S: parameters, then half-close
-    S->>P: doAction(CreatePreparedStatement)
-    P-->>S: handle
-    S->>P: bind with acceptPut, then<br/>getFlightInfo and getStream
-    alt a handler fails
-        P-->>S: error
-        S->>P: doAction(ClosePreparedStatement)
-        S-->>C: error status with the handler's code
+    participant S as Flight SQL server
+    C->>S: DoExchange<br/>descriptor: Any(CommandStatementQuery)
+    C->>S: Schema and RecordBatch of the parameters
+    C->>S: half-close
+    alt the request fails
+        Note over S: closes the one-shot prepared statement
+        S-->>C: status: error, with the code classic Flight SQL uses
     else the client stops reading early
-        P-->>S: record batches
-        S-->>C: Schema, RecordBatch …
-        C-xS: cancel the call
-        Note over S,P: getStream sees isCancelled() and stops
-        S->>P: doAction(ClosePreparedStatement)
+        S-->>C: Schema
+        S-->>C: RecordBatch …
+        C-xS: cancel the call (RST_STREAM CANCEL)
+        Note over S: stops, then closes the one-shot prepared statement
     end
 ```
 
-The server closes the one-shot prepared statement on every path. If a handler fails, the client gets
-the same status code as in classic Flight SQL. If the client cancels, a `getStream` handler that
-checks `isCancelled()` can stop early, and the statement is still closed. The handle never leaves
-the server, so a client that dies cannot leak the statement.
+Here the failure comes before any result, so the reply is status-only (R9). A cancelled call gets
+no status at all (R10). Either way the handle never left the server, so a client that disappears
+cannot leak the statement.
 
-## Measurements
+### Results with several endpoints
 
-`TestFlightSqlExchange` checks every scenario above against the Derby-backed `FlightSqlExample`:
-the exchange result equals the classic one, and the server receives exactly one `DoExchange`
-call per statement.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Flight SQL server
+    participant E as Endpoint location
+    C->>S: DoExchange<br/>descriptor: Any(CommandStatementQuery)
+    C->>S: half-close
+    alt inline: one result stream
+        S-->>C: Schema
+        S-->>C: RecordBatch … of endpoint 1, then 2, then 3
+        S-->>C: status OK
+    else redirect (not prototyped)
+        S-->>C: app_metadata: Any(FlightInfo)
+        S-->>C: status OK
+        Note over C,E: one DoGet per endpoint, in parallel if wanted
+        C->>E: DoGet(ticket)
+        E-->>C: result stream<br/>status OK
+    end
+```
 
-`TestFlightSqlExchangeLatency` is a manual benchmark. The client reaches the server through a TCP
-proxy that delays each direction by half the RTT, which models network latency without limiting
-bandwidth. The table shows the median of 15 runs (21 at RTT 0) on loopback with the Derby example
-server.
+Streaming inline keeps the one round trip, but every row passes through the server that received
+the call. The redirect costs a second round trip and keeps distributed and parallel fetching
+(R15).
+
+### Discovery and fallback
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server without DoExchange support
+    C->>S: DoExchange<br/>descriptor: Any(CommandStatementQuery)
+    C->>S: half-close
+    S-->>C: status UNIMPLEMENTED
+    Note over C: remembers it and uses classic Flight SQL from now on
+    C->>S: GetFlightInfo: Any(CommandStatementQuery)
+    S-->>C: FlightInfo, status OK
+    C->>S: DoGet(ticket)
+    S-->>C: Schema, RecordBatch …, status OK
+```
+
+A failed probe costs one round trip, once per server (R16). A client that already reads `SqlInfo`,
+as JDBC drivers do for database metadata, can check the flag instead.
+
+## Proposed changes to the specification
+
+Flight itself does not change. The Flight SQL changes are additive.
+
+**`Flight.proto`, comment only.** `FlightData.flight_descriptor` says "This is only relevant when
+a client is starting a new DoPut stream", but `DoExchange` uses it too:
+
+```protobuf
+  /*
+   * The descriptor of the data. This is only relevant when a client is
+   * starting a new DoPut or DoExchange stream.
+   */
+  FlightDescriptor flight_descriptor = 1;
+```
+
+**`FlightSql.proto`, a new `SqlInfo` value.** It takes the next free number in the server
+information range:
+
+```protobuf
+  /*
+   * Retrieves a boolean value indicating whether the Flight SQL Server accepts
+   * Flight SQL requests over DoExchange.
+   *
+   * Returns:
+   * - false: if Flight SQL requests over DoExchange are unsupported;
+   * - true: if Flight SQL requests over DoExchange are supported.
+   */
+  FLIGHT_SQL_SERVER_DO_EXCHANGE = 12;
+```
+
+**`FlightSql.proto`, comments.** Each command's comment gains a DoExchange entry. For example:
+
+```protobuf
+/*
+ * Represents a SQL query. Used in the command member of FlightDescriptor
+ * for the following RPC calls:
+ *  - GetSchema: return the Arrow schema of the query.
+ *    ...
+ *  - GetFlightInfo: execute the query.
+ *  - DoExchange: execute the query and return the results on the same call.
+ *    The client may first stream parameter values, one row per parameter set.
+ */
+message CommandStatementQuery {
+```
+
+The comments of `DoPutUpdateResult` and `DoPutPreparedStatementResult` would say that, over
+DoExchange, they are returned `Any`-packed in the `app_metadata` of a metadata-only message.
+
+**`FlightSql.rst`, a new section.** It would sit after the command list:
+
+> **Flight SQL over DoExchange.** Any command or action request above can also be executed with a
+> single DoExchange call. The request is packed into a `google.protobuf.Any`, serialized, and set
+> as the `cmd` of a CMD-type FlightDescriptor sent with the first message. The client then streams
+> its input, if any, as one Arrow stream, and half-closes. The server replies on the same call:
+> first the Flight SQL results, each `Any`-packed in the `app_metadata` of a metadata-only
+> message, then the result set, if any. The status of the call is the result of the request.
+> Servers advertise support with `FLIGHT_SQL_SERVER_DO_EXCHANGE`.
+
+The section would then state rules R1 to R16. Each command in the list would also gain a
+"When used with DoExchange" line, in the same style as the existing entries:
+
+- `CommandStatementQuery`: execute the query and return the results on the same call. The client
+  may stream parameter values; the server then prepares, binds, executes and closes a prepared
+  statement within the call.
+- `CommandStatementUpdate`: execute the query and return the number of affected rows in one or
+  more `DoPutUpdateResult` messages. If the client streams parameter sets, the statement is
+  executed once per row.
+- `CommandStatementIngest`: load the stream of record batches into the target table and return a
+  `DoPutUpdateResult`.
+- `CommandPreparedStatementQuery`: bind the parameter values the client streams, if any, and
+  execute the prepared statement, returning the results on the same call. If parameters were sent,
+  the server first returns exactly one `DoPutPreparedStatementResult`, which may carry an updated
+  handle.
+- `CommandPreparedStatementUpdate`: execute the prepared statement once per parameter row, or once
+  for a batch without rows, and return the number of affected rows.
+- Metadata commands and `CommandStatementSubstraitPlan`: return the results on the same call.
+- Action requests: run the action; each result is returned in a metadata-only message.
+
+## Trade-offs
+
+What a request-scoped exchange gains:
+
+- **One round trip per request**, whatever the request. There are also fewer calls to
+  authenticate, intercept and log.
+- **Affinity for free.** A statement's whole lifecycle stays on the server that received the call,
+  so statements with parameters work behind any load balancer. The server needs no shared state
+  and no parameters encoded in handles.
+- **Automatic cleanup.** One-shot statements are released when the call ends, including when the
+  client disappears.
+- **Portability.** It fits the Flight implementations as they are: one schema per direction,
+  standard `FlightData` messages and standard status codes.
+
+What it gives up, and how to get it back:
+
+- **Parallel and distributed fetch.** An inline result streams through the server that received
+  the call. Engines that fan out answer with a `FlightInfo` instead (R15), or clients use classic
+  `GetFlightInfo` for those queries.
+- **Two-phase execution.** With `GetFlightInfo`, a client can look at the schema and the estimated
+  size before fetching. It can also poll a long-running query (`PollFlightInfo`) and retry a
+  failed `DoGet` on an endpoint that has not expired. An exchange re-executes on retry. The
+  `FlightInfo` answer of R15 and the classic RPCs remain available for these cases.
+- **Waiting for the half-close.** A server cannot run a request that may carry parameters until
+  the client half-closes (R4). A client that forgets to half-close stalls until its deadline.
+
+## Why one request per exchange, not one session
+
+A single long-lived exchange for a whole session, with requests flowing back and forth like a
+PostgreSQL connection, would let a client pipeline dependent statements (`BEGIN`, `INSERT`,
+`UPDATE`, `COMMIT` in one round trip). It does not work on top of today's Flight.
+
+**Schemas.** Consecutive statements have different parameter and result schemas. An Arrow IPC
+stream has exactly one schema, and Flight does not define a way to reset it within a call. The
+implementations behave as follows:
+
+| Implementation | Second schema on one stream |
+| --- | --- |
+| Java `FlightStream` (reader) | Corrupts the stream, including the result set still being read |
+| C++ / pyarrow 25.0.1 writer | Rejected: `This writer has already been started`; a batch with another schema fails with `Tried to write record batch with different schema` |
+| C++ / pyarrow 25.0.1 reader | Error: `Header-type of flatbuffer-encoded Message is not RecordBatch` |
+| Rust `arrow-flight`, `FlightDataDecoder` (low-level) | Supported: "The schema is (re-)set. Dictionaries are cleared" |
+| Rust `arrow-flight`, `FlightRecordBatchStream` | Error: `Unexpectedly saw multiple Schema messages in FlightData stream` |
+| Go | Not tested |
+
+A session-scoped exchange runs into other problems too:
+
+- **Errors.** The status ends the call, so one failed statement would end the whole session.
+  Errors would have to become in-band messages, with rules for the statements already pipelined
+  behind the failed one.
+- **Framing.** Each statement would need explicit end-of-input and end-of-result markers, because
+  a call can be half-closed only once.
+- **Operations.** A long-lived call works badly with L7 proxies, which apply idle timeouts and a
+  maximum connection age (the `GOAWAY` would end the session). Deadlines and authentication headers
+  would apply to the whole session, so an expired token could not be refreshed. Metrics and traces
+  would see a single RPC. A large result would block every statement queued behind it.
+- **No latency gain.** A new call on an open HTTP/2 connection costs no round trip of its own, so a
+  request-scoped exchange already reaches one round trip per request.
+
+Tunnelling each result as an IPC stream inside `app_metadata` would fit today's implementations,
+but it copies every buffer and bypasses Flight's zero-copy path.
+
+## Alternatives considered
+
+- **Pipelining the classic calls.** The client cannot send call 2 before call 1 answers, because it
+  needs the server-issued handle or ticket. Letting clients choose handles would allow it, but
+  servers would have to accept identifiers they did not issue, and the statement would still take
+  several RPCs.
+- **`DoPut` for everything.** `DoPut` replies with `PutResult` messages, which carry metadata but
+  no Arrow data, so queries would still need `GetFlightInfo` and `DoGet`.
+- **`DoGet` with a client-built ticket.** This would give a one-call SELECT without parameters.
+  However, tickets are opaque and issued by the server, and `DoGet` has no client stream for
+  parameters or ingest.
+- **A new Flight RPC.** It would change Flight and every implementation, when `DoExchange` already
+  has the right shape.
+- **One exchange per session.** Rejected above.
+
+## Open questions
+
+1. Should parameters on ad hoc statements (R11) get their own `SqlInfo` value, so that a server
+   can support the transport without them?
+2. Should result messages be allowed after the result stream, for example for warnings or
+   statistics? R5 forbids it, so that clients know when the results end.
+3. There is no DoExchange form for a schema-only request (classic `GetSchema`), or for executing
+   `CommandStatementSubstraitPlan` as an update. Classic Flight SQL expresses both through the
+   choice of RPC. Should they get fields or commands, or stay on the classic RPCs?
+4. Is the `FlightInfo` answer of R15 enough for long-running queries, or is a progress message
+   needed to replace `PollFlightInfo`?
+5. Dictionary-encoded results that span endpoints need dictionary replacement within one stream.
+   Should R15 require the `FlightInfo` answer in that case?
+
+## Next steps
+
+1. Discuss the proposal on [apache/arrow#37741](https://github.com/apache/arrow/issues/37741) and
+   on the Arrow dev mailing list, where Flight SQL changes are proposed and voted on.
+2. Settle the open questions, then turn
+   [Proposed changes](#proposed-changes-to-the-specification) into a pull request against
+   `format/FlightSql.proto` and `docs/source/format/FlightSql.rst` in apache/arrow.
+3. Reference implementations:
+   - **Servers.** For Java, the adapter in this branch serves the prototyped rules from a
+     producer's existing handlers. C++ `FlightSqlServerBase` can use the same mapping.
+   - **Clients.** Java `FlightSqlClient`; the JDBC driver, where
+     `PreparedStatement.executeQuery` with parameters costs 5 round trips today; and the ADBC
+     Flight SQL driver.
+
+## Appendix A: feasibility evidence
+
+**Prototype.** Two classes on this branch implement the rules in Java:
+
+- [`FlightSqlExchangeProducer`](src/main/java/org/apache/arrow/flight/sql/FlightSqlExchangeProducer.java)
+  wraps any Flight SQL producer. It turns each exchange into in-process calls to the producer's
+  existing `getFlightInfo`, `getStream`, `acceptPut` and `doAction` handlers, so servers need no
+  new handler code.
+- [`FlightSqlExchangeClient`](src/main/java/org/apache/arrow/flight/sql/FlightSqlExchangeClient.java)
+  is the matching client.
+
+`TestFlightSqlExchange` runs every scenario against the Derby-backed `FlightSqlExample`. It
+compares results and RPC counts with the classic client, and checks the following:
+
+- error codes, which match classic Flight SQL;
+- cleanup of the one-shot statement after a failure;
+- stateless handles;
+- zero and several endpoints;
+- cancellation.
+
+`TestFlightSqlThroughExchangeProducer` runs the whole classic `TestFlightSql` suite against the
+wrapped server, so classic clients keep working.
+
+**Independent client.** A pyarrow 25.0.1 (C++ Flight) client exercised every scenario against the
+Java server. It uses only `pyarrow.flight` and protobuf classes generated from the official
+`FlightSql.proto`, with no Java-specific code. Its core:
+
+```python
+request = any_pb2.Any()
+request.Pack(FlightSql_pb2.CommandStatementQuery(query="SELECT * FROM intTable WHERE id = ?"))
+writer, reader = client.do_exchange(flight.FlightDescriptor.for_command(request.SerializeToString()))
+writer.begin(parameters.schema)
+writer.write_batch(parameters)
+writer.done_writing()  # half-close: the server now has the whole request
+# then read_chunk() until StopIteration: data chunks are the result stream,
+# metadata-only chunks are Any-packed Flight SQL results
+```
+
+**Latency.** The benchmark `TestFlightSqlExchangeLatency` routes the Java client through a TCP
+proxy that delays each direction by half the RTT. The table shows the median of 15 runs (21 at
+RTT 0) on loopback, with the Derby example server.
 
 | Scenario | Classic RPCs | Classic, RTT 0 | Exchange, RTT 0 | Classic, RTT 20 ms | Exchange, RTT 20 ms | Classic, RTT 50 ms | Exchange, RTT 50 ms |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -416,233 +754,94 @@ server.
 | UPDATE, statement | 1 | 2.1 ms | 1.9 ms | 23.4 ms | 23.4 ms | 53.3 ms | 53.9 ms |
 | GetTables | 2 | 5.6 ms | 2.5 ms | 46.8 ms | 24.6 ms | 109.2 ms | 55.2 ms |
 
-Classic latency is roughly the RPC count times the RTT; exchange latency is about one RTT in
-every scenario. A single `DoPut` UPDATE was already one call and does not change. Even on
-loopback, where network latency is negligible, the exchange path is not slower: skipping the
-extra calls outweighs the adapter's work.
+Classic latency is roughly the number of calls times the RTT. Exchange latency is about one RTT in
+every scenario.
 
-To reproduce:
+**Status of each rule in the prototype:**
+
+| Rule | In the prototype | Checked by |
+| --- | --- | --- |
+| R1 request, repeated descriptors | yes | every capture |
+| R2 to R4 input, half-close, presence of parameters | yes | captures B, D, E, E2, F, F2, K |
+| R5 to R7 order, result messages, schema always sent | yes | every capture; unit test for zero endpoints |
+| R8 update counts | yes | captures C, D, F, F2, G, K |
+| R9 status and error codes | yes | captures H, I; unit test against classic codes |
+| R10 cancellation | yes | capture H2; unit test |
+| R11 parameters on ad hoc statements | yes | captures B, D, H; unit test for cleanup after a failure (cleanup after a cancel is not tested) |
+| R12 binding prepared queries | yes | captures E, E2, E3 (stateless server, new handle) |
+| R13 prepared updates | yes | captures F, F2 |
+| R14 transactions and actions | yes | captures G (stub producer), N |
+| R15 several endpoints | inline only; the `FlightInfo` answer is not implemented | capture J |
+| R16 discovery | fallback on `UNIMPLEMENTED` only; no `SqlInfo` value yet | capture I |
+
+## Appendix B: validation of the message flows
+
+**Rendering.** Every mermaid block in this document renders without errors with mermaid 11.17.2.
+
+**Conformance.** The pyarrow client ran each scenario against the Java prototype through a
+byte-recording TCP proxy, one connection per scenario. The captures were decoded layer by layer,
+from HTTP/2 frames and HPACK headers down to gRPC messages, `FlightData`, and the Arrow IPC and
+Flight SQL messages inside them. Each call was then compared with the flow in its diagram. Two
+timing checks ran on every capture:
+
+- for requests that accept input, the server's first reply came after the client's half-close
+  (R4);
+- the calls of a scenario ran one after another.
+
+Transactions ran against a stub producer, since the example server does not implement them.
+Cancellation and several endpoints ran against a test producer that serves several endpoints or
+blocks until cancelled. The cancel capture therefore used a statement without parameters, so it
+checks the messages on the wire but not the cleanup of a one-shot statement. All 18 scenarios
+match their flows.
+
+| Diagram | Capture | Observed flow (client → server), per call | Result |
+| --- | --- | --- | --- |
+| Classic Flight SQL and DoExchange compared: classic calls | `M_classic_select_params` | DoAction: `Action(CreatePreparedStatement)`, half-close → `Result` `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoPut: descriptor `Any(CommandPreparedStatementQuery)`, Schema, RecordBatch, half-close → status OK<br>GetFlightInfo: `FlightDescriptor` `Any(CommandPreparedStatementQuery)`, half-close → `FlightInfo`, status OK<br>DoGet: `Ticket`, half-close → Schema, RecordBatch ×2, status OK<br>DoAction: `Action(ClosePreparedStatement)`, half-close → status OK | matches |
+| SELECT with parameters (also the DoExchange half of the comparison) | `B_select_params` | DoExchange: descriptor `Any(CommandStatementQuery)`, Schema, RecordBatch, half-close → Schema, RecordBatch ×2, status OK | matches |
+| SELECT | `A_select` | DoExchange: descriptor `Any(CommandStatementQuery)`, half-close → Schema, RecordBatch ×2, status OK | matches |
+| SELECT, with a catalog command | `L_metadata` | DoExchange: descriptor `Any(CommandGetTables)`, half-close → Schema, RecordBatch, status OK | matches |
+| INSERT, UPDATE or DELETE | `C_update` | DoExchange: descriptor `Any(CommandStatementUpdate)`, half-close → `Any(DoPutUpdateResult)`, status OK | matches |
+| INSERT, UPDATE or DELETE with parameter sets | `D_update_params` | DoExchange: descriptor `Any(CommandStatementUpdate)`, Schema, RecordBatch, half-close → `Any(DoPutUpdateResult)`, status OK | matches |
+| Prepared SELECT, with parameters | `E_prepared_select` | DoExchange: descriptor `Any(ActionCreatePreparedStatementRequest)`, half-close → `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoExchange: descriptor `Any(CommandPreparedStatementQuery)`, Schema, RecordBatch, half-close → `Any(DoPutPreparedStatementResult)`, Schema, RecordBatch ×2, status OK<br>DoExchange: descriptor `Any(CommandPreparedStatementQuery)`, Schema, RecordBatch, half-close → `Any(DoPutPreparedStatementResult)`, Schema, RecordBatch ×2, status OK<br>DoExchange: descriptor `Any(ActionClosePreparedStatementRequest)`, half-close → status OK | matches |
+| Prepared SELECT, without parameters | `E2_prepared_select_no_params` | DoExchange: descriptor `Any(ActionCreatePreparedStatementRequest)`, half-close → `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoExchange: descriptor `Any(CommandPreparedStatementQuery)`, half-close → Schema, RecordBatch ×2, status OK<br>DoExchange: descriptor `Any(ActionClosePreparedStatementRequest)`, half-close → status OK | matches |
+| Prepared SELECT, stateless server | `E3_stateless_new_handle` | DoExchange: descriptor `Any(ActionCreatePreparedStatementRequest)`, half-close → `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoExchange: descriptor `Any(CommandPreparedStatementQuery)`, Schema, RecordBatch, half-close → `Any(DoPutPreparedStatementResult)`, Schema, RecordBatch ×2, status OK<br>DoExchange: descriptor `Any(ActionClosePreparedStatementRequest)`, half-close → status OK | matches |
+| Prepared INSERT, UPDATE or DELETE, with parameters | `F_prepared_update` | DoExchange: descriptor `Any(ActionCreatePreparedStatementRequest)`, half-close → `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoExchange: descriptor `Any(CommandPreparedStatementUpdate)`, Schema, RecordBatch, half-close → `Any(DoPutUpdateResult)`, status OK<br>DoExchange: descriptor `Any(ActionClosePreparedStatementRequest)`, half-close → status OK | matches |
+| Prepared INSERT, UPDATE or DELETE, without parameters | `F2_prepared_update_no_params` | DoExchange: descriptor `Any(ActionCreatePreparedStatementRequest)`, half-close → `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoExchange: descriptor `Any(CommandPreparedStatementUpdate)`, Schema, RecordBatch, half-close → `Any(DoPutUpdateResult)`, status OK<br>DoExchange: descriptor `Any(ActionClosePreparedStatementRequest)`, half-close → status OK | matches |
+| Transactions | `G_transactions` | DoExchange: descriptor `Any(ActionBeginTransactionRequest)`, half-close → `Any(ActionBeginTransactionResult)`, status OK<br>DoExchange: descriptor `Any(CommandStatementUpdate)`, half-close → `Any(DoPutUpdateResult)`, status OK<br>DoExchange: descriptor `Any(CommandStatementUpdate)`, half-close → `Any(DoPutUpdateResult)`, status OK<br>DoExchange: descriptor `Any(ActionEndTransactionRequest)`, half-close → status OK | matches |
+| Errors and cancellation: failure | `H_failure` | DoExchange: descriptor `Any(CommandStatementQuery)`, Schema, RecordBatch, half-close → status INTERNAL | matches |
+| Errors and cancellation: cancel | `H2_cancel` | DoExchange: descriptor `Any(CommandStatementQuery)`, half-close, RST_STREAM CANCEL → Schema, RecordBatch | matches |
+| Results with several endpoints: inline | `J_endpoints` | DoExchange: descriptor `Any(CommandStatementQuery)`, half-close → Schema, RecordBatch ×3, status OK | matches |
+| Discovery and fallback | `I_unsupported_then_classic` | DoExchange: descriptor `Any(CommandStatementQuery)`, half-close → status UNIMPLEMENTED<br>GetFlightInfo: `FlightDescriptor` `Any(CommandStatementQuery)`, half-close → `FlightInfo`, status OK<br>DoGet: `Ticket`, half-close → Schema, RecordBatch ×2, status OK | matches |
+| Requests table: `CommandStatementIngest` | `K_ingest` | DoExchange: descriptor `Any(CommandStatementIngest)`, Schema, RecordBatch, half-close → `Any(DoPutUpdateResult)`, status OK | matches |
+| Requests table: Flight `Action` | `N_generic_action` | DoExchange: descriptor `Any(Action)`, half-close → `Any(ActionCreatePreparedStatementResult)`, status OK<br>DoExchange: descriptor `Any(Action)`, half-close → status OK | matches |
+
+The captures also settled details that the rules now state:
+
+- **Repeated descriptors (R1).** Both the C++ and the Java client send the descriptor alone as the
+  first message, then repeat it on the schema message.
+- **The half-close is free (R3).** When the client has no input, it follows the descriptor within
+  about 0.1 ms, in the same burst.
+- **Errors are status-only replies (R9).** The failed bind in `H_failure` came back as headers and
+  `grpc-status 13` (INTERNAL), with no data.
+- **Cancellation is `RST_STREAM(CANCEL)` (R10).** After it, the server sends no status.
+- **The fallback probe is cheap (R16).** An unsupported server answers `UNIMPLEMENTED` with a
+  status-only reply, within one round trip.
+- **Binding differs from classic `DoPut` (R12).** The example server's classic `DoPut` bind
+  returned no `DoPutPreparedStatementResult`, which classic Flight SQL allows. Over the exchange,
+  exactly one always arrived, and a stateless server used it to return a new 727-byte handle.
+- **Empty batches are allowed.** The example server ends each result stream with a zero-row batch.
+
+A decoded capture, `B_select_params`, with times relative to the first frame:
 
 ```
-mvn -pl flight/flight-sql test -Dtest=TestFlightSqlExchangeLatency \
-    -Darrow.flight.sql.exchange.benchmark=true -DrttMs=50 -Druns=15
+   0.0 ms  C → S  HEADERS      POST /arrow.flight.protocol.FlightService/DoExchange
+   0.0 ms  C → S  FlightData   descriptor = Any(CommandStatementQuery{query: 'SELECT * FROM intTable WHERE id = ?'})
+   0.3 ms  C → S  FlightData   descriptor (repeated), Schema(id: int32)
+   0.6 ms  C → S  FlightData   RecordBatch(1 row: id = 2)
+   0.6 ms  C → S  END_STREAM   half-close
+  27.2 ms  S → C  HEADERS      :status 200
+  27.2 ms  S → C  FlightData   Schema(ID: int32, KEYNAME: string, VALUE: int32, FOREIGNID: int32)
+  28.2 ms  S → C  FlightData   RecordBatch(1 row: ID = 2, KEYNAME = 'zero', VALUE = 0, FOREIGNID = 1)
+  28.6 ms  S → C  FlightData   RecordBatch(0 rows)
+  31.6 ms  S → C  trailers     grpc-status 0 (OK)
 ```
-
-**Interoperability.** A pyarrow 25.0.1 (C++) client ran the same scenarios against the Java
-server, using only `pyarrow.flight` and protobuf classes generated from `FlightSql.proto`: SELECT,
-SELECT with a parameter, INSERT, UPDATE and DELETE with parameter sets, `CommandGetTables`, and a
-reusable prepared statement executed twice. The server received 12 `DoExchange` calls and nothing
-else. The core of such a client:
-
-```python
-request = any_pb2.Any()
-request.Pack(FlightSql_pb2.CommandStatementQuery(query="SELECT * FROM intTable WHERE id = ?"))
-writer, reader = client.do_exchange(flight.FlightDescriptor.for_command(request.SerializeToString()))
-writer.begin(parameters.schema)
-writer.write_batch(parameters)
-writer.done_writing()  # half-close: the server now has the whole statement
-# then read_chunk() until StopIteration: data chunks are the result set,
-# metadata-only chunks are Any-packed Flight SQL results
-```
-
-## The prototype
-
-### Server: `FlightSqlExchangeProducer`
-
-```java
-FlightServer server =
-    FlightServer.builder(allocator, location, new FlightSqlExchangeProducer(producer, allocator))
-        .build()
-        .start();
-```
-
-The class is a `FlightProducer` decorator. It forwards every RPC to the wrapped producer and
-implements `doExchange` for Flight SQL requests; any other exchange also goes to the wrapped
-producer. Each exchange becomes in-process calls to the producer's existing handlers. Three
-pieces make that possible:
-
-- **Inbound view.** Handlers written for `DoPut` read the client's data from a `FlightStream`
-  until it ends, and dispatch on `flightStream.getDescriptor()`. A small `FlightStream` subclass
-  wraps the exchange's inbound stream. It reports the descriptor of the in-process call (for
-  example `CommandPreparedStatementUpdate{handle}` in a one-shot update) and replays the first
-  message, which the adapter reads ahead to find out whether parameters were sent. It never closes
-  the underlying stream.
-- **Result-set forwarder.** A handler written for `DoGet` calls `start(root)` and then
-  `putNext()`. Some handlers call `start()` more than once: `FlightSqlStatelessExample` does it
-  once per parameter row. A `FlightInfo` can also have several endpoints. The exchange can only
-  carry one schema, so the forwarder binds its own root to the exchange writer and loads each
-  incoming batch into it with `VectorLoader`. That shares the buffers without copying. The
-  forwarder allocates in the root of the handler's allocator tree, which outlives any per-stream
-  child allocator, and copies values only when a batch comes from a different tree. The schema is
-  sent even when no endpoint produces data.
-- **One-shot statements.** A `CommandStatementQuery` or `CommandStatementUpdate` with parameters
-  is composed from the producer's own prepared-statement handlers: `CreatePreparedStatement`,
-  bind (or execute the update), stream the results, then `ClosePreparedStatement`. The close runs
-  on success, on failure and on cancellation.
-
-### Client: `FlightSqlExchangeClient`
-
-```java
-try (FlightSqlExchangeClient client =
-    new FlightSqlExchangeClient(FlightClient.builder(allocator, location).build())) {
-  // SELECT: one call; the results arrive on it.
-  try (FlightStream results = client.execute("SELECT * FROM intTable")) {
-    while (results.next()) { /* results.getRoot() */ }
-  }
-  // Parameters without an explicit prepared statement: still one call.
-  try (FlightStream results = client.execute("SELECT * FROM intTable WHERE id = ?", ids)) { ... }
-  long inserted = client.executeUpdate("INSERT INTO intTable (keyName, value) VALUES (?, ?)", rows);
-  long deleted = client.executeUpdate("DELETE FROM intTable WHERE keyName = ?", keys);
-  // Reusable prepared statement: one call to prepare, one per execution, one to close.
-  try (FlightSqlExchangeClient.PreparedStatement statement =
-      client.prepare("SELECT * FROM intTable WHERE id = ?")) {
-    try (FlightStream results = statement.execute(ids)) { ... }
-  }
-  // Catalog metadata, ingest, transactions, arbitrary actions.
-  try (FlightStream tables = client.executeCommand(CommandGetTables.getDefaultInstance())) { ... }
-}
-```
-
-### Tests
-
-- `TestFlightSqlExchange` runs every scenario against the Derby example, comparing results and
-  RPC counts with the classic client. It also covers:
-  - error codes, which match classic Flight SQL;
-  - cleanup of the one-shot prepared statement after a failed execution;
-  - transaction and generic actions;
-  - pass-through of non-Flight-SQL exchanges;
-  - a stateless server that returns updated handles;
-  - multiple and zero endpoints, and cancellation;
-  - leak checks on the producer's allocators.
-- `TestFlightSqlThroughExchangeProducer` runs the whole classic `TestFlightSql` suite against the
-  decorated server.
-- `TestFlightSqlExchangeLatency` is the opt-in benchmark above.
-
-### Found along the way
-
-- **Java `FlightStream` cannot survive a schema change.** It applies schema messages as soon as
-  they arrive on the gRPC thread, ahead of the batches still queued for the reader. A second
-  schema therefore breaks even the first result set: when a server sent an `int` batch followed by
-  a `utf8` schema, the client failed on the *first* `next()` with `no more buffers for field b:
-  Utf8`.
-- **`FlightSqlStatelessExample` sends several schemas on one `DoGet`.** Its
-  `getStreamPreparedStatement` calls `listener.start()` once per parameter row, so a classic
-  `DoGet` with more than one parameter row carries several schema messages. The exchange
-  forwarder merges them into one result set.
-- **`FlightStreamUtils.getResults` (test utility) assumes a single batch.** For streams with more
-  than one batch, it appends the rows of later batches to the first rows.
-- **`FlightSqlExample` leaks memory, and existing tests hide it.** Its `DoGet` handlers never close
-  the `ArrowRecordBatch` they unload, so its allocator reports a leak on close. The existing tests
-  never close the producer, which hides this. The example also uses the SQL text as the
-  prepared-statement handle, so preparing the same SQL twice makes both statements share, and
-  invalidate, one handle.
-
-### Limitations of the prototype
-
-- **No update intent for Substrait.** `CommandStatementSubstraitPlan` runs as a query, and
-  "schema only, do not execute" (`GetSchema`) cannot be expressed. Classic Flight SQL encodes
-  both intents in the choice of RPC; a specification would need an explicit field, or dedicated
-  commands.
-- **No fan-out.** All endpoints are served inline by the server that received the call (see
-  below).
-- **One bind per exchange.** Each execution of a reusable prepared statement is its own exchange.
-- **Dictionary encoding.** Dictionary-encoded result sets made of several streams are rejected.
-- **No discovery.** Clients learn that a server does not support this from `UNIMPLEMENTED`.
-- **Blocking waits.** Like classic `DoPut` handlers, the adapter blocks a server executor thread
-  while it waits for asynchronous handlers.
-
-## Trade-offs
-
-What a statement-scoped exchange gains:
-
-- **One round trip per statement**, whatever the statement, and fewer calls to authenticate,
-  intercept and log.
-- **Affinity for free.** A statement's whole lifecycle stays on the server that received the call,
-  so prepared statements with parameters work behind any load balancer. The server needs no shared
-  state and no parameters encoded in handles.
-- **Pipelining.** The client sends the parameters with the request, without waiting for
-  `CreatePreparedStatement` to answer.
-- **Automatic cleanup.** Implicit resources are released when the call ends, including when the
-  client disappears.
-- **Portability.** It fits the existing Flight implementations as they are: one schema per
-  direction, standard `FlightData` messages, standard status codes.
-
-What it gives up, and how to get it back when needed:
-
-- **Parallel and distributed fetch.** `FlightInfo` can point the client at several endpoints and
-  locations, to fetch in parallel or from other nodes. Over an exchange, the results stream from
-  the server that received the call. Engines that rely on fan-out could answer an exchange with
-  the `FlightInfo` itself, as a metadata message the client then fetches with `DoGet` (not
-  implemented here). Alternatively, the client can use classic `GetFlightInfo` for those queries.
-- **Two-phase execution.** With `GetFlightInfo`, a client can inspect the schema and the estimated
-  size before fetching, poll long-running queries (`PollFlightInfo`), and retry a failed `DoGet`
-  on an endpoint that has not expired. An exchange re-executes on retry, and it would need a
-  progress message to replace polling.
-- **Blocking on the half-close.** Servers must wait for the half-close before starting commands
-  that may carry parameters. Clients that forget to half-close stall until their deadline.
-
-## One exchange per session?
-
-The natural next step is a single long-lived exchange for a whole session, with commands flowing
-back and forth, much like a PostgreSQL connection. It would allow pipelining dependent statements
-(`BEGIN; INSERT; UPDATE; COMMIT` in one round trip) and would pin the whole session to one server.
-It does not work on top of today's Flight implementations.
-
-**Schemas.** Consecutive statements have different result and parameter schemas, but an Arrow IPC
-stream has exactly one schema, and the Flight specification says nothing about resetting it
-within a call. What the implementations do today:
-
-| Implementation | Second schema on one stream |
-| --- | --- |
-| Java `FlightStream` (reader) | Corrupts the stream, including the result set that was still being read (see above) |
-| C++ / pyarrow 25.0.1 writer | Rejected: `This writer has already been started`; a batch with another schema fails with `Tried to write record batch with different schema` |
-| C++ / pyarrow 25.0.1 reader | Error: `Header-type of flatbuffer-encoded Message is not RecordBatch` |
-| Rust `arrow-flight`, `FlightDataDecoder` (low-level) | Supported: "The schema is (re-)set. Dictionaries are cleared" |
-| Rust `arrow-flight`, `FlightRecordBatchStream` | Error: `Unexpectedly saw multiple Schema messages in FlightData stream` |
-| Go | Not tested |
-
-**Other blockers:**
-
-- **Errors.** The gRPC status ends the call, so in a session a failed statement would end the
-  whole session. Errors would have to become in-band messages, with a rule for the statements that
-  were already pipelined behind the failed one. PostgreSQL's pipeline mode skips everything until
-  the next sync point.
-- **Framing.** Each statement's input and output needs explicit "end of parameters" and "end of
-  result" markers, because a call can only be half-closed once. That rules out reusing `DoPut`
-  handlers that read until the end of the stream, unless they get delimited views like the one in
-  this prototype.
-- **Operations.** A long-lived call interacts badly with L7 proxies: idle timeouts, and maximum
-  connection age, whose `GOAWAY` ends the session. Deadlines and authentication headers apply to
-  the whole call rather than to each statement, so an expired token cannot be refreshed. Metrics
-  and traces see a single RPC. A large result set blocks every statement queued behind it, unless
-  results are multiplexed with request ids. And the server holds a thread for the whole session.
-- **Workaround.** Tunnelling each result set as an IPC stream inside `app_metadata` works
-  everywhere, but it copies every buffer and bypasses Flight's zero-copy body path. It is only
-  acceptable for small results.
-
-Most of the latency win comes from the statement-scoped exchange. A session-scoped exchange adds
-pipelining of *dependent* statements and affinity, but it needs a change to the Flight
-specification: schema resets, or an explicit end-of-IPC-stream marker in `DoExchange`. It also
-needs matching reader changes in each implementation, plus in-band errors. One intermediate
-option would fit today's implementations: DML and transaction commands only return metadata. A
-"batch" request carrying several such commands, without parameters or with parameters that share
-one schema, could therefore run a whole write transaction in one exchange within the one-schema
-rule. That would need one new message.
-
-## Possible next steps
-
-1. **Specification.** Propose "Flight SQL over DoExchange" as an optional part of Flight SQL,
-   starting from the request table and rules above. It would need:
-   - a `SqlInfo` value so that clients can discover support;
-   - explicit intents for a Substrait update and for schema-only requests.
-
-   The discussion could continue on [apache/arrow#37741](https://github.com/apache/arrow/issues/37741)
-   and the dev@ list, with the numbers above.
-2. **Java.** Make the adapter the default `doExchange` of `FlightSqlProducer`, so that every Java
-   Flight SQL server supports it. Add exchange-based methods, with fallback, to `FlightSqlClient`.
-   Let the JDBC driver use them for `PreparedStatement.executeQuery` with parameters, which today
-   costs 5 round trips.
-3. **Other implementations.** C++, Go and Rust servers can use the same mapping onto their
-   existing handlers: it only needs one schema per direction.
-4. **Fan-out.** Prototype the "answer with a `FlightInfo`" mode for engines that return several
-   endpoints.
