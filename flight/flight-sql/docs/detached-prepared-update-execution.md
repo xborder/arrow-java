@@ -142,7 +142,7 @@ Cons:
   identical on the wire to a legacy parameterless update. Harmless, because
   both mean "execute with no parameters".
 
-### Option B. Execute updates through `GetFlightInfo` (recommended)
+### Option B. Execute updates through `GetFlightInfo`, discovered via `SqlInfo`
 
 Make `CommandPreparedStatementUpdate` a valid `GetFlightInfo`,
 `PollFlightInfo` and `GetSchema` command, mirroring
@@ -326,10 +326,137 @@ the statement runs, or completing the `DoPut` early and executing in the
 background, break C1: existing clients read exactly one `PutResult` and treat
 it as final, so they would report `-1` or a phantom success. Not viable.
 
+### Option F. Extend the `DoPut` ack to say "not executed, call `GetFlightInfo`"
+
+This mirrors how `DoPutPreparedStatementResult` already works for queries:
+the `DoPut` reply carries a (possibly rotated) handle and tells the client
+what to do next. Here the update `DoPut` keeps its own command, but gains a
+bind-only mode, and `DoPutUpdateResult` gains fields that say "execution is
+deferred, trigger it with `GetFlightInfo`".
+
+Two protobuf additions are needed, and **both** are required:
+
+```proto
+message CommandPreparedStatementUpdate {
+  bytes prepared_statement_handle = 1;
+  // Client opt-in. If true, the server MAY only bind the parameters carried by
+  // this DoPut and defer execution to a later GetFlightInfo/PollFlightInfo with
+  // this command. The server MAY ignore the flag and execute immediately; the
+  // reply tells the client which happened.
+  optional bool defer_execution = 2;
+}
+
+message DoPutUpdateResult {
+  int64 record_count = 1;
+  // Set only when execution was deferred. record_count MUST be -1 in that case.
+  // The client MUST call GetFlightInfo or PollFlightInfo with
+  // CommandPreparedStatementUpdate to execute.
+  optional bool execution_deferred = 2;
+  // Optional rotated handle, with the same semantics as
+  // DoPutPreparedStatementResult.prepared_statement_handle. If set, all later
+  // requests for this prepared statement must use it.
+  optional bytes prepared_statement_handle = 3;
+}
+```
+
+The execution phase is identical to Option B: `GetFlightInfo` (or
+`PollFlightInfo`) with `CommandPreparedStatementUpdate` returns a
+`FlightInfo` whose `app_metadata` carries the row count inline, or whose
+endpoints stream it.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant C as FlightSqlClient.PreparedStatement
+    participant S as Server
+
+    App->>C: setParameters(root)
+    App->>C: executeUpdate()
+    C->>S: DoPut(cmd=CommandPreparedStatementUpdate{handle, defer_execution=true}, parameter batch)
+
+    alt new server, chooses to defer
+        S->>S: bind only, keep state or fold parameters into handle'
+        S-->>C: PutResult(DoPutUpdateResult{record_count=-1, execution_deferred=true, prepared_statement_handle=handle'?})
+        C->>C: if handle' present then handle = handle'
+        C->>S: GetFlightInfo(cmd=CommandPreparedStatementUpdate{handle})  (or PollFlightInfo)
+        S->>S: execute
+        S-->>C: FlightInfo{app_metadata=DoPutUpdateResult{record_count}} or endpoints
+        C->>C: record_count from app_metadata, else DoGet each endpoint and sum
+    else old server (flag ignored) or new server that declines to defer
+        S->>S: bind and execute (legacy path)
+        S-->>C: PutResult(DoPutUpdateResult{record_count})
+        Note over C: execution_deferred absent, so the count is final
+    end
+    C-->>App: record_count
+```
+
+Why the request flag cannot be dropped: without it a new server would have
+to guess whether the caller understands deferral. An old client that
+received `DoPutUpdateResult{record_count=-1, execution_deferred=true}` would
+ignore the unknown field, report "unknown row count", and never issue the
+`GetFlightInfo`. The update would silently never run. With the flag, a
+server only defers for callers that asked for it (C1, C3).
+
+Why the response fields are enough for discovery: an old server ignores
+`defer_execution`, executes as before, and returns a plain
+`DoPutUpdateResult` with no `execution_deferred`. The new client reads the
+absence of the marker as "already executed" and returns the count. That is
+exactly the "legacy server sent no `DoPutPreparedStatementResult`" logic the
+query path already has, so no `SqlInfo` probe and no error-driven fallback
+are needed.
+
+Compatibility matrix:
+
+| | Old client | New client (sets `defer_execution`) |
+| --- | --- | --- |
+| **Old server** | unchanged | flag ignored, server executes, reply has no marker, client returns the count. Zero extra round trips. |
+| **New server** | flag absent, server executes, reply has no marker: unchanged | server defers, reply carries marker and maybe a rotated handle, client executes via `GetFlightInfo` |
+
+Pros compared with Option B:
+
+- **In-band negotiation, per call.** No `SqlInfo` round trip, no cached
+  capability, no "try `GetFlightInfo` and catch `INVALID_ARGUMENT`". The
+  server can also decide per statement whether deferral is worth it.
+- **Binding stays on the update command.** No need to bind an update through
+  a message named `...Query`, which also resolves the ambiguity raised in
+  arrow-rs #6560 by giving the update `DoPut` an explicit bind-only mode.
+- **Handle rotation comes with it**, so stateless servers get the same
+  "parameters live in the handle" trick they already have for queries.
+- **Client code is one branch**: parse the ack, and if the marker is set,
+  fall through to the same `FlightInfo` handling as queries.
+
+Cons compared with Option B:
+
+- Two message changes plus the `GetFlightInfo` dispatch branch, versus B's
+  enum value and comments. Both need the upstream spec process anyway (C6).
+- `DoPutUpdateResult` is shared with `CommandStatementUpdate` and
+  `CommandStatementIngest`. The new fields must be documented as meaningful
+  only for commands that define a `defer_execution` flag. Giving
+  `CommandStatementUpdate` the same flag is a natural follow-up; ingestion
+  should probably never defer.
+- Presence of the marker is a hard contract: a server that sets
+  `execution_deferred` but cannot later serve `GetFlightInfo` for the
+  command has broken the client. `FlightSqlProducer` should make it hard to
+  get wrong by wiring both in the same default methods.
+
+A note on alternatives for the opt-in signal. A gRPC header or a
+`SetSessionOptions` option could carry "I understand deferral" once per
+connection instead of per call. Sessions are cookie-based and optional, and
+headers are outside the proto, so a field on the command is the most robust
+and the most consistent with how `transaction_id` is carried today.
+
 ## 4. Recommendation
 
-Do **Option A now and Option B as the target**, in three steps. They compose:
-Option A's zero-row rule is exactly what Option B's legacy path needs.
+Do **Option A now, and Option B's execution phase driven by Option F's
+in-band signalling as the target**, in three steps. They compose: Option A's
+zero-row rule is exactly what the legacy path needs, Option F decides per
+call whether execution is deferred, and Option B defines what
+`GetFlightInfo` returns for an update. A server may additionally accept the
+Rust-style bind through `CommandPreparedStatementQuery`, since both bind
+mechanisms end in the same `GetFlightInfo(CommandPreparedStatementUpdate)`.
+The `SqlInfo` flag from Option B becomes optional introspection rather than
+a requirement.
 
 1. **Harden the legacy `DoPut` path (Option A, no spec change).**
    In `acceptPutPreparedStatementUpdate` implementations, treat a zero-row
@@ -346,28 +473,45 @@ Option A's zero-row rule is exactly what Option B's legacy path needs.
    /*
     * Represents a SQL update query. Used in the command member of FlightDescriptor
     * for the following RPC calls:
-    *  - DoPut: (legacy) bind parameter values and execute the update in one call.
-    *    The server MUST reply with a PutResult carrying DoPutUpdateResult. A stream
-    *    with zero rows executes with the parameters most recently bound to the handle.
+    *  - DoPut: bind parameter values and, unless defer_execution is set and the
+    *    server honours it, execute the update in one call. The server MUST reply
+    *    with a PutResult carrying DoPutUpdateResult. A stream with zero rows
+    *    executes with the parameters most recently bound to the handle.
     *  - GetFlightInfo: execute the prepared update. If the returned FlightInfo has no
     *    endpoints, its app_metadata MUST contain a serialized DoPutUpdateResult.
     *    Otherwise each endpoint yields a stream with the UPDATE_RESULT schema and the
     *    client sums record_count over all rows.
     *  - PollFlightInfo: as GetFlightInfo, for long-running updates.
     *  - GetSchema: return the UPDATE_RESULT schema.
-    * Only valid with GetFlightInfo/PollFlightInfo/GetSchema when the server reports
-    * FLIGHT_SQL_SERVER_UPDATE_VIA_GET_FLIGHT_INFO = true.
+    * A server that sets DoPutUpdateResult.execution_deferred MUST accept this
+    * command with GetFlightInfo, PollFlightInfo and GetSchema.
     */
    message CommandPreparedStatementUpdate {
      bytes prepared_statement_handle = 1;
+     // Client opt-in to deferred execution; see DoPutUpdateResult.
+     optional bool defer_execution = 2;
+   }
+
+   message DoPutUpdateResult {
+     // The number of records updated. -1 represents an unknown count, and is
+     // REQUIRED when execution_deferred is true.
+     int64 record_count = 1;
+     // True if the server only bound the parameters and the client must call
+     // GetFlightInfo or PollFlightInfo with CommandPreparedStatementUpdate to
+     // execute. Only set when the request carried defer_execution = true.
+     optional bool execution_deferred = 2;
+     // Optional rotated handle; same semantics as
+     // DoPutPreparedStatementResult.prepared_statement_handle.
+     optional bytes prepared_statement_handle = 3;
    }
 
    enum SqlInfo {
      // ...
      /*
-      * Retrieves a boolean value indicating whether the Flight SQL Server accepts
-      * CommandPreparedStatementUpdate (and CommandStatementUpdate) with the
-      * GetFlightInfo, PollFlightInfo and GetSchema RPCs.
+      * Optional introspection: whether the Flight SQL Server can defer update
+      * execution and accepts CommandPreparedStatementUpdate (and
+      * CommandStatementUpdate) with GetFlightInfo, PollFlightInfo and GetSchema.
+      * Clients do not need this to use deferral; the DoPut reply is authoritative.
       */
      FLIGHT_SQL_SERVER_UPDATE_VIA_GET_FLIGHT_INFO = 12;
    }
@@ -406,16 +550,21 @@ Server side (`flight-sql`):
 
 Client side (`flight-sql`):
 
-- `FlightSqlClient.PreparedStatement`: add `bindParameters()` (the existing
-  private `putParameters` with the query descriptor, made public) and
-  `executeUpdateInfo()` returning `FlightInfo`, plus a helper that turns a
-  `FlightInfo` into a row count using the inline-or-streamed rule.
-- `executeUpdate()`: keep the legacy behaviour as the default. Add an
-  opt-in (constructor flag or a cached `SqlInfo` probe) that routes it
-  through bind + `GetFlightInfo` when the server advertises support, so JDBC
-  and other callers gain the benefit without an API change.
-- `FlightSqlClient`: cache the boolean `SqlInfo` answer per client instance;
-  today the client does not cache any `SqlInfo`.
+- `FlightSqlClient.PreparedStatement.executeUpdate()`: set
+  `defer_execution = true` on the command, parse the ack as today, and if
+  `execution_deferred` is set adopt any rotated handle and continue with
+  `GetFlightInfo(CommandPreparedStatementUpdate{handle})`, turning the
+  `FlightInfo` into a row count with the inline-or-streamed rule. Against an
+  old server the marker is absent and the method returns the count exactly as
+  it does now, so callers see no behavioural change. A constructor flag can
+  keep the request flag off for users who want the pure legacy wire shape.
+- Add `executeUpdateInfo()` returning the `FlightInfo` (or a `PollInfo`
+  variant) for callers that want to poll, cancel or redirect long-running
+  updates themselves, and a `bindParameters()` that sends the `DoPut` with
+  `defer_execution` and stops.
+- No `SqlInfo` probe is required. If the optional introspection key is
+  added, it can be exposed through the existing `getSqlInfo` API without
+  the client depending on it.
 
 JDBC driver (`flight-sql-jdbc-core`):
 
@@ -428,9 +577,14 @@ JDBC driver (`flight-sql-jdbc-core`):
 Tests:
 
 - Producer-level tests for old-client behaviour against the new example
-  servers (legacy `DoPut` still returns `DoPutUpdateResult`).
-- Client tests against a producer without the new branches, asserting the
-  fallback to the legacy path and that the probe happens once.
+  servers (a `DoPut` without `defer_execution` still executes and returns a
+  plain `DoPutUpdateResult`).
+- Client tests against a producer without the new branches, asserting that
+  a `DoPut` carrying `defer_execution` is answered with a plain count and
+  that no `GetFlightInfo` is issued.
+- A client test against a producer that sets `execution_deferred` without a
+  rotated handle, and one with a rotated handle, asserting the handle used
+  by the subsequent `GetFlightInfo` and `ClosePreparedStatement`.
 - A stateless round trip: bind via `CommandPreparedStatementQuery`, observe
   the rotated handle, execute via `GetFlightInfo(CommandPreparedStatementUpdate)`
   with that handle, and read the count from `app_metadata`.
