@@ -18,6 +18,10 @@
 ARG base
 FROM ${base}
 
+# Archery requires Python 3.11 or newer.
+ENV CPYTHON_VERSION=cp311
+ENV PATH=/opt/python/${CPYTHON_VERSION}-${CPYTHON_VERSION}/bin:${PATH}
+
 # Install Java
 # We need Java for JNI headers, but we don't invoke Maven in this build.
 ARG java=17
