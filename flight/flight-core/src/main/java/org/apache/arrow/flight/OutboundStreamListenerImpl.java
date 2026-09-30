@@ -22,6 +22,8 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.vector.compression.CompressionCodec;
+import org.apache.arrow.vector.compression.NoCompressionCodec;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.message.IpcOption;
 
@@ -31,6 +33,7 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
   protected final CallStreamObserver<ArrowMessage> responseObserver;
   protected volatile VectorUnloader unloader; // null until stream started
   protected IpcOption option; // null until stream started
+  protected CompressionCodec compressionCodec = NoCompressionCodec.INSTANCE;
   protected boolean tryZeroCopy = ArrowMessage.ENABLE_ZERO_COPY_WRITE;
 
   OutboundStreamListenerImpl(
@@ -53,10 +56,16 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
 
   @Override
   public void start(VectorSchemaRoot root, DictionaryProvider dictionaries, IpcOption option) {
-    this.option = option;
+    this.option = Preconditions.checkNotNull(option, "option must be provided");
+    compressionCodec = getCompressionCodec(this.option);
     try {
       DictionaryUtils.generateSchemaMessages(
-          root.getSchema(), descriptor, dictionaries, option, responseObserver::onNext);
+          root.getSchema(),
+          descriptor,
+          dictionaries,
+          this.option,
+          compressionCodec,
+          responseObserver::onNext);
     } catch (RuntimeException e) {
       // Propagate runtime exceptions, like those raised when trying to write unions with V4
       // metadata
@@ -68,7 +77,9 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
       throw new RuntimeException("Could not generate and send all schema messages", e);
     }
     // We include the null count and align buffers to be compatible with Flight/C++
-    unloader = new VectorUnloader(root, /* includeNullCount */ true, /* alignBuffers */ true);
+    unloader =
+        new VectorUnloader(
+            root, /* includeNullCount */ true, compressionCodec, /* alignBuffers */ true);
   }
 
   @Override
@@ -135,5 +146,12 @@ abstract class OutboundStreamListenerImpl implements OutboundStreamListener {
   @Override
   public void setUseZeroCopy(boolean enabled) {
     tryZeroCopy = enabled;
+  }
+
+  private static CompressionCodec getCompressionCodec(IpcOption option) {
+    return option.compressionLevel.isPresent()
+        ? CompressionCodec.Factory.INSTANCE.createCodec(
+            option.codecType, option.compressionLevel.get())
+        : CompressionCodec.Factory.INSTANCE.createCodec(option.codecType);
   }
 }
