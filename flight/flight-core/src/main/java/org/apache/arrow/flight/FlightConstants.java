@@ -21,6 +21,9 @@ public interface FlightConstants {
 
   String SERVICE = "arrow.flight.protocol.FlightService";
 
+  /** Request header listing supported IPC body compression codecs in preference order. */
+  String IPC_ACCEPT_COMPRESSION_HEADER = "arrow-ipc-accept-compression";
+
   FlightServerMiddleware.Key<ServerHeaderMiddleware> HEADER_KEY =
       FlightServerMiddleware.Key.of("org.apache.arrow.flight.ServerHeaderMiddleware");
 

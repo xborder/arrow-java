@@ -29,10 +29,12 @@ import java.util.concurrent.Executors;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler;
 import org.apache.arrow.driver.jdbc.client.utils.FlightClientCache;
 import org.apache.arrow.driver.jdbc.utils.ArrowFlightConnectionConfigImpl;
+import org.apache.arrow.flight.CallOptions;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.apache.calcite.avatica.AvaticaConnection;
 import org.apache.calcite.avatica.AvaticaFactory;
 import org.apache.calcite.avatica.DriverVersion;
@@ -105,30 +107,35 @@ public final class ArrowFlightConnection extends AvaticaConnection {
       final DriverVersion driverVersion)
       throws SQLException {
     try {
-      return new ArrowFlightSqlClientHandler.Builder()
-          .withHost(config.getHost())
-          .withPort(config.getPort())
-          .withUsername(config.getUser())
-          .withPassword(config.getPassword())
-          .withTrustStorePath(config.getTrustStorePath())
-          .withTrustStorePassword(config.getTrustStorePassword())
-          .withSystemTrustStore(config.useSystemTrustStore())
-          .withTlsRootCertificates(config.getTlsRootCertificatesPath())
-          .withClientCertificate(config.getClientCertificatePath())
-          .withClientKey(config.getClientKeyPath())
-          .withBufferAllocator(allocator)
-          .withEncryption(config.useEncryption())
-          .withDisableCertificateVerification(config.getDisableCertificateVerification())
-          .withToken(config.getToken())
-          .withCallOptions(config.toCallOption())
-          .withRetainCookies(config.retainCookies())
-          .withRetainAuth(config.retainAuth())
-          .withCatalog(config.getCatalog())
-          .withClientCache(config.useClientCache() ? new FlightClientCache() : null)
-          .withConnectTimeout(config.getConnectTimeout())
-          .withDriverVersion(driverVersion)
-          .withOAuthConfiguration(config.getOauthConfiguration())
-          .build();
+      final ArrowFlightSqlClientHandler.Builder builder =
+          new ArrowFlightSqlClientHandler.Builder()
+              .withHost(config.getHost())
+              .withPort(config.getPort())
+              .withUsername(config.getUser())
+              .withPassword(config.getPassword())
+              .withTrustStorePath(config.getTrustStorePath())
+              .withTrustStorePassword(config.getTrustStorePassword())
+              .withSystemTrustStore(config.useSystemTrustStore())
+              .withTlsRootCertificates(config.getTlsRootCertificatesPath())
+              .withClientCertificate(config.getClientCertificatePath())
+              .withClientKey(config.getClientKeyPath())
+              .withBufferAllocator(allocator)
+              .withEncryption(config.useEncryption())
+              .withDisableCertificateVerification(config.getDisableCertificateVerification())
+              .withToken(config.getToken())
+              .withCallOptions(config.toCallOption())
+              .withRetainCookies(config.retainCookies())
+              .withRetainAuth(config.retainAuth())
+              .withCatalog(config.getCatalog())
+              .withClientCache(config.useClientCache() ? new FlightClientCache() : null)
+              .withConnectTimeout(config.getConnectTimeout())
+              .withDriverVersion(driverVersion)
+              .withOAuthConfiguration(config.getOauthConfiguration());
+      final CompressionUtil.CodecType[] ipcCompressionCodecs = config.getIpcCompressionCodecs();
+      if (ipcCompressionCodecs.length > 0) {
+        builder.withCallOptions(CallOptions.acceptIpcCompression(ipcCompressionCodecs));
+      }
+      return builder.build();
     } catch (final SQLException e) {
       try {
         allocator.close();

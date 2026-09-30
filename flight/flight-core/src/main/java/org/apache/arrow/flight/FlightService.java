@@ -20,6 +20,7 @@ import com.google.common.base.Strings;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -38,6 +39,8 @@ import org.apache.arrow.flight.impl.Flight;
 import org.apache.arrow.flight.impl.FlightServiceGrpc.FlightServiceImplBase;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.AutoCloseables;
+import org.apache.arrow.vector.compression.CompressionCodec;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,16 +54,27 @@ class FlightService extends FlightServiceImplBase {
   private final FlightProducer producer;
   private final ServerAuthHandler authHandler;
   private final ExecutorService executors;
+  private final List<CompressionUtil.CodecType> ipcCompressionCodecs;
 
   FlightService(
       BufferAllocator allocator,
       FlightProducer producer,
       ServerAuthHandler authHandler,
       ExecutorService executors) {
+    this(allocator, producer, authHandler, executors, Collections.emptyList());
+  }
+
+  FlightService(
+      BufferAllocator allocator,
+      FlightProducer producer,
+      ServerAuthHandler authHandler,
+      ExecutorService executors,
+      List<CompressionUtil.CodecType> ipcCompressionCodecs) {
     this.allocator = allocator;
     this.producer = producer;
     this.authHandler = authHandler;
     this.executors = new ContextPropagatingExecutorService(executors);
+    this.ipcCompressionCodecs = ipcCompressionCodecs;
   }
 
   private CallContext makeContext(ServerCallStreamObserver<?> responseObserver) {
@@ -107,10 +121,14 @@ class FlightService extends FlightServiceImplBase {
     final ServerCallStreamObserver<ArrowMessage> responseObserver =
         (ServerCallStreamObserver<ArrowMessage>) responseObserverSimple;
 
+    final CallContext context = makeContext(responseObserver);
     final GetListener listener =
-        new GetListener(responseObserver, this::handleExceptionWithMiddleware);
+        new GetListener(
+            responseObserver,
+            this::handleExceptionWithMiddleware,
+            IpcCompression.negotiate(context, ipcCompressionCodecs));
     try {
-      producer.getStream(makeContext(responseObserver), new Ticket(ticket), listener);
+      producer.getStream(context, new Ticket(ticket), listener);
     } catch (Exception ex) {
       listener.error(ex);
     }
@@ -155,7 +173,14 @@ class FlightService extends FlightServiceImplBase {
 
     public GetListener(
         ServerCallStreamObserver<ArrowMessage> responseObserver, Consumer<Throwable> errorHandler) {
-      super(null, responseObserver);
+      this(responseObserver, errorHandler, null);
+    }
+
+    public GetListener(
+        ServerCallStreamObserver<ArrowMessage> responseObserver,
+        Consumer<Throwable> errorHandler,
+        CompressionCodec compressionCodec) {
+      super(null, responseObserver, compressionCodec);
       this.errorHandler = errorHandler;
       this.completed = false;
       this.serverCallResponseObserver = responseObserver;
@@ -327,7 +352,14 @@ class FlightService extends FlightServiceImplBase {
 
     public ExchangeListener(
         ServerCallStreamObserver<ArrowMessage> responseObserver, Consumer<Throwable> errorHandler) {
-      super(responseObserver, errorHandler);
+      this(responseObserver, errorHandler, null);
+    }
+
+    public ExchangeListener(
+        ServerCallStreamObserver<ArrowMessage> responseObserver,
+        Consumer<Throwable> errorHandler,
+        CompressionCodec compressionCodec) {
+      super(responseObserver, errorHandler, compressionCodec);
       this.resource = null;
       super.setOnCancelHandler(
           () -> {
@@ -387,8 +419,12 @@ class FlightService extends FlightServiceImplBase {
       StreamObserver<ArrowMessage> responseObserverSimple) {
     final ServerCallStreamObserver<ArrowMessage> responseObserver =
         (ServerCallStreamObserver<ArrowMessage>) responseObserverSimple;
+    final CallContext context = makeContext(responseObserver);
     final ExchangeListener listener =
-        new ExchangeListener(responseObserver, this::handleExceptionWithMiddleware);
+        new ExchangeListener(
+            responseObserver,
+            this::handleExceptionWithMiddleware,
+            IpcCompression.negotiate(context, ipcCompressionCodecs));
     final FlightStream fs =
         new FlightStream(
             allocator,
@@ -405,7 +441,7 @@ class FlightService extends FlightServiceImplBase {
           executors.submit(
               () -> {
                 try {
-                  producer.doExchange(makeContext(responseObserver), fs, listener);
+                  producer.doExchange(context, fs, listener);
                 } catch (Exception ex) {
                   listener.error(ex);
                 }

@@ -26,6 +26,7 @@ import io.grpc.ServiceDescriptor;
 import io.grpc.protobuf.ProtoUtils;
 import io.grpc.stub.ServerCalls;
 import io.grpc.stub.StreamObserver;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import org.apache.arrow.flight.auth.ServerAuthHandler;
@@ -33,6 +34,7 @@ import org.apache.arrow.flight.impl.Flight;
 import org.apache.arrow.flight.impl.Flight.PutResult;
 import org.apache.arrow.flight.impl.FlightServiceGrpc;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.compression.CompressionUtil;
 
 /** Extends the basic flight service to override some methods for more efficient implementations. */
 class FlightBindingService implements BindableService {
@@ -53,8 +55,18 @@ class FlightBindingService implements BindableService {
       FlightProducer producer,
       ServerAuthHandler authHandler,
       ExecutorService executor) {
+    this(allocator, producer, authHandler, executor, java.util.Collections.emptyList());
+  }
+
+  public FlightBindingService(
+      BufferAllocator allocator,
+      FlightProducer producer,
+      ServerAuthHandler authHandler,
+      ExecutorService executor,
+      List<CompressionUtil.CodecType> ipcCompressionCodecs) {
     this.allocator = allocator;
-    this.delegate = new FlightService(allocator, producer, authHandler, executor);
+    this.delegate =
+        new FlightService(allocator, producer, authHandler, executor, ipcCompressionCodecs);
   }
 
   public static MethodDescriptor<Flight.Ticket, ArrowMessage> getDoGetDescriptor(

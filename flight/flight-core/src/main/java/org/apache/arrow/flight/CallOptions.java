@@ -17,12 +17,35 @@
 package org.apache.arrow.flight;
 
 import io.grpc.stub.AbstractStub;
+import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import org.apache.arrow.vector.compression.CompressionCodec;
+import org.apache.arrow.vector.compression.CompressionUtil;
 
 /** Common call options. */
 public class CallOptions {
   public static CallOption timeout(long duration, TimeUnit unit) {
     return new Timeout(duration, unit);
+  }
+
+  /**
+   * Advertise support for IPC body compression codecs in preference order.
+   *
+   * <p>Servers that do not support negotiation ignore this option and return uncompressed IPC.
+   */
+  public static CallOption acceptIpcCompression(CompressionUtil.CodecType... codecs) {
+    if (codecs.length == 0) {
+      throw new IllegalArgumentException("At least one IPC compression codec is required");
+    }
+    for (CompressionUtil.CodecType codec : codecs) {
+      CompressionCodec.Factory.INSTANCE.createCodec(codec);
+    }
+    final FlightCallHeaders headers = new FlightCallHeaders();
+    headers.insert(
+        FlightConstants.IPC_ACCEPT_COMPRESSION_HEADER,
+        Arrays.stream(codecs).map(IpcCompression::codecName).collect(Collectors.joining(",")));
+    return new HeaderCallOption(headers);
   }
 
   static <T extends AbstractStub<T>> T wrapStub(T stub, CallOption[] options) {

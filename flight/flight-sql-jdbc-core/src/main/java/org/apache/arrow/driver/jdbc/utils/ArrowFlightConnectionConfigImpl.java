@@ -16,10 +16,13 @@
  */
 package org.apache.arrow.driver.jdbc.utils;
 
+import com.google.common.base.Splitter;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
@@ -30,6 +33,7 @@ import org.apache.arrow.flight.CallOption;
 import org.apache.arrow.flight.FlightCallHeaders;
 import org.apache.arrow.flight.HeaderCallOption;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.apache.calcite.avatica.ConnectionConfig;
 import org.apache.calcite.avatica.ConnectionConfigImpl;
 import org.apache.calcite.avatica.ConnectionProperty;
@@ -182,6 +186,31 @@ public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl 
     return ArrowFlightConnectionProperty.USE_CLIENT_CACHE.getBoolean(properties);
   }
 
+  /** IPC body compression codecs to advertise, in preference order. */
+  public CompressionUtil.CodecType[] getIpcCompressionCodecs() throws SQLException {
+    final String value = ArrowFlightConnectionProperty.IPC_COMPRESSION.getString(properties);
+    if (value == null || value.trim().isEmpty() || "none".equalsIgnoreCase(value.trim())) {
+      return new CompressionUtil.CodecType[0];
+    }
+    final List<String> names = Splitter.on(',').splitToList(value);
+    final CompressionUtil.CodecType[] codecs = new CompressionUtil.CodecType[names.size()];
+    for (int i = 0; i < names.size(); i++) {
+      final String name = names.get(i).trim().toLowerCase(Locale.ROOT);
+      try {
+        codecs[i] =
+            "lz4".equals(name)
+                ? CompressionUtil.CodecType.LZ4_FRAME
+                : CompressionUtil.CodecType.valueOf(name.toUpperCase(Locale.ROOT));
+        if (codecs[i] == CompressionUtil.CodecType.NO_COMPRESSION) {
+          throw new IllegalArgumentException();
+        }
+      } catch (IllegalArgumentException e) {
+        throw new SQLException("Unsupported IPC compression codec: " + names.get(i).trim(), e);
+      }
+    }
+    return codecs;
+  }
+
   /**
    * Gets the {@link CallOption}s from this {@link ConnectionConfig}.
    *
@@ -267,6 +296,7 @@ public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl 
     CATALOG("catalog", null, Type.STRING, false),
     CONNECT_TIMEOUT_MILLIS("connectTimeoutMs", 10000, Type.NUMBER, false),
     USE_CLIENT_CACHE("useClientCache", true, Type.BOOLEAN, false),
+    IPC_COMPRESSION("ipcCompression", null, Type.STRING, false),
 
     // OAuth configuration properties
     OAUTH_FLOW("oauth.flow", null, Type.STRING, false),

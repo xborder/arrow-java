@@ -45,6 +45,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.junit.jupiter.api.extension.AfterAllCallback;
 import org.junit.jupiter.api.extension.BeforeAllCallback;
 import org.junit.jupiter.api.extension.ExtensionContext;
@@ -69,6 +70,7 @@ public class FlightServerTestExtension
   private final Authentication authentication;
   private final CertKeyPair certKeyPair;
   private final File mTlsCACert;
+  private final CompressionUtil.CodecType[] ipcCompressionCodecs;
 
   private final InterceptorMiddleware.Factory interceptorFactory =
       new InterceptorMiddleware.Factory();
@@ -80,7 +82,8 @@ public class FlightServerTestExtension
       final FlightSqlProducer producer,
       final Authentication authentication,
       final CertKeyPair certKeyPair,
-      final File mTlsCACert) {
+      final File mTlsCACert,
+      final CompressionUtil.CodecType[] ipcCompressionCodecs) {
     this.properties = Preconditions.checkNotNull(properties);
     this.config = Preconditions.checkNotNull(config);
     this.allocator = Preconditions.checkNotNull(allocator);
@@ -88,6 +91,7 @@ public class FlightServerTestExtension
     this.authentication = authentication;
     this.certKeyPair = certKeyPair;
     this.mTlsCACert = mTlsCACert;
+    this.ipcCompressionCodecs = ipcCompressionCodecs;
   }
 
   /**
@@ -136,6 +140,10 @@ public class FlightServerTestExtension
     return this.createDataSource().getConnection();
   }
 
+  public void setIpcCompression(String codecs) {
+    properties.put("ipcCompression", codecs);
+  }
+
   private void setUseEncryption(boolean useEncryption) {
     properties.put("useEncryption", useEncryption);
   }
@@ -154,6 +162,9 @@ public class FlightServerTestExtension
         FlightServer.builder(allocator, location, producer)
             .headerAuthenticator(authentication.authenticate())
             .middleware(FlightServerMiddleware.Key.of("KEY"), interceptorFactory);
+    if (ipcCompressionCodecs.length > 0) {
+      builder.ipcCompression(ipcCompressionCodecs);
+    }
     if (certKeyPair != null) {
       builder.useTls(certKeyPair.cert, certKeyPair.key);
     }
@@ -237,6 +248,7 @@ public class FlightServerTestExtension
     private Authentication authentication;
     private CertKeyPair certKeyPair;
     private File mTlsCACert;
+    private CompressionUtil.CodecType[] ipcCompressionCodecs = new CompressionUtil.CodecType[0];
 
     public Builder() {
       this.properties = new Properties();
@@ -263,6 +275,11 @@ public class FlightServerTestExtension
      */
     public Builder authentication(final Authentication authentication) {
       this.authentication = authentication;
+      return this;
+    }
+
+    public Builder ipcCompression(CompressionUtil.CodecType... codecs) {
+      ipcCompressionCodecs = codecs.clone();
       return this;
     }
 
@@ -303,7 +320,8 @@ public class FlightServerTestExtension
           producer,
           authentication,
           certKeyPair,
-          mTlsCACert);
+          mTlsCACert,
+          ipcCompressionCodecs);
     }
   }
 

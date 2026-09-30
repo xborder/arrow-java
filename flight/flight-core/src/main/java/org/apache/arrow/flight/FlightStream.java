@@ -38,6 +38,7 @@ import org.apache.arrow.util.VisibleForTesting;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.compression.CompressionUtil;
 import org.apache.arrow.vector.dictionary.Dictionary;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
@@ -86,6 +87,7 @@ public class FlightStream implements AutoCloseable {
   private volatile Throwable ex;
   private volatile ArrowBuf applicationMetadata = null;
   @VisibleForTesting volatile MetadataVersion metadataVersion = null;
+  @VisibleForTesting volatile CompressionUtil.CodecType compressionType = null;
 
   /**
    * Constructs a new instance.
@@ -272,6 +274,9 @@ public class FlightStream implements AutoCloseable {
             // Ensure we have the root
             root.get().clear();
             try (ArrowRecordBatch arb = msg.asRecordBatch()) {
+              compressionType =
+                  CompressionUtil.CodecType.fromCompressionType(
+                      arb.getBodyCompression().getCodec());
               loader.load(arb);
             }
             updateMetadata(msg);

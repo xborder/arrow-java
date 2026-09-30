@@ -34,6 +34,8 @@ import java.lang.reflect.InvocationTargetException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -55,6 +57,8 @@ import org.apache.arrow.flight.grpc.ServerInterceptorAdapter.KeyFactory;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.util.VisibleForTesting;
+import org.apache.arrow.vector.compression.CompressionCodec;
+import org.apache.arrow.vector.compression.CompressionUtil;
 
 /**
  * Generic server of flight data that is customized via construction with delegate classes for the
@@ -197,6 +201,7 @@ public class FlightServer implements AutoCloseable {
     private final List<KeyFactory<?>> interceptors;
     // Keep track of inserted interceptors
     private final Set<String> interceptorKeys;
+    private List<CompressionUtil.CodecType> ipcCompressionCodecs = Collections.emptyList();
 
     Builder() {
       builderOptions = new HashMap<>();
@@ -321,7 +326,7 @@ public class FlightServer implements AutoCloseable {
       }
 
       final FlightBindingService flightService =
-          new FlightBindingService(allocator, producer, authHandler, exec);
+          new FlightBindingService(allocator, producer, authHandler, exec, ipcCompressionCodecs);
       builder
           .executor(exec)
           .maxInboundMessageSize(maxInboundMessageSize)
@@ -389,6 +394,22 @@ public class FlightServer implements AutoCloseable {
     public Builder backpressureThreshold(int backpressureThreshold) {
       Preconditions.checkArgument(backpressureThreshold > 0);
       this.backpressureThreshold = backpressureThreshold;
+      return this;
+    }
+
+    /**
+     * Enable negotiated IPC body compression for server response streams.
+     *
+     * <p>The client preference order wins. Clients that do not advertise support continue to
+     * receive uncompressed IPC.
+     */
+    public Builder ipcCompression(CompressionUtil.CodecType... codecs) {
+      Preconditions.checkArgument(codecs.length > 0, "At least one codec is required");
+      for (CompressionUtil.CodecType codec : codecs) {
+        IpcCompression.codecName(codec);
+        CompressionCodec.Factory.INSTANCE.createCodec(codec);
+      }
+      ipcCompressionCodecs = Collections.unmodifiableList(Arrays.asList(codecs.clone()));
       return this;
     }
 
