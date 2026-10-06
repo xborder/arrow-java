@@ -1103,37 +1103,47 @@ loadScripts(document, 'script');</script>
 <div class="col-last odd-row-color">
 <div class="block">Concat two validity buffers.</div>
 </div>
-<div class="col-first even-row-color"><code>default void</code></div>
-<div class="col-second even-row-color"><span class="type-name-label">FieldVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/FieldVector.html#exportBuffer(org.apache.arrow.memory.ArrowBuf,java.util.List,org.apache.arrow.memory.ArrowBuf,long,boolean)" class="member-name-link">exportBuffer</a><wbr>(<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffer,
+<div class="col-first even-row-color"><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseVariableWidthViewVector.ViewElementConsumer.html" title="type parameter in BaseVariableWidthViewVector.ViewElementConsumer">T</a></code></div>
+<div class="col-second even-row-color"><span class="type-name-label">BaseVariableWidthViewVector.ViewElementConsumer.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseVariableWidthViewVector.ViewElementConsumer.html#consume(org.apache.arrow.memory.ArrowBuf,int,int)" class="member-name-link">consume</a><wbr>(<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buf,
+ int&nbsp;offset,
+ int&nbsp;length)</code></div>
+<div class="col-last even-row-color">&nbsp;</div>
+<div class="col-first odd-row-color"><code>default void</code></div>
+<div class="col-second odd-row-color"><span class="type-name-label">FieldVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/FieldVector.html#exportBuffer(org.apache.arrow.memory.ArrowBuf,java.util.List,org.apache.arrow.memory.ArrowBuf,long,boolean)" class="member-name-link">exportBuffer</a><wbr>(<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffer,
  <a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
  <a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffersPtr,
  long&nbsp;nullValue,
  boolean&nbsp;retain)</code></div>
-<div class="col-last even-row-color">
+<div class="col-last odd-row-color">
 <div class="block">Export a given buffer and its memory address into a list of buffers and a pointer to the list
  of buffers.</div>
 </div>
+<div class="col-first even-row-color"><code>void</code></div>
+<div class="col-second even-row-color"><span class="type-name-label">BaseLargeVariableWidthVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseLargeVariableWidthVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
+ <a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffersPtr,
+ long&nbsp;nullValue)</code></div>
+<div class="col-last even-row-color">
+<div class="block">Export the buffers of the fields for C Data Interface.</div>
+</div>
 <div class="col-first odd-row-color"><code>void</code></div>
-<div class="col-second odd-row-color"><span class="type-name-label">BaseLargeVariableWidthVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseLargeVariableWidthVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
+<div class="col-second odd-row-color"><span class="type-name-label">BaseVariableWidthVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseVariableWidthVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
  <a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffersPtr,
  long&nbsp;nullValue)</code></div>
 <div class="col-last odd-row-color">
 <div class="block">Export the buffers of the fields for C Data Interface.</div>
 </div>
 <div class="col-first even-row-color"><code>void</code></div>
-<div class="col-second even-row-color"><span class="type-name-label">BaseVariableWidthVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseVariableWidthVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
+<div class="col-second even-row-color"><span class="type-name-label">BaseVariableWidthViewVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseVariableWidthViewVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
  <a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffersPtr,
  long&nbsp;nullValue)</code></div>
 <div class="col-last even-row-color">
-<div class="block">Export the buffers of the fields for C Data Interface.</div>
-</div>
-<div class="col-first odd-row-color"><code>void</code></div>
-<div class="col-second odd-row-color"><span class="type-name-label">BaseVariableWidthViewVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseVariableWidthViewVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
- <a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffersPtr,
- long&nbsp;nullValue)</code></div>
-<div class="col-last odd-row-color">
 <div class="block">Get the data buffer of the vector.</div>
 </div>
+<div class="col-first odd-row-color"><code>void</code></div>
+<div class="col-second odd-row-color"><span class="type-name-label">ExtensionTypeVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ExtensionTypeVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
+ <a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffersPtr,
+ long&nbsp;nullValue)</code></div>
+<div class="col-last odd-row-color">&nbsp;</div>
 <div class="col-first even-row-color"><code>default void</code></div>
 <div class="col-second even-row-color"><span class="type-name-label">FieldVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/FieldVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
  <a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffersPtr,
@@ -1772,51 +1782,56 @@ loadScripts(document, 'script');</script>
 <div class="col-last odd-row-color">
 <div class="block">Get the data buffer of the vector.</div>
 </div>
-<div class="col-first even-row-color"><code>default void</code></div>
-<div class="col-second even-row-color"><span class="type-name-label">FieldVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/FieldVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
+<div class="col-first even-row-color"><code>void</code></div>
+<div class="col-second even-row-color"><span class="type-name-label">ExtensionTypeVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ExtensionTypeVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
  <a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffersPtr,
  long&nbsp;nullValue)</code></div>
-<div class="col-last even-row-color">
+<div class="col-last even-row-color">&nbsp;</div>
+<div class="col-first odd-row-color"><code>default void</code></div>
+<div class="col-second odd-row-color"><span class="type-name-label">FieldVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/FieldVector.html#exportCDataBuffers(java.util.List,org.apache.arrow.memory.ArrowBuf,long)" class="member-name-link">exportCDataBuffers</a><wbr>(<a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;buffers,
+ <a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&nbsp;buffersPtr,
+ long&nbsp;nullValue)</code></div>
+<div class="col-last odd-row-color">
 <div class="block">Export the buffers of the fields for C Data Interface.</div>
 </div>
+<div class="col-first even-row-color"><code>void</code></div>
+<div class="col-second even-row-color"><span class="type-name-label">BaseFixedWidthVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseFixedWidthVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
+ <a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;ownBuffers)</code></div>
+<div class="col-last even-row-color">
+<div class="block">Load the buffers of this vector with provided source buffers.</div>
+</div>
 <div class="col-first odd-row-color"><code>void</code></div>
-<div class="col-second odd-row-color"><span class="type-name-label">BaseFixedWidthVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseFixedWidthVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
+<div class="col-second odd-row-color"><span class="type-name-label">BaseLargeVariableWidthVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseLargeVariableWidthVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
  <a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;ownBuffers)</code></div>
 <div class="col-last odd-row-color">
 <div class="block">Load the buffers of this vector with provided source buffers.</div>
 </div>
 <div class="col-first even-row-color"><code>void</code></div>
-<div class="col-second even-row-color"><span class="type-name-label">BaseLargeVariableWidthVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseLargeVariableWidthVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
+<div class="col-second even-row-color"><span class="type-name-label">BaseVariableWidthVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseVariableWidthVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
  <a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;ownBuffers)</code></div>
 <div class="col-last even-row-color">
 <div class="block">Load the buffers of this vector with provided source buffers.</div>
 </div>
 <div class="col-first odd-row-color"><code>void</code></div>
-<div class="col-second odd-row-color"><span class="type-name-label">BaseVariableWidthVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseVariableWidthVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
+<div class="col-second odd-row-color"><span class="type-name-label">BaseVariableWidthViewVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseVariableWidthViewVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
  <a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;ownBuffers)</code></div>
 <div class="col-last odd-row-color">
 <div class="block">Load the buffers of this vector with provided source buffers.</div>
 </div>
 <div class="col-first even-row-color"><code>void</code></div>
-<div class="col-second even-row-color"><span class="type-name-label">BaseVariableWidthViewVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/BaseVariableWidthViewVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
+<div class="col-second even-row-color"><span class="type-name-label">ExtensionTypeVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ExtensionTypeVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
  <a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;ownBuffers)</code></div>
-<div class="col-last even-row-color">
-<div class="block">Load the buffers of this vector with provided source buffers.</div>
-</div>
+<div class="col-last even-row-color">&nbsp;</div>
 <div class="col-first odd-row-color"><code>void</code></div>
-<div class="col-second odd-row-color"><span class="type-name-label">ExtensionTypeVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ExtensionTypeVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
+<div class="col-second odd-row-color"><span class="type-name-label">FieldVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/FieldVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
  <a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;ownBuffers)</code></div>
-<div class="col-last odd-row-color">&nbsp;</div>
-<div class="col-first even-row-color"><code>void</code></div>
-<div class="col-second even-row-color"><span class="type-name-label">FieldVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/FieldVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
- <a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;ownBuffers)</code></div>
-<div class="col-last even-row-color">
+<div class="col-last odd-row-color">
 <div class="block">Loads data in the vectors.</div>
 </div>
-<div class="col-first odd-row-color"><code>void</code></div>
-<div class="col-second odd-row-color"><span class="type-name-label">NullVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/NullVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
+<div class="col-first even-row-color"><code>void</code></div>
+<div class="col-second even-row-color"><span class="type-name-label">NullVector.</span><code><a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/NullVector.html#loadFieldBuffers(org.apache.arrow.vector.ipc.message.ArrowFieldNode,java.util.List)" class="member-name-link">loadFieldBuffers</a><wbr>(<a href="../../../../../../org.apache.arrow.vector/org/apache/arrow/vector/ipc/message/ArrowFieldNode.html" title="class in org.apache.arrow.vector.ipc.message">ArrowFieldNode</a>&nbsp;fieldNode,
  <a href="https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html" title="class or interface in java.util" class="external-link">List</a>&lt;<a href="../ArrowBuf.html" title="class in org.apache.arrow.memory">ArrowBuf</a>&gt;&nbsp;ownBuffers)</code></div>
-<div class="col-last odd-row-color">&nbsp;</div>
+<div class="col-last even-row-color">&nbsp;</div>
 </div>
 </section>
 </li>
