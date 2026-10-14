@@ -21,6 +21,7 @@ import static org.apache.arrow.vector.testing.ValueVectorDataPopulator.setVector
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -31,6 +32,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.function.ToIntBiFunction;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.complex.FixedSizeListVector;
@@ -54,6 +57,8 @@ import org.apache.arrow.vector.util.Text;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class TestDictionaryVector {
 
@@ -73,6 +78,78 @@ public class TestDictionaryVector {
   @AfterEach
   public void terminate() throws Exception {
     allocator.close();
+  }
+
+  @ParameterizedTest
+  @ValueSource(longs = {-1, 2, 4294967296L, Long.MAX_VALUE, Long.MIN_VALUE})
+  public void testDecodeRejectsInvalidLongIndices(long index) {
+    try (VarCharVector values = newVarCharVector("dictionary", allocator);
+        BigIntVector indices = new BigIntVector("indices", allocator)) {
+      setVector(values, "foo", "bar");
+      setVector(indices, 0L, 1L);
+      Dictionary dictionary =
+          new Dictionary(values, new DictionaryEncoding(7, false, new ArrowType.Int(64, true)));
+      try (ValueVector decoded = DictionaryEncoder.decode(indices, dictionary)) {
+        assertEquals(
+            Arrays.asList("foo", "bar"),
+            IntStream.range(0, decoded.getValueCount())
+                .mapToObj(i -> decoded.getObject(i).toString())
+                .collect(Collectors.toList()));
+      }
+      indices.setSafe(1, index);
+      long allocatedBefore = allocator.getAllocatedMemory();
+      assertEquals(
+          "Provided dictionary does not contain value for index " + index,
+          assertThrows(
+                  IllegalArgumentException.class,
+                  () -> DictionaryEncoder.decode(indices, dictionary).close())
+              .getMessage());
+      assertEquals(allocatedBefore, allocator.getAllocatedMemory());
+    }
+    assertEquals(0, allocator.getAllocatedMemory());
+  }
+
+  @Test
+  public void testStructDecodeUsesDictionaryValueCount() {
+    try (StructVector validIndices = StructVector.empty("valid", allocator);
+        StructVector invalidIndices = StructVector.empty("invalid", allocator);
+        VarCharVector values = new VarCharVector("f0", allocator)) {
+      setVector(values, "aa", "bb");
+      Dictionary dictionary = new Dictionary(values, new DictionaryEncoding(7, false, null));
+      DictionaryProvider.MapDictionaryProvider provider =
+          new DictionaryProvider.MapDictionaryProvider(dictionary);
+      FieldType type = new FieldType(true, new ArrowType.Int(32, true), dictionary.getEncoding());
+      validIndices.addOrGet("f0", type, IntVector.class);
+      invalidIndices.addOrGet("f0", type, IntVector.class);
+      NullableStructWriter writer = validIndices.getWriter();
+      writer.allocate();
+      writer.start();
+      writer.integer("f0").writeInt(1);
+      writer.end();
+      validIndices.setValueCount(1);
+      try (StructVector decoded = StructSubfieldEncoder.decode(validIndices, provider, allocator)) {
+        assertEquals(
+            List.of(Map.of("f0", new Text("bb"))),
+            IntStream.range(0, decoded.getValueCount())
+                .mapToObj(decoded::getObject)
+                .collect(Collectors.toList()));
+      }
+      NullableStructWriter invalidWriter = invalidIndices.getWriter();
+      invalidWriter.allocate();
+      for (int i = 0; i < 5; i++) {
+        invalidWriter.start();
+        invalidWriter.integer("f0").writeInt(i == 0 ? 2 : 0);
+        invalidWriter.end();
+      }
+      invalidIndices.setValueCount(5);
+      assertEquals(
+          "Provided dictionary does not contain value for index 2",
+          assertThrows(
+                  IllegalArgumentException.class,
+                  () -> StructSubfieldEncoder.decode(invalidIndices, provider, allocator).close())
+              .getMessage());
+    }
+    assertEquals(0, allocator.getAllocatedMemory());
   }
 
   @Test
@@ -1053,7 +1130,7 @@ public class TestDictionaryVector {
       NullableStructWriter writer = indices.getWriter();
       writer.allocate();
       writer.start();
-      writer.integer("f0").writeInt(1);
+      writer.integer("f0").writeInt(0);
       writer.integer("f1").writeInt(3);
       writer.end();
       writer.setValueCount(1);

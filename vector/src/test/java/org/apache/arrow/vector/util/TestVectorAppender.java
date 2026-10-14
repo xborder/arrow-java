@@ -17,6 +17,7 @@
 package org.apache.arrow.vector.util;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -24,8 +25,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.memory.util.CommonUtil;
@@ -33,9 +36,11 @@ import org.apache.arrow.vector.BaseValueVector;
 import org.apache.arrow.vector.BaseVariableWidthViewVector;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.LargeVarCharVector;
+import org.apache.arrow.vector.NullVector;
 import org.apache.arrow.vector.TestUtils;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.VarCharVector;
@@ -53,6 +58,7 @@ import org.apache.arrow.vector.complex.UnionVector;
 import org.apache.arrow.vector.holders.NullableBigIntHolder;
 import org.apache.arrow.vector.holders.NullableFloat4Holder;
 import org.apache.arrow.vector.holders.NullableIntHolder;
+import org.apache.arrow.vector.ipc.message.ArrowFieldNode;
 import org.apache.arrow.vector.testing.ValueVectorDataPopulator;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -61,6 +67,8 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 /** Test cases for {@link VectorAppender}. */
 public class TestVectorAppender {
@@ -76,6 +84,252 @@ public class TestVectorAppender {
   @AfterEach
   public void shutdown() {
     allocator.close();
+  }
+
+  @Test
+  public void testAppendNullVector() {
+    try (NullVector target = new NullVector("target");
+        NullVector delta = new NullVector("delta", 2);
+        NullVector empty = new NullVector("empty")) {
+      VectorAppender appender = new VectorAppender(target);
+      assertSame(target, empty.accept(appender, null));
+      assertEquals(
+          Collections.emptyList(),
+          IntStream.range(0, target.getValueCount())
+              .mapToObj(target::getObject)
+              .collect(Collectors.toList()));
+      assertSame(target, delta.accept(appender, null));
+      assertEquals(
+          Arrays.asList(null, null),
+          IntStream.range(0, target.getValueCount())
+              .mapToObj(target::getObject)
+              .collect(Collectors.toList()));
+      VectorBatchAppender.batchAppend(target, empty, delta, delta);
+      assertEquals(
+          Arrays.asList(null, null, null, null, null, null),
+          IntStream.range(0, target.getValueCount())
+              .mapToObj(target::getObject)
+              .collect(Collectors.toList()));
+      assertEquals(
+          Arrays.asList(null, null),
+          IntStream.range(0, delta.getValueCount())
+              .mapToObj(delta::getObject)
+              .collect(Collectors.toList()));
+      assertEquals(0, allocator.getAllocatedMemory());
+    }
+  }
+
+  @Test
+  public void testAppendNullVectorTypeMismatch() {
+    try (NullVector nulls = new NullVector("nulls", 1);
+        IntVector integers = new IntVector("integers", allocator)) {
+      ValueVectorDataPopulator.setVector(integers, 42);
+      assertThrows(
+          IllegalArgumentException.class, () -> nulls.accept(new VectorAppender(integers), null));
+      assertThrows(
+          IllegalArgumentException.class, () -> integers.accept(new VectorAppender(nulls), null));
+      assertEquals(
+          Collections.singletonList(42),
+          IntStream.range(0, integers.getValueCount())
+              .mapToObj(integers::getObject)
+              .collect(Collectors.toList()));
+      assertEquals(
+          Collections.singletonList(null),
+          IntStream.range(0, nulls.getValueCount())
+              .mapToObj(nulls::getObject)
+              .collect(Collectors.toList()));
+    }
+    assertEquals(0, allocator.getAllocatedMemory());
+  }
+
+  @Test
+  public void testAppendNullVectorCountBoundary() {
+    try (NullVector target = new NullVector("target", Integer.MAX_VALUE - 1);
+        NullVector delta = new NullVector("delta", 1);
+        NullVector empty = new NullVector("empty")) {
+      VectorBatchAppender.batchAppend(target, delta, empty);
+      assertEquals(
+          List.of(Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE),
+          List.of(target.getValueCount(), target.getNullCount(), target.getValueCapacity()));
+      assertThrows(ArithmeticException.class, () -> VectorBatchAppender.batchAppend(target, delta));
+      assertEquals(
+          List.of(Integer.MAX_VALUE, 1, 0),
+          List.of(target.getValueCount(), delta.getValueCount(), empty.getValueCount()));
+      assertEquals(0, allocator.getAllocatedMemory());
+    }
+  }
+
+  @Test
+  public void testAppendSlicedVariableWidthVector() {
+    try (VarCharVector target = new VarCharVector("target", allocator);
+        VarCharVector source = new VarCharVector("source", allocator);
+        VarCharVector delta = new VarCharVector("delta", allocator);
+        ArrowBuf validity = allocator.buffer(1)) {
+      ValueVectorDataPopulator.setVector(target, "alpha");
+      ValueVectorDataPopulator.setVector(source, "skip", "beta", null, "gamma", "tail");
+      validity.setByte(0, 5);
+      delta.loadFieldBuffers(
+          new ArrowFieldNode(3, 1),
+          Arrays.asList(validity, source.getOffsetBuffer().slice(4, 16), source.getDataBuffer()));
+      VectorBatchAppender.batchAppend(target, delta, delta);
+      assertEquals(
+          Arrays.asList("alpha", "beta", null, "gamma", "beta", null, "gamma"),
+          IntStream.range(0, target.getValueCount())
+              .mapToObj(i -> target.isNull(i) ? null : target.getObject(i).toString())
+              .collect(Collectors.toList()));
+      assertEquals(
+          Arrays.asList("skip", "beta", null, "gamma", "tail"),
+          IntStream.range(0, source.getValueCount())
+              .mapToObj(i -> source.isNull(i) ? null : source.getObject(i).toString())
+              .collect(Collectors.toList()));
+    }
+    assertEquals(0, allocator.getAllocatedMemory());
+  }
+
+  @Test
+  public void testAppendSlicedLargeVariableWidthVector() {
+    try (LargeVarCharVector target = new LargeVarCharVector("target", allocator);
+        LargeVarCharVector source = new LargeVarCharVector("source", allocator);
+        LargeVarCharVector delta = new LargeVarCharVector("delta", allocator);
+        ArrowBuf validity = allocator.buffer(1)) {
+      ValueVectorDataPopulator.setVector(target, "alpha");
+      ValueVectorDataPopulator.setVector(source, "skip", "beta", null, "gamma", "tail");
+      validity.setByte(0, 5);
+      delta.loadFieldBuffers(
+          new ArrowFieldNode(3, 1),
+          Arrays.asList(validity, source.getOffsetBuffer().slice(8, 32), source.getDataBuffer()));
+      VectorBatchAppender.batchAppend(target, delta, delta);
+      assertEquals(
+          Arrays.asList("alpha", "beta", null, "gamma", "beta", null, "gamma"),
+          IntStream.range(0, target.getValueCount())
+              .mapToObj(i -> target.isNull(i) ? null : target.getObject(i).toString())
+              .collect(Collectors.toList()));
+      assertEquals(5, source.getValueCount());
+    }
+    assertEquals(0, allocator.getAllocatedMemory());
+  }
+
+  @Test
+  public void testAppendSlicedListVector() {
+    try (ListVector target = ListVector.empty("target", allocator);
+        ListVector source = ListVector.empty("source", allocator);
+        ListVector delta = ListVector.empty("delta", allocator);
+        ArrowBuf validity = allocator.buffer(1)) {
+      ValueVectorDataPopulator.setVector(target, List.of(1));
+      ValueVectorDataPopulator.setVector(
+          source, List.of(-1, -2), List.of(10, 11), null, List.of(), List.of(12, 13), List.of(99));
+      delta.initializeChildrenFromFields(source.getField().getChildren());
+      delta
+          .getDataVector()
+          .loadFieldBuffers(
+              new ArrowFieldNode(source.getDataVector().getValueCount(), 0),
+              source.getDataVector().getFieldBuffers());
+      validity.setByte(0, 13);
+      delta.loadFieldBuffers(
+          new ArrowFieldNode(4, 1), Arrays.asList(validity, source.getOffsetBuffer().slice(4, 20)));
+      VectorBatchAppender.batchAppend(target, delta, delta);
+      assertEquals(
+          Arrays.asList(
+              List.of(1),
+              List.of(10, 11),
+              null,
+              List.of(),
+              List.of(12, 13),
+              List.of(10, 11),
+              null,
+              List.of(),
+              List.of(12, 13)),
+          IntStream.range(0, target.getValueCount())
+              .mapToObj(target::getObject)
+              .collect(Collectors.toList()));
+      assertEquals(
+          Arrays.asList(
+              List.of(-1, -2), List.of(10, 11), null, List.of(), List.of(12, 13), List.of(99)),
+          IntStream.range(0, source.getValueCount())
+              .mapToObj(source::getObject)
+              .collect(Collectors.toList()));
+      assertEquals(7, delta.getDataVector().getValueCount());
+    }
+    assertEquals(0, allocator.getAllocatedMemory());
+  }
+
+  @Test
+  public void testAppendSlicedLargeListVector() {
+    try (LargeListVector target = LargeListVector.empty("target", allocator);
+        LargeListVector source = LargeListVector.empty("source", allocator);
+        LargeListVector delta = LargeListVector.empty("delta", allocator);
+        ArrowBuf validity = allocator.buffer(1)) {
+      ValueVectorDataPopulator.setVector(target, List.of(1));
+      ValueVectorDataPopulator.setVector(
+          source, List.of(-1, -2), List.of(10, 11), null, List.of(), List.of(12, 13), List.of(99));
+      delta.initializeChildrenFromFields(source.getField().getChildren());
+      delta
+          .getDataVector()
+          .loadFieldBuffers(
+              new ArrowFieldNode(source.getDataVector().getValueCount(), 0),
+              source.getDataVector().getFieldBuffers());
+      validity.setByte(0, 13);
+      delta.loadFieldBuffers(
+          new ArrowFieldNode(4, 1), Arrays.asList(validity, source.getOffsetBuffer().slice(8, 40)));
+      VectorBatchAppender.batchAppend(target, delta, delta);
+      assertEquals(
+          Arrays.asList(
+              List.of(1),
+              List.of(10, 11),
+              null,
+              List.of(),
+              List.of(12, 13),
+              List.of(10, 11),
+              null,
+              List.of(),
+              List.of(12, 13)),
+          IntStream.range(0, target.getValueCount())
+              .mapToObj(target::getObject)
+              .collect(Collectors.toList()));
+      assertEquals(7, delta.getDataVector().getValueCount());
+      assertEquals(6, source.getValueCount());
+    }
+    assertEquals(0, allocator.getAllocatedMemory());
+  }
+
+  @ParameterizedTest
+  @EnumSource(
+      value = Types.MinorType.class,
+      names = {"VARCHAR", "LARGEVARCHAR", "LIST", "LARGELIST"})
+  public void testAppendToUnallocatedVector(Types.MinorType type) {
+    try (FieldVector delta =
+        type.getNewVector(
+            new Field("delta", FieldType.nullable(type.getType()), Collections.emptyList()),
+            allocator,
+            null)) {
+      switch (type) {
+        case VARCHAR:
+          ValueVectorDataPopulator.setVector((VarCharVector) delta, "alpha", null, "beta");
+          break;
+        case LARGEVARCHAR:
+          ValueVectorDataPopulator.setVector((LargeVarCharVector) delta, "alpha", null, "beta");
+          break;
+        case LIST:
+          ValueVectorDataPopulator.setVector((ListVector) delta, List.of(42), null, List.of());
+          break;
+        case LARGELIST:
+          ValueVectorDataPopulator.setVector((LargeListVector) delta, List.of(42), null, List.of());
+          break;
+        default:
+          throw new AssertionError(type);
+      }
+      try (FieldVector target = delta.getField().createVector(allocator)) {
+        VectorBatchAppender.batchAppend(target, delta);
+        assertEquals(
+            type == Types.MinorType.LIST || type == Types.MinorType.LARGELIST
+                ? Arrays.asList("[42]", null, "[]")
+                : Arrays.asList("alpha", null, "beta"),
+            IntStream.range(0, target.getValueCount())
+                .mapToObj(i -> target.isNull(i) ? null : target.getObject(i).toString())
+                .collect(Collectors.toList()));
+      }
+    }
+    assertEquals(0, allocator.getAllocatedMemory());
   }
 
   @Test
