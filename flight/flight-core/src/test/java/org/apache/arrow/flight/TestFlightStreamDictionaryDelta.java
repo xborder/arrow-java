@@ -34,6 +34,7 @@ import java.util.Map;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.NullVector;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -55,6 +56,40 @@ public class TestFlightStreamDictionaryDelta {
       new DictionaryEncoding(7, false, new ArrowType.Int(32, true));
   private static final Schema WIRE_SCHEMA = schema(ArrowType.Utf8.INSTANCE, ENCODING);
   private static final Schema MEMORY_SCHEMA = schema(new ArrowType.Int(32, true), ENCODING);
+
+  @Test
+  public void nullDictionaryDeltaAndReplacement() throws Exception {
+    try (TestStream incoming = new TestStream(schema(ArrowType.Null.INSTANCE, ENCODING), false)) {
+      final DictionaryProvider provider = incoming.stream.getDictionaryProvider();
+      assertEquals(MEMORY_SCHEMA, incoming.stream.getSchema());
+      incoming.nullDictionary(false, 1);
+      incoming.batch(0);
+      assertTrue(incoming.stream.next());
+      final List<String> captured = incoming.decode();
+      assertEquals(Collections.singletonList(null), captured);
+      assertEquals(Collections.singletonList(null), values(provider.lookup(7).getVector()));
+
+      incoming.nullDictionary(true, 0);
+      incoming.nullDictionary(true, 1);
+      incoming.batch(1);
+      assertTrue(incoming.stream.next());
+      assertEquals(Collections.singletonList(null), incoming.decode());
+      assertEquals(Arrays.asList(null, null), values(provider.lookup(7).getVector()));
+      assertSame(provider, incoming.stream.getDictionaryProvider());
+
+      incoming.nullDictionary(false, 1);
+      incoming.batch(0);
+      assertTrue(incoming.stream.next());
+      assertEquals(Collections.singletonList(null), incoming.decode());
+      assertEquals(Collections.singletonList(null), values(provider.lookup(7).getVector()));
+      incoming.batch(1);
+      assertTrue(incoming.stream.next());
+      assertThrows(IllegalArgumentException.class, incoming::decode);
+      assertEquals(Collections.singletonList(null), captured);
+      incoming.observer.onCompleted();
+      assertFalse(incoming.stream.next());
+    }
+  }
 
   @Test
   public void dictionaryDeltaAndReplacement() throws Exception {
@@ -302,6 +337,16 @@ public class TestFlightStreamDictionaryDelta {
         push(
             new ArrowMessage(
                 new VectorUnloader(root).getRecordBatch(), null, false, IpcOption.DEFAULT));
+      }
+    }
+
+    private void nullDictionary(boolean delta, int count) throws Exception {
+      try (VectorSchemaRoot root = VectorSchemaRoot.of(new NullVector("dictionary"))) {
+        root.setRowCount(count);
+        try (ArrowDictionaryBatch batch =
+            new ArrowDictionaryBatch(7, new VectorUnloader(root).getRecordBatch(), delta)) {
+          push(new ArrowMessage(batch, IpcOption.DEFAULT));
+        }
       }
     }
 

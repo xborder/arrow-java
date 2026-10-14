@@ -736,6 +736,8 @@ public class VectorAppender implements VectorVisitor<ValueVector, Void> {
     Preconditions.checkArgument(
         targetVector.getField().getType().equals(deltaVector.getField().getType()),
         "The targetVector to append must have the same type as the targetVector being appended");
+    targetVector.setValueCount(
+        Math.addExact(targetVector.getValueCount(), deltaVector.getValueCount()));
     return targetVector;
   }
 
