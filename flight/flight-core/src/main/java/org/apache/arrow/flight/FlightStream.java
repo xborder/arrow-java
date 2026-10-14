@@ -46,6 +46,7 @@ import org.apache.arrow.vector.types.MetadataVersion;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.DictionaryUtility;
+import org.apache.arrow.vector.util.VectorBatchAppender;
 import org.apache.arrow.vector.validate.MetadataV4UnionChecker;
 
 /** An adaptor between protobuf streams and flight data streams. */
@@ -291,13 +292,21 @@ public class FlightStream implements AutoCloseable {
               }
 
               final FieldVector vector = dictionary.getVector();
-              final VectorSchemaRoot dictionaryRoot =
-                  new VectorSchemaRoot(
-                      Collections.singletonList(vector.getField()),
-                      Collections.singletonList(vector),
-                      0);
-              final VectorLoader dictionaryLoader = new VectorLoader(dictionaryRoot);
-              dictionaryLoader.load(arb.getDictionary());
+              if (arb.isDelta()) {
+                try (FieldVector deltaVector = vector.getField().createVector(allocator)) {
+                  final VectorSchemaRoot deltaRoot = VectorSchemaRoot.of(deltaVector);
+                  new VectorLoader(deltaRoot).load(arb.getDictionary());
+                  VectorBatchAppender.batchAppend(vector, deltaVector);
+                }
+              } else {
+                final VectorSchemaRoot dictionaryRoot =
+                    new VectorSchemaRoot(
+                        Collections.singletonList(vector.getField()),
+                        Collections.singletonList(vector),
+                        0);
+                final VectorLoader dictionaryLoader = new VectorLoader(dictionaryRoot);
+                dictionaryLoader.load(arb.getDictionary());
+              }
             }
             return next();
           } else {
