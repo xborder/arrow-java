@@ -17,6 +17,7 @@
 package org.apache.arrow.vector.util;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -39,6 +40,7 @@ import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.LargeVarCharVector;
+import org.apache.arrow.vector.NullVector;
 import org.apache.arrow.vector.TestUtils;
 import org.apache.arrow.vector.ValueVector;
 import org.apache.arrow.vector.VarCharVector;
@@ -80,6 +82,67 @@ public class TestVectorAppender {
   @AfterEach
   public void shutdown() {
     allocator.close();
+  }
+
+  @Test
+  public void testAppendNullVector() {
+    try (NullVector target = new NullVector("target");
+        NullVector delta = new NullVector("delta", 2);
+        NullVector empty = new NullVector("empty")) {
+      VectorAppender appender = new VectorAppender(target);
+      assertSame(target, empty.accept(appender, null));
+      assertEquals(
+          Collections.emptyList(),
+          IntStream.range(0, target.getValueCount()).mapToObj(target::getObject).toList());
+      assertSame(target, delta.accept(appender, null));
+      assertEquals(
+          Arrays.asList(null, null),
+          IntStream.range(0, target.getValueCount()).mapToObj(target::getObject).toList());
+      VectorBatchAppender.batchAppend(target, empty, delta, delta);
+      assertEquals(
+          Arrays.asList(null, null, null, null, null, null),
+          IntStream.range(0, target.getValueCount()).mapToObj(target::getObject).toList());
+      assertEquals(
+          Arrays.asList(null, null),
+          IntStream.range(0, delta.getValueCount()).mapToObj(delta::getObject).toList());
+      assertEquals(0, allocator.getAllocatedMemory());
+    }
+  }
+
+  @Test
+  public void testAppendNullVectorTypeMismatch() {
+    try (NullVector nulls = new NullVector("nulls", 1);
+        IntVector integers = new IntVector("integers", allocator)) {
+      ValueVectorDataPopulator.setVector(integers, 42);
+      assertThrows(
+          IllegalArgumentException.class, () -> nulls.accept(new VectorAppender(integers), null));
+      assertThrows(
+          IllegalArgumentException.class, () -> integers.accept(new VectorAppender(nulls), null));
+      assertEquals(
+          Collections.singletonList(42),
+          IntStream.range(0, integers.getValueCount()).mapToObj(integers::getObject).toList());
+      assertEquals(
+          Collections.singletonList(null),
+          IntStream.range(0, nulls.getValueCount()).mapToObj(nulls::getObject).toList());
+    }
+    assertEquals(0, allocator.getAllocatedMemory());
+  }
+
+  @Test
+  public void testAppendNullVectorCountBoundary() {
+    try (NullVector target = new NullVector("target", Integer.MAX_VALUE - 1);
+        NullVector delta = new NullVector("delta", 1);
+        NullVector empty = new NullVector("empty")) {
+      VectorBatchAppender.batchAppend(target, delta, empty);
+      assertEquals(
+          List.of(Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE),
+          List.of(target.getValueCount(), target.getNullCount(), target.getValueCapacity()));
+      assertThrows(ArithmeticException.class, () -> VectorBatchAppender.batchAppend(target, delta));
+      assertEquals(
+          List.of(Integer.MAX_VALUE, 1, 0),
+          List.of(target.getValueCount(), delta.getValueCount(), empty.getValueCount()));
+      assertEquals(0, allocator.getAllocatedMemory());
+    }
   }
 
   @Test
