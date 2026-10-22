@@ -350,6 +350,7 @@ jobs:
   binaries:
     name: Binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs:
       - jni-linux
       - jni-macos
@@ -423,6 +424,7 @@ jobs:
     needs:
       - binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
@@ -474,6 +476,7 @@ jobs:
     needs:
       - docs
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -528,6 +531,7 @@ jobs:
     needs:
       - binaries
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -566,6 +570,7 @@ jobs:
       - docs
       - verify
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
