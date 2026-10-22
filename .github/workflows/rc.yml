@@ -19,11 +19,11 @@ name: RC
 on:
   push:
     branches:
-      - "**"
-      - "!dependabot/**"
+      - main
     tags:
       - "*-rc*"
   pull_request:
+  workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
 concurrency:
@@ -458,19 +458,8 @@ jobs:
           path: html.tar.gz
   publish-docs:
     name: Publish docs
-    # Run only when:
-    # * We push to a branch
-    # * If the target repository is apache/arrow-java:
-    #   * The target branch is main
-    # * Else (fork repositories):
-    #   * All branches
-    #   * We can preview the last pushed content
-    #     at https://${YOUR_GITHUB_ACCOUNT}.github.io/arrow-java/main/
-    if: >-
-      github.event_name == 'push' &&
-        github.ref_type == 'branch' &&
-        ((github.repository == 'apache/arrow-java' && github.ref_name == 'main') ||
-         github.repository != 'apache/arrow-java')
+    # Publish the main branch in both upstream and fork repositories.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs:
       - docs
     runs-on: ubuntu-latest
