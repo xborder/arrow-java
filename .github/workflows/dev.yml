@@ -20,8 +20,9 @@ name: Dev
 on:
   pull_request: {}
   push:
-    branches-ignore:
-      - dependabot/**
+    branches:
+      - main
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}
