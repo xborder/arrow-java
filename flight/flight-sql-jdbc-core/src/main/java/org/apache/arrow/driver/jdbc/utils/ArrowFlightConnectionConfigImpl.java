@@ -182,6 +182,11 @@ public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl 
     return ArrowFlightConnectionProperty.USE_CLIENT_CACHE.getBoolean(properties);
   }
 
+  /** Whether normal FlightInfo-producing operations use PollFlightInfo. */
+  public boolean usePollInfo() {
+    return ArrowFlightConnectionProperty.USE_POLL_INFO.getBoolean(properties);
+  }
+
   /**
    * Gets the {@link CallOption}s from this {@link ConnectionConfig}.
    *
@@ -267,6 +272,7 @@ public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl 
     CATALOG("catalog", null, Type.STRING, false),
     CONNECT_TIMEOUT_MILLIS("connectTimeoutMs", 10000, Type.NUMBER, false),
     USE_CLIENT_CACHE("useClientCache", true, Type.BOOLEAN, false),
+    USE_POLL_INFO("usePollInfo", true, Type.BOOLEAN, false),
 
     // OAuth configuration properties
     OAUTH_FLOW("oauth.flow", null, Type.STRING, false),

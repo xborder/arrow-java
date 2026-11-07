@@ -21,13 +21,20 @@ import static org.apache.arrow.driver.jdbc.utils.FlightEndpointDataQueue.createN
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLTimeoutException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 import org.apache.arrow.driver.jdbc.client.CloseableEndpointStreamPair;
+import org.apache.arrow.driver.jdbc.client.PollInfoOperation;
 import org.apache.arrow.driver.jdbc.utils.FlightEndpointDataQueue;
 import org.apache.arrow.driver.jdbc.utils.VectorSchemaRootTransformer;
+import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
+import org.apache.arrow.flight.FlightStatusCode;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -46,7 +53,9 @@ public final class ArrowFlightJdbcFlightStreamResultSet
     extends ArrowFlightJdbcVectorSchemaRootResultSet {
 
   private final ArrowFlightConnection connection;
-  private final FlightInfo flightInfo;
+  private FlightInfo flightInfo;
+  private final PollInfoOperation pollInfoOperation;
+  private int consumedEndpointCount;
   private CloseableEndpointStreamPair currentEndpointData;
   private FlightEndpointDataQueue flightEndpointDataQueue;
 
@@ -67,7 +76,21 @@ public final class ArrowFlightJdbcFlightStreamResultSet
       throws SQLException {
     super(statement, state, signature, resultSetMetaData, timeZone, firstFrame);
     this.connection = (ArrowFlightConnection) statement.connection;
-    this.flightInfo = ((ArrowFlightInfoStatement) statement).executeFlightInfoQuery();
+    try {
+      this.flightInfo = ((ArrowFlightInfoStatement) statement).executeFlightInfoQuery();
+      this.pollInfoOperation = activePollInfoOperation(statement);
+    } catch (FlightRuntimeException e) {
+      if (e.status().code() != FlightStatusCode.TIMED_OUT) {
+        throw e;
+      }
+      final SQLTimeoutException jdbcTimeout =
+          new SQLTimeoutException(
+              String.format(
+                  "Query timed out after %d %s",
+                  statement.getQueryTimeout(), TimeUnit.SECONDS));
+      jdbcTimeout.initCause(e);
+      throw jdbcTimeout;
+    }
   }
 
   /** Private constructor for fromFlightInfo. */
@@ -83,6 +106,7 @@ public final class ArrowFlightJdbcFlightStreamResultSet
     super(null, state, signature, resultSetMetaData, timeZone, firstFrame);
     this.connection = connection;
     this.flightInfo = flightInfo;
+    this.pollInfoOperation = null;
     this.id = connection.getNewMetadataResultSetId(this);
   }
 
@@ -143,7 +167,7 @@ public final class ArrowFlightJdbcFlightStreamResultSet
 
   private void populateData() throws SQLException {
     loadNewQueue();
-    flightEndpointDataQueue.enqueue(connection.getClientHandler().getStreams(flightInfo));
+    enqueueNewEndpoints(flightInfo);
     loadNewFlightStream();
 
     // Ownership of the root will be passed onto the cursor.
@@ -176,7 +200,9 @@ public final class ArrowFlightJdbcFlightStreamResultSet
   @Override
   public boolean next() throws SQLException {
     if (currentVectorSchemaRoot == null) {
-      return false;
+      if (!loadNextPublishedEndpoint()) {
+        return false;
+      }
     }
     while (true) {
       final boolean hasNext = super.next();
@@ -209,6 +235,10 @@ public final class ArrowFlightJdbcFlightStreamResultSet
         continue;
       }
 
+      if (loadNextPublishedEndpoint()) {
+        continue;
+      }
+
       if (statement != null && statement.isCloseOnCompletion()) {
         statement.close();
       }
@@ -219,6 +249,10 @@ public final class ArrowFlightJdbcFlightStreamResultSet
 
   @Override
   protected void cancel() {
+    if (pollInfoOperation != null && !pollInfoOperation.isComplete()) {
+      pollInfoOperation.cancel();
+    }
+    finishPollInfoOperation();
     super.cancel();
     final CloseableEndpointStreamPair currentEndpoint = this.currentEndpointData;
     if (currentEndpoint != null) {
@@ -253,6 +287,10 @@ public final class ArrowFlightJdbcFlightStreamResultSet
     } catch (final Exception e) {
       throw new RuntimeException(e);
     } finally {
+      if (pollInfoOperation != null && !pollInfoOperation.isComplete()) {
+        pollInfoOperation.cancel();
+      }
+      finishPollInfoOperation();
       super.close();
     }
   }
@@ -260,12 +298,123 @@ public final class ArrowFlightJdbcFlightStreamResultSet
   private CloseableEndpointStreamPair getNextEndpointStream(final boolean canTimeout)
       throws SQLException {
     if (canTimeout) {
-      final int statementTimeout = statement != null ? statement.getQueryTimeout() : 0;
-      return statementTimeout != 0
-          ? flightEndpointDataQueue.next(statementTimeout, TimeUnit.SECONDS)
-          : flightEndpointDataQueue.next();
+      final long remainingTimeoutNanos = remainingQueryTimeoutNanos();
+      if (remainingTimeoutNanos != Long.MAX_VALUE) {
+        if (remainingTimeoutNanos <= 0) {
+          throw new SQLTimeoutException("Query timed out before retrieving its first endpoint");
+        }
+        try {
+          return flightEndpointDataQueue.next(remainingTimeoutNanos, TimeUnit.NANOSECONDS);
+        } catch (SQLTimeoutException e) {
+          if (statement != null && e.getMessage().startsWith("Query timed out after")) {
+            final SQLTimeoutException jdbcTimeout =
+                new SQLTimeoutException(
+                    String.format(
+                        "Query timed out after %d %s",
+                        statement.getQueryTimeout(), TimeUnit.SECONDS));
+            jdbcTimeout.initCause(e);
+            throw jdbcTimeout;
+          }
+          throw e;
+        }
+      }
     } else {
       return flightEndpointDataQueue.next();
+    }
+    return flightEndpointDataQueue.next();
+  }
+
+  private long remainingQueryTimeoutNanos() throws SQLException {
+    if (statement instanceof ArrowFlightStatement) {
+      return ((ArrowFlightStatement) statement).remainingQueryTimeoutNanos();
+    }
+    if (statement instanceof ArrowFlightPreparedStatement) {
+      return ((ArrowFlightPreparedStatement) statement).remainingQueryTimeoutNanos();
+    }
+    final int statementTimeout = statement != null ? statement.getQueryTimeout() : 0;
+    return statementTimeout > 0 ? TimeUnit.SECONDS.toNanos(statementTimeout) : Long.MAX_VALUE;
+  }
+
+  private void enqueueNewEndpoints(final FlightInfo updatedFlightInfo) throws SQLException {
+    final int updatedEndpointCount = updatedFlightInfo.getEndpoints().size();
+    if (updatedEndpointCount < consumedEndpointCount) {
+      throw new SQLException("PollInfo removed previously published endpoints");
+    }
+    final Schema updatedSchema = updatedFlightInfo.getSchemaOptional().orElse(schema);
+    if (schema != null && updatedSchema != null && !schema.equals(updatedSchema)) {
+      throw new SQLException("PollInfo changed the result schema");
+    }
+    if (updatedEndpointCount == consumedEndpointCount) {
+      flightInfo = updatedFlightInfo;
+      return;
+    }
+    final List<FlightEndpoint> appendedEndpoints =
+        new ArrayList<>(
+            updatedFlightInfo
+                .getEndpoints()
+                .subList(consumedEndpointCount, updatedEndpointCount));
+    final FlightInfo appendedInfo =
+        new FlightInfo(
+            updatedSchema,
+            updatedFlightInfo.getDescriptor(),
+            appendedEndpoints,
+            updatedFlightInfo.getBytes(),
+            updatedFlightInfo.getRecords());
+    flightEndpointDataQueue.enqueue(connection.getClientHandler().getStreams(appendedInfo));
+    consumedEndpointCount = updatedEndpointCount;
+    flightInfo = updatedFlightInfo;
+  }
+
+  private boolean loadNextPublishedEndpoint() throws SQLException {
+    if (pollInfoOperation == null || !pollInfoOperation.hasContinuation()) {
+      finishPollInfoOperation();
+      return false;
+    }
+    try {
+      enqueueNewEndpoints(pollInfoOperation.pollNextAvailable());
+      currentEndpointData = getNextEndpointStream(false);
+      if (currentEndpointData != null) {
+        populateDataForCurrentFlightStream();
+        return true;
+      }
+      finishPollInfoOperation();
+      return false;
+    } catch (FlightRuntimeException e) {
+      if (e.status().code() == FlightStatusCode.CANCELLED
+          || e.status().code() == FlightStatusCode.TIMED_OUT) {
+        pollInfoOperation.cancel();
+      } else {
+        pollInfoOperation.terminate();
+      }
+      finishPollInfoOperation();
+      if (e.status().code() == FlightStatusCode.TIMED_OUT) {
+        final SQLTimeoutException timeout =
+            new SQLTimeoutException(
+                String.format(
+                    "Query timed out after %d %s",
+                    statement.getQueryTimeout(), TimeUnit.SECONDS));
+        timeout.initCause(e);
+        throw timeout;
+      }
+      throw new SQLException("Continuation PollFlightInfo failed", e);
+    }
+  }
+
+  private static PollInfoOperation activePollInfoOperation(final AvaticaStatement statement) {
+    if (statement instanceof ArrowFlightStatement) {
+      return ((ArrowFlightStatement) statement).activePollInfoOperation();
+    }
+    if (statement instanceof ArrowFlightPreparedStatement) {
+      return ((ArrowFlightPreparedStatement) statement).activePollInfoOperation();
+    }
+    return null;
+  }
+
+  private void finishPollInfoOperation() {
+    if (statement instanceof ArrowFlightStatement) {
+      ((ArrowFlightStatement) statement).finishPollInfoOperation(pollInfoOperation);
+    } else if (statement instanceof ArrowFlightPreparedStatement) {
+      ((ArrowFlightPreparedStatement) statement).finishPollInfoOperation(pollInfoOperation);
     }
   }
 }

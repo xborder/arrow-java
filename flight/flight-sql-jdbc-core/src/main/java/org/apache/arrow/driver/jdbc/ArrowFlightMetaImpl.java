@@ -181,9 +181,12 @@ public class ArrowFlightMetaImpl extends MetaImpl {
         String.format("%s does not use frames.", this), AvaticaConnection.HELPER.unsupported());
   }
 
-  private PreparedStatement prepareForHandle(final String query, StatementHandle handle) {
+  private PreparedStatement prepareForHandle(
+      final String query, StatementHandle handle, final boolean directExecution) {
     final PreparedStatement preparedStatement =
-        ((ArrowFlightConnection) connection).getClientHandler().prepare(query);
+        directExecution
+            ? ((ArrowFlightConnection) connection).getClientHandler().prepareDirect(query)
+            : ((ArrowFlightConnection) connection).getClientHandler().prepare(query);
     handle.signature =
         newSignature(
             query,
@@ -198,7 +201,7 @@ public class ArrowFlightMetaImpl extends MetaImpl {
   public StatementHandle prepare(
       final ConnectionHandle connectionHandle, final String query, final long maxRowCount) {
     final StatementHandle handle = super.createStatement(connectionHandle);
-    prepareForHandle(query, handle);
+    prepareForHandle(query, handle, false);
     return handle;
   }
 
@@ -222,7 +225,7 @@ public class ArrowFlightMetaImpl extends MetaImpl {
       final PrepareCallback callback)
       throws NoSuchStatementException {
     try {
-      PreparedStatement preparedStatement = prepareForHandle(query, handle);
+      PreparedStatement preparedStatement = prepareForHandle(query, handle, true);
       final StatementType statementType = preparedStatement.getType();
 
       final long updateCount =

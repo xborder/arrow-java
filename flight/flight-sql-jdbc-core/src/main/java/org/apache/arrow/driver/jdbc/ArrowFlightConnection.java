@@ -126,6 +126,7 @@ public final class ArrowFlightConnection extends AvaticaConnection {
           .withCatalog(config.getCatalog())
           .withClientCache(config.useClientCache() ? new FlightClientCache() : null)
           .withConnectTimeout(config.getConnectTimeout())
+          .withPollInfo(config.usePollInfo())
           .withDriverVersion(driverVersion)
           .withOAuthConfiguration(config.getOauthConfiguration())
           .build();

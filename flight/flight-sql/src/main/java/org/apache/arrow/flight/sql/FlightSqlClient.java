@@ -106,6 +106,17 @@ public class FlightSqlClient implements AutoCloseable {
   }
 
   /**
+   * Resolve a descriptor to its final {@link FlightInfo}.
+   *
+   * <p>This protected hook lets integrations preserve all Flight SQL descriptor construction and
+   * prepared-parameter binding while changing how the descriptor is resolved. The default remains a
+   * single GetFlightInfo request.
+   */
+  protected FlightInfo getInfo(final FlightDescriptor descriptor, final CallOption... options) {
+    return client.getInfo(descriptor, options);
+  }
+
+  /**
    * Execute a query on the server.
    *
    * @param query The query to execute.
@@ -133,7 +144,7 @@ public class FlightSqlClient implements AutoCloseable {
     }
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -168,7 +179,7 @@ public class FlightSqlClient implements AutoCloseable {
     }
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /** Get the schema of the result set of a query. */
@@ -446,7 +457,7 @@ public class FlightSqlClient implements AutoCloseable {
     final CommandGetCatalogs.Builder builder = CommandGetCatalogs.newBuilder();
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -482,7 +493,7 @@ public class FlightSqlClient implements AutoCloseable {
 
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -563,7 +574,7 @@ public class FlightSqlClient implements AutoCloseable {
     builder.addAllInfo(info);
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -591,7 +602,7 @@ public class FlightSqlClient implements AutoCloseable {
 
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -605,7 +616,7 @@ public class FlightSqlClient implements AutoCloseable {
 
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -658,7 +669,7 @@ public class FlightSqlClient implements AutoCloseable {
 
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -698,7 +709,7 @@ public class FlightSqlClient implements AutoCloseable {
 
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -738,7 +749,7 @@ public class FlightSqlClient implements AutoCloseable {
 
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -777,7 +788,7 @@ public class FlightSqlClient implements AutoCloseable {
 
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -830,7 +841,7 @@ public class FlightSqlClient implements AutoCloseable {
 
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -855,7 +866,7 @@ public class FlightSqlClient implements AutoCloseable {
     final CommandGetTableTypes.Builder builder = CommandGetTableTypes.newBuilder();
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return getInfo(descriptor, options);
   }
 
   /**
@@ -895,6 +906,7 @@ public class FlightSqlClient implements AutoCloseable {
       builder.setTransactionId(ByteString.copyFrom(transaction.getTransactionId()));
     }
     return new PreparedStatement(
+        this,
         client,
         new Action(
             FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_STATEMENT.getType(),
@@ -933,6 +945,7 @@ public class FlightSqlClient implements AutoCloseable {
       builder.setTransactionId(ByteString.copyFrom(transaction.getTransactionId()));
     }
     return new PreparedStatement(
+        this,
         client,
         new Action(
             FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_SUBSTRAIT_PLAN.getType(),
@@ -1215,6 +1228,7 @@ public class FlightSqlClient implements AutoCloseable {
 
   /** Helper class to encapsulate Flight SQL prepared statement logic. */
   public static class PreparedStatement implements AutoCloseable {
+    private final FlightSqlClient parent;
     private final FlightClient client;
     private final ActionCreatePreparedStatementResult preparedStatementResult;
     private ByteString handle;
@@ -1223,7 +1237,9 @@ public class FlightSqlClient implements AutoCloseable {
     private Schema resultSetSchema;
     private Schema parameterSchema;
 
-    PreparedStatement(FlightClient client, Action action, CallOption... options) {
+    PreparedStatement(
+        FlightSqlClient parent, FlightClient client, Action action, CallOption... options) {
+      this.parent = parent;
       this.client = client;
 
       final Iterator<Result> preparedStatementResults = client.doAction(action, options);
@@ -1376,7 +1392,7 @@ public class FlightSqlClient implements AutoCloseable {
         }
       }
 
-      return client.getInfo(descriptor, options);
+      return parent.getInfo(descriptor, options);
     }
 
     private SyncPutListener putParameters(FlightDescriptor descriptor, CallOption... options) {
