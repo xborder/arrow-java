@@ -39,6 +39,7 @@ import java.util.List;
 import java.util.TimeZone;
 import org.apache.arrow.driver.jdbc.utils.CoreMockedSqlProducers;
 import org.apache.arrow.driver.jdbc.utils.MockFlightSqlProducer;
+import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.sql.FlightSqlUtils;
 import org.apache.arrow.memory.BufferAllocator;
@@ -172,6 +173,42 @@ public class ArrowFlightPreparedStatementTest {
             () -> connection.prepareStatement("SELECT * FROM unregistered_table"));
 
     assertThat(exception.getCause(), instanceOf(FlightRuntimeException.class));
+  }
+
+  @Test
+  public void testPreparedStatementIsClosedWhenSignatureBuildingFails() {
+    final String query = "UPDATE unsupported_parameter_type";
+    final Schema parameterSchema =
+        new Schema(Collections.singletonList(Field.nullable("", ArrowType.ListView.INSTANCE)));
+    PRODUCER.addUpdateQuery(query, 1);
+    PRODUCER.addExpectedParameters(query, parameterSchema, Collections.emptyList());
+    PRODUCER.setClosePreparedStatementFailure(CallStatus.INTERNAL.withDescription("Close failed"));
+
+    try {
+      final SQLException exception =
+          assertThrows(SQLException.class, () -> connection.prepareStatement(query));
+      Throwable buildFailure = exception;
+      while (buildFailure != null && !(buildFailure instanceof UnsupportedOperationException)) {
+        buildFailure = buildFailure.getCause();
+      }
+
+      assertThat(buildFailure, instanceOf(UnsupportedOperationException.class));
+      assertEquals(1, buildFailure.getSuppressed().length);
+      assertThat(buildFailure.getSuppressed()[0], instanceOf(FlightRuntimeException.class));
+      assertTrue(buildFailure.getSuppressed()[0].getMessage().contains("Close failed"));
+      assertEquals(
+          1,
+          PRODUCER
+              .getActionTypeCounter()
+              .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_STATEMENT.getType(), 0));
+      assertEquals(
+          1,
+          PRODUCER
+              .getActionTypeCounter()
+              .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CLOSE_PREPARED_STATEMENT.getType(), 0));
+    } finally {
+      PRODUCER.setClosePreparedStatementFailure(null);
+    }
   }
 
   @Test

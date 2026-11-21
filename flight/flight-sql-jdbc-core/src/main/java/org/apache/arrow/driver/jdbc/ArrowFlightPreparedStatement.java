@@ -253,26 +253,37 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
       } catch (final FlightRuntimeException e) {
         throw new SQLException(e.getMessage(), e);
       }
-      final Signature signature =
-          ArrowFlightMetaImpl.buildSignature(
-              query,
-              preparedStatement.getDataSetSchema(),
-              preparedStatement.getParameterSchema(),
-              preparedStatement.isUpdate());
+      try {
+        final Signature signature =
+            ArrowFlightMetaImpl.buildSignature(
+                query,
+                preparedStatement.getDataSetSchema(),
+                preparedStatement.getParameterSchema(),
+                preparedStatement.isUpdate());
 
-      final ArrowFlightPreparedStatement statement =
-          new ArrowFlightPreparedStatement(
-              connection,
-              generateHandle ? null : handle,
-              signature,
-              preparedStatement,
-              resultSetType,
-              resultSetConcurrency,
-              resultSetHoldability);
-      if (generateHandle) {
-        connection.registerStatementOwner(statement);
+        final ArrowFlightPreparedStatement statement =
+            new ArrowFlightPreparedStatement(
+                connection,
+                generateHandle ? null : handle,
+                signature,
+                preparedStatement,
+                resultSetType,
+                resultSetConcurrency,
+                resultSetHoldability);
+        if (generateHandle) {
+          connection.registerStatementOwner(statement);
+        }
+        return statement;
+      } catch (final SQLException | RuntimeException | Error buildFailure) {
+        try {
+          preparedStatement.close();
+        } catch (final RuntimeException | Error closeFailure) {
+          if (closeFailure != buildFailure) {
+            buildFailure.addSuppressed(closeFailure);
+          }
+        }
+        throw buildFailure;
       }
-      return statement;
     }
   }
 }
