@@ -93,7 +93,18 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
             .withQuery(query)
             .withExistingStatement(this)
             .build();
-    closePreparedResources();
+    try {
+      closePreparedResources();
+    } catch (final RuntimeException closeFailure) {
+      try {
+        replacement.closePreparedResources();
+      } catch (final RuntimeException replacementCloseFailure) {
+        if (replacementCloseFailure != closeFailure) {
+          closeFailure.addSuppressed(replacementCloseFailure);
+        }
+      }
+      throw closeFailure;
+    }
     return replacement.prepareAndExecuteInternal(callback);
   }
 

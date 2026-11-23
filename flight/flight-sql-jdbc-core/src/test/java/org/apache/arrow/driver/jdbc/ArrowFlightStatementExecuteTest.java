@@ -198,6 +198,37 @@ public class ArrowFlightStatementExecuteTest {
   }
 
   @Test
+  public void testExecuteAttemptsToCloseReplacementWhenPreviousCloseFails() throws SQLException {
+    PRODUCER.clearActionTypeCounter();
+    assertThat(statement.execute(SAMPLE_QUERY_CMD), is(true));
+    PRODUCER.setClosePreparedStatementFailure(
+        CallStatus.INTERNAL.withDescription("Prepared statement close failed"));
+
+    try {
+      final SQLException exception =
+          assertThrows(SQLException.class, () -> statement.execute(SAMPLE_QUERY_CMD));
+
+      assertThat(exception.getCause(), instanceOf(FlightRuntimeException.class));
+      final FlightRuntimeException closeFailure = (FlightRuntimeException) exception.getCause();
+      assertThat(
+          closeFailure.status().description(), containsString("Prepared statement close failed"));
+      assertThat(closeFailure.getSuppressed().length, is(1));
+      assertThat(
+          PRODUCER
+              .getActionTypeCounter()
+              .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CREATE_PREPARED_STATEMENT.getType(), 0),
+          is(2));
+      assertThat(
+          PRODUCER
+              .getActionTypeCounter()
+              .getOrDefault(FlightSqlUtils.FLIGHT_SQL_CLOSE_PREPARED_STATEMENT.getType(), 0),
+          is(2));
+    } finally {
+      PRODUCER.setClosePreparedStatementFailure(null);
+    }
+  }
+
+  @Test
   public void testExecutePrepareFailurePreservesServerError() {
     final SQLException exception =
         assertThrows(
