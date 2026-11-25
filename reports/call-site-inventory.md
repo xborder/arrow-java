@@ -1,5 +1,7 @@
 # Arrow Java FlightInfo call-site inventory
 
+> **2026-11-25:** this report describes the POC at base `91b4a2ca4`. After the rebase onto upstream `main` (`10c55b9c8`), the `prepareDirect` path is gone, because upstream GH-62 already sends `CommandStatementQuery` for direct `executeQuery`, and the opt-out direct path now uses `CommandStatementQuery`. For the current mapping, re-validation results and the production go/no-go, see [`production-recommendation.md`](production-recommendation.md).
+
 Baseline: Apache Arrow Java `91b4a2ca418ecb47cb8871d97588b19444337eb4`. The baseline `FlightSqlClient` had 14 `FlightClient.getInfo` call shapes representing 13 distinct Flight SQL command families; the two XDBC overloads share one wire command family. Schema-only `getSchema` calls, updates/ingest, actions, `DoPut`, and `DoGet` are not FlightInfo-producing call sites.
 
 The POC routes all 13 families through `FlightSqlClient.getInfo(FlightDescriptor, CallOption...)`. The default hook still makes one `GetFlightInfo` call. JDBC installs a polling subclass that can retain continuation state and append newly published endpoints to the existing ResultSet on demand.

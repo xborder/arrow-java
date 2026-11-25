@@ -1,5 +1,7 @@
 # BDX-645 Arrow Java JDBC PollInfo feasibility report
 
+> **2026-11-25:** this report describes the POC at base `91b4a2ca4`. After the rebase onto upstream `main` (`10c55b9c8`), the `prepareDirect` path is gone, because upstream GH-62 already sends `CommandStatementQuery` for direct `executeQuery`, and the opt-out direct path now uses `CommandStatementQuery`. For the current mapping, re-validation results and the production go/no-go, see [`production-recommendation.md`](production-recommendation.md).
+
 ## Verdict
 
 **Feasible with documented limitations**
