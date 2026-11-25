@@ -91,8 +91,7 @@ public final class ArrowFlightJdbcFlightStreamResultSet
       final SQLTimeoutException jdbcTimeout =
           new SQLTimeoutException(
               String.format(
-                  "Query timed out after %d %s",
-                  statement.getQueryTimeout(), TimeUnit.SECONDS));
+                  "Query timed out after %d %s", statement.getQueryTimeout(), TimeUnit.SECONDS));
       jdbcTimeout.initCause(e);
       throw jdbcTimeout;
     }
@@ -417,9 +416,7 @@ public final class ArrowFlightJdbcFlightStreamResultSet
     }
     final List<FlightEndpoint> appendedEndpoints =
         new ArrayList<>(
-            updatedFlightInfo
-                .getEndpoints()
-                .subList(consumedEndpointCount, updatedEndpointCount));
+            updatedFlightInfo.getEndpoints().subList(consumedEndpointCount, updatedEndpointCount));
     final FlightInfo appendedInfo =
         new FlightInfo(
             updatedSchema,
@@ -462,8 +459,7 @@ public final class ArrowFlightJdbcFlightStreamResultSet
         final SQLTimeoutException timeout =
             new SQLTimeoutException(
                 String.format(
-                    "Query timed out after %d %s",
-                    statement.getQueryTimeout(), TimeUnit.SECONDS));
+                    "Query timed out after %d %s", statement.getQueryTimeout(), TimeUnit.SECONDS));
         timeout.initCause(e);
         throw timeout;
       }

@@ -417,8 +417,13 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
      */
     FlightInfo executeQuery() throws SQLException;
 
-    /** Execute using a statement-owned timeout/cancellation operation. */
-    FlightInfo executeQuery(PollInfoOperation operation) throws SQLException;
+    /**
+     * Execute using a statement-owned timeout/cancellation operation. Implementations that do not
+     * support PollInfo fall back to {@link #executeQuery()}.
+     */
+    default FlightInfo executeQuery(PollInfoOperation operation) throws SQLException {
+      return executeQuery();
+    }
 
     /**
      * Executes a {@link StatementType#UPDATE} query.
@@ -788,8 +793,7 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
       org.apache.arrow.flight.FlightDescriptor descriptor = originalDescriptor;
       boolean initialPoll = true;
       operation.configure(
-          descriptorForPoll ->
-              client.pollInfo(descriptorForPoll, operation.options(options)),
+          descriptorForPoll -> client.pollInfo(descriptorForPoll, operation.options(options)),
           () -> cancelFlightInfoBestEffort(operation, options));
       try {
         while (true) {
@@ -807,8 +811,7 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
         if (initialPoll && e.status().code() == FlightStatusCode.UNIMPLEMENTED) {
           unsupportedFamilies.add(family);
           final FlightInfo flightInfo =
-              operation.call(
-                  () -> client.getInfo(originalDescriptor, operation.options(options)));
+              operation.call(() -> client.getInfo(originalDescriptor, operation.options(options)));
           operation.complete(flightInfo);
           return flightInfo;
         }

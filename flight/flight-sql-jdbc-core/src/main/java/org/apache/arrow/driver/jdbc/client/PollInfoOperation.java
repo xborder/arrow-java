@@ -110,8 +110,7 @@ public final class PollInfoOperation implements AutoCloseable {
   }
 
   void configure(
-      final Function<FlightDescriptor, PollInfo> poller,
-      final Runnable cancelFlightInfo) {
+      final Function<FlightDescriptor, PollInfo> poller, final Runnable cancelFlightInfo) {
     this.poller = poller;
     this.cancelFlightInfo = cancelFlightInfo;
   }
@@ -216,8 +215,7 @@ public final class PollInfoOperation implements AutoCloseable {
     return flightInfo == null ? 0 : flightInfo.getEndpoints().size();
   }
 
-  private static void validateAppendOnly(
-      final FlightInfo previous, final FlightInfo current) {
+  private static void validateAppendOnly(final FlightInfo previous, final FlightInfo current) {
     if (previous == null) {
       return;
     }

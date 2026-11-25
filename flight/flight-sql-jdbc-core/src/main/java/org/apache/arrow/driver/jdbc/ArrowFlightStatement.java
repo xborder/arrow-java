@@ -190,7 +190,8 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   }
 
   private ArrowFlightPreparedStatement preparedDelegate() {
-    final AvaticaStatement current = ((ArrowFlightConnection) connection).statementMap.get(handle.id);
+    final AvaticaStatement current =
+        ((ArrowFlightConnection) connection).statementMap.get(handle.id);
     return current instanceof ArrowFlightPreparedStatement
         ? (ArrowFlightPreparedStatement) current
         : null;
