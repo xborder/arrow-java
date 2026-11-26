@@ -88,11 +88,24 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
       final PrepareCallback callback)
       throws SQLException {
 
-    return ArrowFlightPreparedStatement.builder(getConnection())
-        .withQuery(query)
-        .withExistingStatement(this)
-        .build()
-        .prepareAndExecuteInternal(callback);
+    final ArrowFlightPreparedStatement replacement =
+        ArrowFlightPreparedStatement.builder(getConnection())
+            .withQuery(query)
+            .withExistingStatement(this)
+            .build();
+    try {
+      closePreparedResources();
+    } catch (final RuntimeException closeFailure) {
+      try {
+        replacement.closePreparedResources();
+      } catch (final RuntimeException replacementCloseFailure) {
+        if (replacementCloseFailure != closeFailure) {
+          closeFailure.addSuppressed(replacementCloseFailure);
+        }
+      }
+      throw closeFailure;
+    }
+    return replacement.prepareAndExecuteInternal(callback);
   }
 
   Schema getDataSetSchema() {
