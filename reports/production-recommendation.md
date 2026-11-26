@@ -12,7 +12,7 @@ The branch has been rebased onto current upstream `main` (see "Rebase onto upstr
 
 1. **The public API surface is accidental.** The POC adds a protected `FlightSqlClient.getInfo(FlightDescriptor, CallOption...)` in the published `flight-sql` artifact. That method can collide with subclasses that already exist downstream. It also adds a public `PollInfoOperation` and public handler and builder methods in `flight-sql-jdbc-core`. All of this needs an intentional design and an upstream Apache discussion before it lands.
 
-Contract item 12 (a delay between answers that add nothing) was missing from the first POC. It is now implemented: both the background poller and the reader's own polling wait 100 ms after such an answer, doubling up to `pollInfoMaxBackoffMs` (default 5000), never past the deadline. Cancel and close end the wait.
+Contract item 12 (a delay between answers that add nothing) was missing from the first POC. It is now implemented: the poller waits 100 ms after such an answer, doubling up to `pollInfoMaxBackoffMs` (default 5000), never past the deadline. Cancel and close end the wait.
 
 ## Documented limitations (behavioral)
 
@@ -21,7 +21,7 @@ Contract item 12 (a delay between answers that add nothing) was missing from the
 - **CancelFlightInfo needs a payload.** Best-effort `CancelFlightInfo` is only possible after at least one `PollInfo` has returned a `FlightInfo`. Cancelling a blocked initial poll terminates the RPC but sends no server-side cancel.
 - **Cleanup is synchronous.** The cancel cleanup call is bounded to one second, but it runs on the caller's thread. A slow server can delay the delivery of a timeout or cancel by up to that second.
 - **The capability cache is scoped to the handler.** Unsupported families are cached per `ArrowFlightSqlClientHandler`, keyed by Flight SQL command `type_url`. Pooled or reused physical connections have not been tested.
-- **Poll-ahead uses threads per connection.** Each connection can start up to `pollInfoPollerThreads` (default 4) daemon poller threads. When they are all busy, a new result falls back to polling inside `next()`. Several results sharing one pool are covered by unit tests, not by the model.
+- **Poll-ahead uses threads per connection.** Each connection can start up to `pollInfoPollerThreads` (default 4) daemon poller threads. When they are all busy, a new result's poller runs inline on the application's thread inside `next()` until a pool thread is free. Several results sharing one pool are covered by unit tests, not by the model.
 - **The opt-out name differs from the ticket.** The ticket suggested `usePollFlightInfo=false`; the POC implements `usePollInfo=false`. Pick one name before release and document it.
 
 ## GetFlightInfo call-site coverage
@@ -72,11 +72,11 @@ The first POC polled the next continuation only after the application had read e
 - Backoff as described above.
 - Fail fast: a failed continuation closes every stream, drops buffered batches, and makes the next `next()` throw, with the existing exception mapping.
 - Cancel, the deadline, and closing an unfinished result stop the poller and send `CancelFlightInfo` once.
-- `pollInfoPrefetch=0`, or a busy poller pool, keeps the first POC's behavior (with backoff). A first answer that is already complete opens every endpoint at once, as before.
+- Every result with a continuation has a poller. If the poller pool is busy, the poller starts orphaned: the reader runs it inline when it would otherwise wait, and hands it back to the pool after an answer adds endpoints. The first POC's reader-side polling path was removed in `b19d8370a`. A first answer that is already complete opens every endpoint at once, as before.
 
 | Property | Default | Meaning |
 | --- | --- | --- |
-| `pollInfoPrefetch` | `-1` = `max(2, threadPoolSize)` | Most queued, unread endpoints. `0` keeps the first POC's behavior. |
+| `pollInfoPrefetch` | `-1` = `max(2, threadPoolSize)` | Most queued, unread endpoints. Must be `-1` or positive; `0` is rejected when the connection is created. |
 | `pollInfoPollerThreads` | `4` | Size of the connection's poller pool. |
 | `pollInfoMaxBackoffMs` | `5000` | Longest wait between answers that add nothing. |
 
@@ -84,11 +84,11 @@ The review set the prefetch default to `threadPoolSize`, but `threadPoolSize` de
 
 Verification:
 
-- **Model.** `formal/pollinfo-poll-ahead/PollAhead.tla`, checked with TLC 2.19 by `run.sh`: 22 checks match at 3 and 4 endpoints, including a broken variant for each rule. How to recheck after a change: `.claude/skills/verify-jdbc-poll-ahead/SKILL.md`.
+- **Model.** `formal/pollinfo-poll-ahead/PollAhead.tla`, checked with TLC 2.19 by `run.sh`: 23 checks match at 3 and 4 endpoints, including a broken variant for each rule. The poller may start on the pool or orphaned (pool busy), and both starts are checked. How to recheck after a change: `.claude/skills/verify-jdbc-poll-ahead/SKILL.md`.
 - **Bugs found before release.** The model found a hang after a rejected poller resume (`dadd45d8a`). A code review found a late slot release that made poll-ahead fall back to the first POC's timing, plus error, fallback and cancel edge cases (`4b831553c`). The tests found a raw `CANCELLED` error leaking from `next()` (`dadd45d8a`) and a lost `CancelFlightInfo` when the connection closed right after a deadline failure (`436156f29`).
-- **Tests.** `PollAheadTest` (30), `FlightEndpointDataQueueDeferredOpenTest` (24), `EndpointPollerTest` (1) and `PollBackoffTest` (6) against scripted mock servers, and `SharedServerPollAheadTest` (13) against the conformance server's poll-ahead scenarios (`burst`, `trickle`, `empty-answers`, `late-error-buffered`), which check the server's maximum concurrent streams, poll timing against held streams, backoff gaps and cancellation. Four existing tests that assert the first POC's exact request order now run with `pollInfoPrefetch=0`.
+- **Tests.** `PollAheadTest` (36 runs), `FlightEndpointDataQueueDeferredOpenTest` (26), `EndpointPollerTest` (1) and `PollBackoffTest` (6) against scripted mock servers, and `SharedServerPollAheadTest` (12) against the conformance server's poll-ahead scenarios (`burst`, `trickle`, `empty-answers`, `late-error-buffered`), which check the server's maximum concurrent streams, poll timing against held streams, backoff gaps and cancellation. Existing tests that asserted the first POC's exact request order now assert poll-ahead behavior, with answers held back where order matters.
 
-Not covered by the model: `executeQuery`'s first poll, the fallback path, and several results sharing one pool.
+Not covered by the model: `executeQuery`'s first poll, the `UNIMPLEMENTED` fallback, metadata, several results sharing one pool, and backoff timing.
 
 ## Rebase onto upstream main (2026-11-25)
 
@@ -150,7 +150,7 @@ formal/pollinfo-poll-ahead/run.sh && N=4 formal/pollinfo-poll-ahead/run.sh
 | Run | Result |
 | --- | --- |
 | Flight SQL suite | 97/97 |
-| JDBC core suite, shared-server tests enabled | 1,458 run, 0 failures, 49 skipped |
-| `SharedServerPollAheadTest` / `SharedServerPollInfoExecutionTest` | 13/13 and 11/11 |
+| JDBC core suite, shared-server tests enabled | 1,456 run, 0 failures, 49 skipped (after removing the first POC's path in `b19d8370a`) |
+| `SharedServerPollAheadTest` / `SharedServerPollInfoExecutionTest` | 12/12 and 11/11 |
 | `install` (Spotless, Checkstyle, `dependency:analyze`) | passes |
-| Model checks | all 22 match at N=3 and N=4 |
+| Model checks | all 23 match at N=3 and N=4 |

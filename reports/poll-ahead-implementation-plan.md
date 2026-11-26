@@ -1,5 +1,7 @@
 # BDX-645 JDBC poll-ahead: implementation plan
 
+> **Revision (2026-11-26).** The first POC's reader-side polling is removed (`b19d8370a`). Every progressive result with a continuation gets an `EndpointPoller`. A busy poller pool leaves the poller orphaned, and the reader runs it inline when it would otherwise wait. `pollInfoPrefetch` must be `-1` or positive. Behavior 2 and 9, the configuration table and U1/U2 below are updated to match.
+
 Goal: during progressive `PollFlightInfo` execution, poll continuations in the background while the application reads, without changing the JDBC API. The design was agreed in review and model-checked in `formal/pollinfo-poll-ahead/` (skill: `.claude/skills/verify-jdbc-poll-ahead/SKILL.md`). The implementation must match the model's **deferred-open** configuration (`EagerOpen = FALSE`).
 
 All paths below are relative to `flight/flight-sql-jdbc-core/src/main/java/org/apache/arrow/driver/jdbc/` unless shown in full.
@@ -7,7 +9,7 @@ All paths below are relative to `flight/flight-sql-jdbc-core/src/main/java/org/a
 ## Behavior
 
 1. `executeQuery` is unchanged. It polls until the first endpoint exists and returns the `ResultSet`.
-2. If a continuation is pending, the prefetch limit is above 0, and the poller pool accepts the task, the `ResultSet` hands the continuation to an `EndpointPoller`. Otherwise it keeps today's behavior: the reader polls inside `next()` when its queue is empty (the POC path, plus backoff).
+2. If a continuation is pending, the `ResultSet` hands it to an `EndpointPoller`. If the poller pool rejects the task, the poller starts orphaned: the reader runs it inline, through the queue's idle hook, when it would otherwise wait, and hands it back to the pool after an answer adds endpoints. There is no other polling path.
 3. The poller polls the held continuation once, in the execution's `PollInfoOperation` context (one deadline, one cancel). It checks append-only, queues only the appended endpoints, and continues with the next continuation.
 4. Backpressure:
    - The poller does not poll while queued, unread endpoints (opened-unread plus not-yet-opened) are at or above the limit. It pauses and holds no thread.
@@ -17,15 +19,15 @@ All paths below are relative to `flight/flight-sql-jdbc-core/src/main/java/org/a
 6. End of results: `next()` returns false only when the queue is empty, nothing is pending, and the poller has finished. The poller must mark itself finished in the same locked step that queues the final endpoints.
 7. Fail fast: a failed continuation poll records the failure, closes every open stream, drops pending endpoints and buffered batches, and makes the next `next()` throw. No `CancelFlightInfo` is needed, because the server already ended the query. The exception keeps today's mapping: `TIMED_OUT` becomes `SQLTimeoutException("Query timed out after N SECONDS")`; anything else becomes `SQLException("Continuation PollFlightInfo failed", cause)`.
 8. Cancel and close stop the poller. `Statement.cancel()`, the deadline and `ResultSet.close()` on an incomplete result cancel the operation context, end any open poll, send best-effort `CancelFlightInfo` once (existing `PollInfoOperation.cancel`), close the queue, and make the next `next()` throw "Statement canceled".
-9. Unlimited eager queue: a first answer that is already complete (no continuation) and `pollInfoPrefetch=0` both use the queue without an open limit, so every endpoint opens at once, as it always did. The limit applies only while a poller is running.
+9. Unlimited eager queue: a first answer that is already complete (no continuation) uses the queue without an open limit, so every endpoint opens at once, as it always did. The limit applies only while a poller exists.
 10. Metadata calls, `executeQuery`'s first poll, the `UNIMPLEMENTED` fallback, and `usePollInfo=false` are unchanged.
 
 ## Configuration (connection properties)
 
 | Property | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `pollInfoPrefetch` | number | `-1` = auto: `max(2, threadPoolSize)` | Most queued, unread endpoints. The poller polls only below it, and streams open only below it. `0` keeps the POC behavior (the reader polls when its queue is empty). |
-| `pollInfoPollerThreads` | number | `4` | Size of the connection's poller pool. When all threads are busy, a new result uses the `0` behavior. |
+| `pollInfoPrefetch` | number | `-1` = auto: `max(2, threadPoolSize)` | Most queued, unread endpoints. The poller polls only below it, and streams open only below it. Must be `-1` or positive; other values are rejected when the connection is created. |
+| `pollInfoPollerThreads` | number | `4` | Size of the connection's poller pool. When all threads are busy, a new result's poller runs inline on the reader until a pool thread is free. |
 | `pollInfoMaxBackoffMs` | number | `5000` | Longest wait between answers that add nothing. |
 
 Deviation from the review decision: the review set the prefetch default to `threadPoolSize`, but `threadPoolSize` defaults to 1. A limit of 1 never polls while an endpoint is being read, so the default is `max(2, threadPoolSize)`. Follow the naming and type conventions of the existing properties in `utils/ArrowFlightConnectionConfigImpl.java`. If they use a different suffix for durations, use theirs and record the name here.
@@ -47,7 +49,7 @@ Deviation from the review decision: the review set the prefetch default to `thre
   - An atomic `pauseIfFull()` for the poller and a resume callback fired when the unread count drops below the limit, all under one lock. Never hold that lock across a blocking `future.get()`, `take()`, or a network call.
 - `client/PollInfoOperation.java`:
   - A single-poll method for the poller: poll the held continuation once, `remember` the answer, and report whether it added endpoints.
-  - Keep `pollNextAvailable` for the fallback path, but add the same backoff between empty answers.
+  - ~~Keep `pollNextAvailable` for the fallback path~~ Removed in the revision, with the fallback path.
   - Keep `validateAppendOnly`.
 - New `EndpointPoller` (package `org.apache.arrow.driver.jdbc`, package-private), started by the result set.
   - States: running, polling, paused, backoff, finished, failed, stopped.
@@ -57,8 +59,8 @@ Deviation from the review decision: the review set the prefetch default to `thre
   - Create the queue with the limit and opener, and queue the first answer's endpoints through it, so deferred opening applies to the first answer too.
   - Start the poller, or fall back.
   - In poller mode, `next()` relies on the queue: `null` means done. Map a failure to the exceptions above.
-  - Keep the POC path for prefetch `0` or a rejected submit. Keep cancel and close semantics.
-- Keep every existing test green. If an existing test asserts the POC request order (`Poll, DoGet, Poll, DoGet`), run it with `pollInfoPrefetch=0` rather than deleting the assertion.
+  - A rejected start orphans the poller (revision; the POC path for prefetch `0` or a rejected submit was removed). Keep cancel and close semantics.
+- Keep every existing test green. Tests that asserted the POC request order (`Poll, DoGet, Poll, DoGet`) were rewritten in the revision to assert poll-ahead behavior, with answers gated where order matters.
 - Do not change the TLA+ model.
 
 ### U2. Unit tests (after U1)
@@ -74,8 +76,8 @@ Add to `flight/flight-sql-jdbc-core/src/test/java/org/apache/arrow/driver/jdbc/`
 7. Close of an unfinished result stops the poller and sends one `CancelFlightInfo`.
 8. No premature end: the final endpoints arrive in the done answer, and all rows are delivered.
 9. Continuations are sent once each and in order.
-10. `pollInfoPrefetch=0` keeps the exact POC order.
-11. Poller pool busy (`pollInfoPollerThreads=1`, two concurrent results): the second falls back, and both return correct rows.
+10. ~~`pollInfoPrefetch=0` keeps the exact POC order.~~ Revision: `pollInfoPrefetch=0` is rejected when the connection is created.
+11. Poller pool busy (`pollInfoPollerThreads=1`, two concurrent results): the second result's poller runs inline on the reader, is handed back to the pool once a thread is free, and both return correct rows.
 12. `FlightEndpointDataQueue` unit tests for deferred open, wait-for-more, fail, and close.
 
 ### U3. End-to-end tests against the conformance server (after U2 and the server additions)
