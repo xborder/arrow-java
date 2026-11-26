@@ -17,6 +17,8 @@
 package org.apache.arrow.driver.jdbc.client;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.protobuf.Any;
+import com.google.protobuf.InvalidProtocolBufferException;
 import io.grpc.ManagedChannel;
 import io.grpc.netty.NettyChannelBuilder;
 import io.netty.channel.ChannelOption;
@@ -33,6 +35,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import org.apache.arrow.driver.jdbc.client.oauth.OAuthConfiguration;
 import org.apache.arrow.driver.jdbc.client.oauth.OAuthCredentialWriter;
 import org.apache.arrow.driver.jdbc.client.oauth.OAuthTokenProvider;
@@ -41,6 +46,7 @@ import org.apache.arrow.driver.jdbc.client.utils.FlightClientCache;
 import org.apache.arrow.driver.jdbc.client.utils.FlightLocationQueue;
 import org.apache.arrow.flight.CallOption;
 import org.apache.arrow.flight.CallStatus;
+import org.apache.arrow.flight.CancelFlightInfoRequest;
 import org.apache.arrow.flight.CloseSessionRequest;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightClientMiddleware;
@@ -51,6 +57,7 @@ import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStatusCode;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.LocationSchemes;
+import org.apache.arrow.flight.PollInfo;
 import org.apache.arrow.flight.SessionOptionValueFactory;
 import org.apache.arrow.flight.SetSessionOptionsRequest;
 import org.apache.arrow.flight.SetSessionOptionsResult;
@@ -121,7 +128,12 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
       final @Nullable FlightClientCache flightClientCache) {
     final ArrowFlightSqlClientHandler handler =
         new ArrowFlightSqlClientHandler(
-            cacheKey, new FlightSqlClient(client), builder, options, catalog, flightClientCache);
+            cacheKey,
+            new PollingFlightSqlClient(client, builder.usePollInfo),
+            builder,
+            options,
+            catalog,
+            flightClientCache);
     handler.setSetCatalogInSessionIfPresent();
     return handler;
   }
@@ -149,111 +161,7 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
 
     try {
       for (FlightEndpoint endpoint : flightInfo.getEndpoints()) {
-        if (endpoint.getLocations().isEmpty()) {
-          // Create a stream using the current client only and do not close the client at
-          // the end.
-          endpoints.add(
-              new CloseableEndpointStreamPair(
-                  sqlClient.getStream(endpoint.getTicket(), getOptions()), null));
-        } else {
-          // Clone the builder and then set the new endpoint on it.
-
-          // GH-38574: Currently a new FlightClient will be made for each partition that
-          // returns a
-          // non-empty Location then disposed of. It may be better to cache clients
-          // because a server
-          // may report the same Locations. It would also be good to identify when the
-          // reported
-          // location
-          // is the same as the original connection's Location and skip creating a
-          // FlightClient in
-          // that scenario.
-          // Also copy the cache to the client so we can share a cache. Cache needs to
-          // cache
-          // negative attempts too.
-          List<Exception> exceptions = new ArrayList<>();
-          CloseableEndpointStreamPair stream = null;
-          FlightLocationQueue locations =
-              new FlightLocationQueue(flightClientCache, endpoint.getLocations());
-          while (locations.hasNext()) {
-            Location location = locations.next();
-            final URI endpointUri = location.getUri();
-            if (endpointUri.getScheme().equals(LocationSchemes.REUSE_CONNECTION)) {
-              stream =
-                  new CloseableEndpointStreamPair(
-                      sqlClient.getStream(endpoint.getTicket(), getOptions()), null);
-              break;
-            }
-            final boolean encryptEndpoint =
-                endpointUri.getScheme().equals(LocationSchemes.GRPC_TLS);
-            if (builder.useEncryption && !encryptEndpoint) {
-              exceptions.add(
-                  new SQLException(
-                      String.format(
-                          "Refusing to connect to endpoint location %s without encryption "
-                              + "because the connection to %s is encrypted.",
-                          endpointUri, builder.getLocation().getUri())));
-              continue;
-            }
-            final Builder builderForEndpoint =
-                new Builder(ArrowFlightSqlClientHandler.this.builder)
-                    .withHost(endpointUri.getHost())
-                    .withPort(endpointUri.getPort())
-                    .withEncryption(encryptEndpoint)
-                    .withHostnameOverride(builder.getHostnameOverrideForEndpoint(endpointUri))
-                    .withClientCache(flightClientCache)
-                    .withConnectTimeout(builder.connectTimeout);
-
-            ArrowFlightSqlClientHandler endpointHandler = null;
-            try {
-              endpointHandler = builderForEndpoint.build();
-              stream =
-                  new CloseableEndpointStreamPair(
-                      endpointHandler.sqlClient.getStream(
-                          endpoint.getTicket(), endpointHandler.getOptions()),
-                      endpointHandler.sqlClient);
-              // Make sure we actually get data from the server
-              stream.getStream().getSchema();
-            } catch (Exception ex) {
-              if (endpointHandler != null) {
-                // If the exception is related to connectivity, mark the client as a dud.
-                if (flightClientCache != null) {
-                  if (ex instanceof FlightRuntimeException
-                      && ((FlightRuntimeException) ex).status().code()
-                          == FlightStatusCode.UNAVAILABLE
-                      &&
-                      // IOException covers SocketException and Netty's (private)
-                      // AnnotatedSocketException
-                      // We are looking for things like "Network is unreachable"
-                      ex.getCause() instanceof IOException) {
-                    flightClientCache.markLocationAsDud(location.toString());
-                  }
-                }
-
-                AutoCloseables.close(endpointHandler);
-              }
-              exceptions.add(ex);
-              continue;
-            }
-
-            if (flightClientCache != null) {
-              flightClientCache.markLocationAsReachable(location.toString());
-            }
-            break;
-          }
-          if (stream != null) {
-            endpoints.add(stream);
-          } else if (exceptions.isEmpty()) {
-            // This should never happen...
-            throw new IllegalStateException("Could not connect to endpoint and no errors occurred");
-          } else {
-            Exception ex = exceptions.remove(0);
-            while (!exceptions.isEmpty()) {
-              ex.addSuppressed(exceptions.remove(exceptions.size() - 1));
-            }
-            throw ex;
-          }
-        }
+        endpoints.add(getStream(endpoint));
       }
     } catch (Exception outerException) {
       try {
@@ -271,12 +179,149 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
   }
 
   /**
+   * Opens a single DoGet stream for one endpoint, trying the endpoint's locations in order.
+   *
+   * @param endpoint The {@link FlightEndpoint} to read.
+   * @return the open stream; the caller owns and must close it.
+   */
+  public CloseableEndpointStreamPair getStream(final FlightEndpoint endpoint) throws SQLException {
+    try {
+      return openStream(endpoint);
+    } catch (SQLException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new SQLException(e);
+    }
+  }
+
+  private CloseableEndpointStreamPair openStream(final FlightEndpoint endpoint) throws Exception {
+    if (endpoint.getLocations().isEmpty()) {
+      // Create a stream using the current client only and do not close the client at
+      // the end.
+      return new CloseableEndpointStreamPair(
+          sqlClient.getStream(endpoint.getTicket(), getOptions()), null);
+    }
+    // Clone the builder and then set the new endpoint on it.
+
+    // GH-38574: Currently a new FlightClient will be made for each partition that
+    // returns a
+    // non-empty Location then disposed of. It may be better to cache clients
+    // because a server
+    // may report the same Locations. It would also be good to identify when the
+    // reported
+    // location
+    // is the same as the original connection's Location and skip creating a
+    // FlightClient in
+    // that scenario.
+    // Also copy the cache to the client so we can share a cache. Cache needs to
+    // cache
+    // negative attempts too.
+    List<Exception> exceptions = new ArrayList<>();
+    CloseableEndpointStreamPair stream = null;
+    FlightLocationQueue locations =
+        new FlightLocationQueue(flightClientCache, endpoint.getLocations());
+    while (locations.hasNext()) {
+      Location location = locations.next();
+      final URI endpointUri = location.getUri();
+      if (endpointUri.getScheme().equals(LocationSchemes.REUSE_CONNECTION)) {
+        stream =
+            new CloseableEndpointStreamPair(
+                sqlClient.getStream(endpoint.getTicket(), getOptions()), null);
+        break;
+      }
+      final boolean encryptEndpoint = endpointUri.getScheme().equals(LocationSchemes.GRPC_TLS);
+      if (builder.useEncryption && !encryptEndpoint) {
+        exceptions.add(
+            new SQLException(
+                String.format(
+                    "Refusing to connect to endpoint location %s without encryption "
+                        + "because the connection to %s is encrypted.",
+                    endpointUri, builder.getLocation().getUri())));
+        continue;
+      }
+      final Builder builderForEndpoint =
+          new Builder(ArrowFlightSqlClientHandler.this.builder)
+              .withHost(endpointUri.getHost())
+              .withPort(endpointUri.getPort())
+              .withEncryption(encryptEndpoint)
+              .withHostnameOverride(builder.getHostnameOverrideForEndpoint(endpointUri))
+              .withClientCache(flightClientCache)
+              .withConnectTimeout(builder.connectTimeout);
+
+      ArrowFlightSqlClientHandler endpointHandler = null;
+      try {
+        endpointHandler = builderForEndpoint.build();
+        stream =
+            new CloseableEndpointStreamPair(
+                endpointHandler.sqlClient.getStream(
+                    endpoint.getTicket(), endpointHandler.getOptions()),
+                endpointHandler.sqlClient);
+        // Make sure we actually get data from the server
+        stream.getStream().getSchema();
+      } catch (Exception ex) {
+        if (endpointHandler != null) {
+          // If the exception is related to connectivity, mark the client as a dud.
+          if (flightClientCache != null) {
+            if (ex instanceof FlightRuntimeException
+                && ((FlightRuntimeException) ex).status().code() == FlightStatusCode.UNAVAILABLE
+                &&
+                // IOException covers SocketException and Netty's (private)
+                // AnnotatedSocketException
+                // We are looking for things like "Network is unreachable"
+                ex.getCause() instanceof IOException) {
+              flightClientCache.markLocationAsDud(location.toString());
+            }
+          }
+
+          AutoCloseables.close(endpointHandler);
+        }
+        exceptions.add(ex);
+        continue;
+      }
+
+      if (flightClientCache != null) {
+        flightClientCache.markLocationAsReachable(location.toString());
+      }
+      break;
+    }
+    if (stream != null) {
+      return stream;
+    } else if (exceptions.isEmpty()) {
+      // This should never happen...
+      throw new IllegalStateException("Could not connect to endpoint and no errors occurred");
+    } else {
+      Exception ex = exceptions.remove(0);
+      while (!exceptions.isEmpty()) {
+        ex.addSuppressed(exceptions.remove(exceptions.size() - 1));
+      }
+      throw ex;
+    }
+  }
+
+  /**
    * Makes an RPC "getInfo" request based on the provided {@code query} object.
    *
    * @param query The query.
    * @return a {@code FlightStream} of results.
    */
   public FlightInfo getInfo(final String query) {
+    return sqlClient.execute(query, getOptions());
+  }
+
+  /**
+   * Executes {@code query} as a direct {@code CommandStatementQuery} within a statement-owned
+   * timeout/cancellation operation.
+   *
+   * @param query The query.
+   * @param operation The statement-owned PollInfo operation.
+   * @return the (possibly partial, when progressive) {@link FlightInfo}.
+   */
+  public FlightInfo getInfo(final String query, final PollInfoOperation operation) {
+    if (sqlClient instanceof PollingFlightSqlClient) {
+      final CallOption[] operationOptions = operation.options(getOptions());
+      return ((PollingFlightSqlClient) sqlClient)
+          .withOperation(operation, () -> sqlClient.execute(query, operationOptions));
+    }
     return sqlClient.execute(query, getOptions());
   }
 
@@ -389,6 +434,14 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
     FlightInfo executeQuery() throws SQLException;
 
     /**
+     * Execute using a statement-owned timeout/cancellation operation. Implementations that do not
+     * support PollInfo fall back to {@link #executeQuery()}.
+     */
+    default FlightInfo executeQuery(PollInfoOperation operation) throws SQLException {
+      return executeQuery();
+    }
+
+    /**
      * Executes a {@link StatementType#UPDATE} query.
      *
      * @return the number of rows affected.
@@ -482,6 +535,16 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
     return new PreparedStatement() {
       @Override
       public FlightInfo executeQuery() throws SQLException {
+        return preparedStatement.execute(getOptions());
+      }
+
+      @Override
+      public FlightInfo executeQuery(final PollInfoOperation operation) throws SQLException {
+        if (sqlClient instanceof PollingFlightSqlClient) {
+          final CallOption[] operationOptions = operation.options(getOptions());
+          return ((PollingFlightSqlClient) sqlClient)
+              .withOperation(operation, () -> preparedStatement.execute(operationOptions));
+        }
         return preparedStatement.execute(getOptions());
       }
 
@@ -681,6 +744,135 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
         getOptions());
   }
 
+  /** Flight SQL client that resolves descriptors through synchronous PollFlightInfo. */
+  private static final class PollingFlightSqlClient extends FlightSqlClient {
+    private static final String UNKNOWN_COMMAND_FAMILY = "unknown-command";
+
+    private final FlightClient client;
+    private final boolean pollInfoEnabled;
+    private final Set<String> unsupportedFamilies = ConcurrentHashMap.newKeySet();
+    private final ThreadLocal<PollInfoOperation> currentOperation = new ThreadLocal<>();
+
+    private PollingFlightSqlClient(final FlightClient client, final boolean pollInfoEnabled) {
+      super(client);
+      this.client = client;
+      this.pollInfoEnabled = pollInfoEnabled;
+    }
+
+    private FlightInfo withOperation(
+        final PollInfoOperation operation, final Supplier<FlightInfo> action) {
+      final PollInfoOperation previous = currentOperation.get();
+      currentOperation.set(operation);
+      try {
+        // Enter the statement-owned cancellable context before prepared parameter upload as well
+        // as descriptor polling. This lets timeout/cancel terminate a blocked DoPut.
+        return operation.call(action::get);
+      } finally {
+        if (previous == null) {
+          currentOperation.remove();
+        } else {
+          currentOperation.set(previous);
+        }
+      }
+    }
+
+    @Override
+    protected FlightInfo getInfo(
+        final org.apache.arrow.flight.FlightDescriptor originalDescriptor,
+        final CallOption... options) {
+      PollInfoOperation operation = currentOperation.get();
+      final boolean ownsOperation = operation == null;
+      if (ownsOperation) {
+        operation = new PollInfoOperation(0);
+      }
+      try {
+        return getInfo(operation, originalDescriptor, options);
+      } finally {
+        if (ownsOperation) {
+          operation.close();
+        }
+      }
+    }
+
+    private FlightInfo getInfo(
+        final PollInfoOperation operation,
+        final org.apache.arrow.flight.FlightDescriptor originalDescriptor,
+        final CallOption[] options) {
+      final String family = commandFamily(originalDescriptor);
+      if (!pollInfoEnabled || unsupportedFamilies.contains(family)) {
+        final FlightInfo flightInfo =
+            operation.call(() -> client.getInfo(originalDescriptor, operation.options(options)));
+        operation.complete(flightInfo);
+        return flightInfo;
+      }
+
+      org.apache.arrow.flight.FlightDescriptor descriptor = originalDescriptor;
+      boolean initialPoll = true;
+      operation.configure(
+          descriptorForPoll -> client.pollInfo(descriptorForPoll, operation.options(options)),
+          () -> cancelFlightInfoBestEffort(operation, options));
+      try {
+        while (true) {
+          final PollInfo pollInfo = operation.poll(descriptor);
+          operation.remember(pollInfo);
+          if (operation.isComplete()
+              || (operation.isProgressive()
+                  && !pollInfo.getFlightInfo().getEndpoints().isEmpty())) {
+            return pollInfo.getFlightInfo();
+          }
+          descriptor = operation.continuationDescriptor();
+          initialPoll = false;
+        }
+      } catch (FlightRuntimeException e) {
+        if (initialPoll && e.status().code() == FlightStatusCode.UNIMPLEMENTED) {
+          unsupportedFamilies.add(family);
+          final FlightInfo flightInfo =
+              operation.call(() -> client.getInfo(originalDescriptor, operation.options(options)));
+          operation.complete(flightInfo);
+          return flightInfo;
+        }
+        if (operation.isCancelled()
+            || e.status().code() == FlightStatusCode.CANCELLED
+            || e.status().code() == FlightStatusCode.TIMED_OUT) {
+          cancelFlightInfoBestEffort(operation, options);
+        }
+        throw e;
+      }
+    }
+
+    private void cancelFlightInfoBestEffort(
+        final PollInfoOperation operation, final CallOption[] options) {
+      if (!operation.beginCancelFlightInfoAttempt()) {
+        return;
+      }
+      final CallOption[] cancelOptions = Arrays.copyOf(options, options.length + 1);
+      cancelOptions[options.length] =
+          org.apache.arrow.flight.CallOptions.timeout(1, TimeUnit.SECONDS);
+      try {
+        // The primary statement context is already cancelled/timed out. Use a fresh root context
+        // for this bounded best-effort cleanup action so it can reach the server.
+        io.grpc.Context.ROOT.run(
+            () ->
+                client.cancelFlightInfo(
+                    new CancelFlightInfoRequest(operation.latestFlightInfo()), cancelOptions));
+      } catch (RuntimeException e) {
+        LOGGER.debug("Best-effort CancelFlightInfo failed", e);
+      }
+    }
+
+    private static String commandFamily(final org.apache.arrow.flight.FlightDescriptor descriptor) {
+      if (!descriptor.isCommand()) {
+        return "path";
+      }
+      try {
+        final String typeUrl = Any.parseFrom(descriptor.getCommand()).getTypeUrl();
+        return typeUrl.isEmpty() ? UNKNOWN_COMMAND_FAMILY : typeUrl;
+      } catch (InvalidProtocolBufferException e) {
+        return UNKNOWN_COMMAND_FAMILY;
+      }
+    }
+  }
+
   /** Builder for {@link ArrowFlightSqlClientHandler}. */
   public static final class Builder {
     static final String USER_AGENT_TEMPLATE = "JDBC Flight SQL Driver %s";
@@ -727,6 +919,8 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
 
     @VisibleForTesting @Nullable Duration connectTimeout;
 
+    @VisibleForTesting boolean usePollInfo = true;
+
     @VisibleForTesting @Nullable OAuthConfiguration oauthConfig;
 
     // These two middleware are for internal use within build() and should not be
@@ -770,6 +964,7 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
       this.allocator = original.allocator;
       this.catalog = original.catalog;
       this.oauthConfig = original.oauthConfig;
+      this.usePollInfo = original.usePollInfo;
 
       if (original.retainCookies) {
         this.cookieFactory = original.cookieFactory;
@@ -1082,6 +1277,12 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
 
     public Builder withConnectTimeout(Duration connectTimeout) {
       this.connectTimeout = connectTimeout;
+      return this;
+    }
+
+    /** Select PollFlightInfo (default) or legacy GetFlightInfo descriptor resolution. */
+    public Builder withPollInfo(final boolean usePollInfo) {
+      this.usePollInfo = usePollInfo;
       return this;
     }
 

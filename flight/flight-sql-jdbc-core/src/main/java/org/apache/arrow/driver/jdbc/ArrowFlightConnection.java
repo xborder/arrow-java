@@ -33,6 +33,9 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler;
 import org.apache.arrow.driver.jdbc.client.utils.FlightClientCache;
 import org.apache.arrow.driver.jdbc.utils.ArrowFlightConnectionConfigImpl;
@@ -45,14 +48,18 @@ import org.apache.calcite.avatica.AvaticaConnection;
 import org.apache.calcite.avatica.AvaticaFactory;
 import org.apache.calcite.avatica.AvaticaStatement;
 import org.apache.calcite.avatica.DriverVersion;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Connection to the Arrow Flight server. */
 public final class ArrowFlightConnection extends AvaticaConnection {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ArrowFlightConnection.class);
 
   private final BufferAllocator allocator;
   private final ArrowFlightSqlClientHandler clientHandler;
   private final ArrowFlightConnectionConfigImpl config;
   private ExecutorService executorService;
+  private ThreadPoolExecutor pollerExecutor;
   private int metadataResultSetCount;
   // Track metadata result sets so connection close can release them.
   private Map<Integer, ArrowFlightJdbcFlightStreamResultSet> metadataResultSetMap = new HashMap<>();
@@ -109,6 +116,7 @@ public final class ArrowFlightConnection extends AvaticaConnection {
       url = replaceSemiColons(url);
       final ArrowFlightConnectionConfigImpl config =
           new ArrowFlightConnectionConfigImpl(properties);
+      config.validatePollInfoPrefetch();
       clientHandler = createNewClientHandler(config, allocator, driver.getDriverVersion());
       return new ArrowFlightConnection(
           driver, factory, url, properties, config, allocator, clientHandler);
@@ -145,6 +153,7 @@ public final class ArrowFlightConnection extends AvaticaConnection {
         .withCatalog(config.getCatalog())
         .withClientCache(config.useClientCache() ? new FlightClientCache() : null)
         .withConnectTimeout(config.getConnectTimeout())
+        .withPollInfo(config.usePollInfo())
         .withDriverVersion(driverVersion)
         .withOAuthConfiguration(config.getOauthConfiguration())
         .build();
@@ -187,6 +196,56 @@ public final class ArrowFlightConnection extends AvaticaConnection {
             ? Executors.newFixedThreadPool(
                 config.threadPoolSize(), new DefaultThreadFactory(getClass().getSimpleName()))
             : executorService;
+  }
+
+  /**
+   * Gets the pool that runs background PollFlightInfo pollers, creating it on first use. The pool
+   * is bounded and has no queue: when every thread is busy, submitting a task is rejected and the
+   * poller is run by the result set's reader inside {@code next()} instead.
+   */
+  synchronized ThreadPoolExecutor getPollerExecutor() {
+    if (pollerExecutor == null) {
+      final int threads = config.pollInfoPollerThreads();
+      pollerExecutor =
+          new ThreadPoolExecutor(
+              threads,
+              threads,
+              0L,
+              TimeUnit.MILLISECONDS,
+              new SynchronousQueue<>(),
+              new DefaultThreadFactory(getClass().getSimpleName() + "-poller", true),
+              new ThreadPoolExecutor.AbortPolicy());
+    }
+    return pollerExecutor;
+  }
+
+  /** The effective most queued, unread endpoints of a progressive result; at least 1. */
+  int getPollInfoPrefetch() {
+    return config.pollInfoPrefetch();
+  }
+
+  /** The longest wait between PollFlightInfo answers that add no endpoints. */
+  long getPollInfoMaxBackoffMs() {
+    return config.pollInfoMaxBackoffMs();
+  }
+
+  private void shutdownPollerExecutor() throws InterruptedException {
+    final ThreadPoolExecutor executor;
+    synchronized (this) {
+      executor = pollerExecutor;
+    }
+    if (executor != null) {
+      // The statements were closed, so every poller is ending. One that failed the result on a
+      // deadline is still sending its CancelFlightInfo (bounded to 1 s): interrupting it now would
+      // drop the cancel, so give the pollers a moment before interrupting them.
+      executor.shutdown();
+      if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+        executor.shutdownNow();
+        if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+          LOGGER.warn("PollFlightInfo poller threads did not terminate within 5 seconds");
+        }
+      }
+    }
   }
 
   /**
@@ -261,6 +320,8 @@ public final class ArrowFlightConnection extends AvaticaConnection {
     // copies of the collections are used to avoid concurrent modification problems
     ArrayList<AutoCloseable> closeables = getStatementsToClose();
     closeables.addAll(new ArrayList<>(metadataResultSetMap.values()));
+    // Statements stop their pollers first; then no poller can outlive the client or allocator.
+    closeables.add(this::shutdownPollerExecutor);
     closeables.add(clientHandler);
     closeables.addAll(allocator.getChildAllocators());
     closeables.add(allocator);

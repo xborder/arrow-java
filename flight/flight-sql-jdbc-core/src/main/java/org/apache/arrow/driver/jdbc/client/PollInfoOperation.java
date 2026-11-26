@@ -1,0 +1,297 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.arrow.driver.jdbc.client;
+
+import io.grpc.Context;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
+import org.apache.arrow.flight.CallOption;
+import org.apache.arrow.flight.CallOptions;
+import org.apache.arrow.flight.CallStatus;
+import org.apache.arrow.flight.FlightDescriptor;
+import org.apache.arrow.flight.FlightEndpoint;
+import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.PollInfo;
+
+/**
+ * State shared by every PollFlightInfo call in one JDBC query execution.
+ *
+ * <p>The absolute deadline is deliberately created once. Each RPC receives only the remaining
+ * budget, while the cancellable gRPC context lets {@code Statement.cancel()} terminate an active
+ * poll before or after a ResultSet exists. Progressive operations retain their continuation until
+ * the ResultSet consumes all published endpoints.
+ */
+public final class PollInfoOperation implements AutoCloseable {
+  private static final long NO_DEADLINE = Long.MAX_VALUE;
+
+  private final long deadlineNanos;
+  private final boolean progressive;
+  private final Context.CancellableContext context;
+  private final AtomicBoolean cancelled = new AtomicBoolean();
+  private final CountDownLatch cancelLatch = new CountDownLatch(1);
+  private final AtomicBoolean cancelFlightInfoAttempted = new AtomicBoolean();
+  private volatile FlightInfo latestFlightInfo;
+  private volatile FlightDescriptor continuationDescriptor;
+  private volatile Function<FlightDescriptor, PollInfo> poller;
+  private volatile Runnable cancelFlightInfo;
+
+  /** Create an operation whose timeout is expressed in JDBC query-timeout seconds. */
+  public PollInfoOperation(final int timeoutSeconds) {
+    this(timeoutSeconds, false);
+  }
+
+  /** Create an operation that may hand continuation polling to the JDBC ResultSet. */
+  public PollInfoOperation(final int timeoutSeconds, final boolean progressive) {
+    deadlineNanos =
+        timeoutSeconds > 0
+            ? saturatingAdd(System.nanoTime(), TimeUnit.SECONDS.toNanos(timeoutSeconds))
+            : NO_DEADLINE;
+    this.progressive = progressive;
+    context = Context.current().withCancellation();
+  }
+
+  /** Run one RPC in the operation's cancellable context. */
+  <T> T call(final Callable<T> callable) {
+    if (cancelled.get()) {
+      throw CallStatus.CANCELLED.withDescription("Statement canceled").toRuntimeException();
+    }
+    try {
+      return context.call(callable);
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  /** Return the base options plus this operation's remaining deadline. */
+  CallOption[] options(final CallOption[] baseOptions) {
+    if (deadlineNanos == NO_DEADLINE) {
+      return baseOptions;
+    }
+    final long remaining = remainingTimeoutNanos();
+    if (remaining <= 0) {
+      throw CallStatus.TIMED_OUT.withDescription("JDBC query timeout expired").toRuntimeException();
+    }
+    final CallOption[] options = Arrays.copyOf(baseOptions, baseOptions.length + 1);
+    options[baseOptions.length] = CallOptions.timeout(remaining, TimeUnit.NANOSECONDS);
+    return options;
+  }
+
+  /** Cancel the active PollFlightInfo call, if any. */
+  public void cancel() {
+    cancelled.set(true);
+    cancelLatch.countDown();
+    context.cancel(null);
+    final Runnable cleanup = cancelFlightInfo;
+    if (cleanup != null) {
+      cleanup.run();
+    }
+  }
+
+  /** Whether {@link #cancel()} was called, by the statement, the deadline handling or close. */
+  public boolean isCancelled() {
+    return cancelled.get();
+  }
+
+  void configure(
+      final Function<FlightDescriptor, PollInfo> poller, final Runnable cancelFlightInfo) {
+    this.poller = poller;
+    this.cancelFlightInfo = cancelFlightInfo;
+  }
+
+  PollInfo poll(final FlightDescriptor descriptor) {
+    final Function<FlightDescriptor, PollInfo> currentPoller = poller;
+    if (currentPoller == null) {
+      throw new IllegalStateException("PollInfo operation has no poller");
+    }
+    return call(() -> currentPoller.apply(descriptor));
+  }
+
+  synchronized void remember(final PollInfo pollInfo) {
+    if (pollInfo == null || pollInfo.getFlightInfo() == null) {
+      throw CallStatus.INTERNAL
+          .withDescription("Server returned PollInfo without FlightInfo")
+          .toRuntimeException();
+    }
+    final FlightInfo nextFlightInfo = pollInfo.getFlightInfo();
+    validateAppendOnly(latestFlightInfo, nextFlightInfo);
+    latestFlightInfo = nextFlightInfo;
+    continuationDescriptor = pollInfo.getFlightDescriptor().orElse(null);
+  }
+
+  synchronized void complete(final FlightInfo flightInfo) {
+    latestFlightInfo = flightInfo;
+    continuationDescriptor = null;
+  }
+
+  /**
+   * Poll the held continuation exactly once and remember the answer. The operation monitor is not
+   * held across the RPC, so {@link #cancel()} always gets through.
+   *
+   * @return the answer, or {@code null} when no continuation is held.
+   */
+  public PollAnswer pollOnce() {
+    final FlightDescriptor descriptor = continuationDescriptor;
+    if (descriptor == null) {
+      return null;
+    }
+    final PollInfo pollInfo = poll(descriptor);
+    synchronized (this) {
+      final int before = endpointCount(latestFlightInfo);
+      remember(pollInfo);
+      return new PollAnswer(
+          latestFlightInfo,
+          endpointCount(latestFlightInfo) > before,
+          continuationDescriptor != null);
+    }
+  }
+
+  /**
+   * Wait for the backoff delay, but never past the operation deadline. Returns early, with {@code
+   * false}, when the operation is cancelled or the thread is interrupted (the interrupt flag is
+   * restored).
+   */
+  public boolean backoff(final long delayMillis) {
+    long delayNanos = TimeUnit.MILLISECONDS.toNanos(delayMillis);
+    if (deadlineNanos != NO_DEADLINE) {
+      delayNanos = Math.min(delayNanos, Math.max(0L, remainingTimeoutNanos()));
+    }
+    try {
+      return !cancelLatch.await(delayNanos, TimeUnit.NANOSECONDS);
+    } catch (final InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return false;
+    }
+  }
+
+  /** The result of one continuation poll. */
+  public static final class PollAnswer {
+    private final FlightInfo flightInfo;
+    private final boolean addedEndpoints;
+    private final boolean hasContinuation;
+
+    PollAnswer(
+        final FlightInfo flightInfo, final boolean addedEndpoints, final boolean hasContinuation) {
+      this.flightInfo = flightInfo;
+      this.addedEndpoints = addedEndpoints;
+      this.hasContinuation = hasContinuation;
+    }
+
+    /** The cumulative FlightInfo of this answer. */
+    public FlightInfo flightInfo() {
+      return flightInfo;
+    }
+
+    /** Whether this answer published more endpoints than the previous one. */
+    public boolean addedEndpoints() {
+      return addedEndpoints;
+    }
+
+    /** Whether the query is still running (the answer carries a continuation). */
+    public boolean hasContinuation() {
+      return hasContinuation;
+    }
+  }
+
+  FlightInfo latestFlightInfo() {
+    return latestFlightInfo;
+  }
+
+  FlightDescriptor continuationDescriptor() {
+    return continuationDescriptor;
+  }
+
+  /** Whether this operation can return before PollFlightInfo reaches completion. */
+  public boolean isProgressive() {
+    return progressive;
+  }
+
+  /** Whether another continuation poll is required. */
+  public boolean hasContinuation() {
+    return continuationDescriptor != null;
+  }
+
+  /** Whether PollFlightInfo has reached a response without a continuation descriptor. */
+  public boolean isComplete() {
+    return latestFlightInfo != null && continuationDescriptor == null;
+  }
+
+  /** Mark a failed continuation as terminal without discarding already published endpoints. */
+  public synchronized void terminate() {
+    continuationDescriptor = null;
+  }
+
+  boolean beginCancelFlightInfoAttempt() {
+    return latestFlightInfo != null && cancelFlightInfoAttempted.compareAndSet(false, true);
+  }
+
+  /** Return the remaining operation-wide timeout, in nanoseconds. */
+  public long remainingTimeoutNanos() {
+    if (deadlineNanos == NO_DEADLINE) {
+      return NO_DEADLINE;
+    }
+    return deadlineNanos - System.nanoTime();
+  }
+
+  /** Whether this operation has a finite deadline. */
+  public boolean hasDeadline() {
+    return deadlineNanos != NO_DEADLINE;
+  }
+
+  @Override
+  public void close() {
+    context.close();
+  }
+
+  private static long saturatingAdd(final long left, final long right) {
+    final long result = left + right;
+    if (((left ^ result) & (right ^ result)) < 0) {
+      return Long.MAX_VALUE;
+    }
+    return result;
+  }
+
+  private static int endpointCount(final FlightInfo flightInfo) {
+    return flightInfo == null ? 0 : flightInfo.getEndpoints().size();
+  }
+
+  private static void validateAppendOnly(final FlightInfo previous, final FlightInfo current) {
+    if (previous == null) {
+      return;
+    }
+    final List<FlightEndpoint> previousEndpoints = previous.getEndpoints();
+    final List<FlightEndpoint> currentEndpoints = current.getEndpoints();
+    if (currentEndpoints.size() < previousEndpoints.size()) {
+      throw CallStatus.INTERNAL
+          .withDescription("PollInfo removed previously published endpoints")
+          .toRuntimeException();
+    }
+    for (int index = 0; index < previousEndpoints.size(); index++) {
+      if (!previousEndpoints.get(index).equals(currentEndpoints.get(index))) {
+        throw CallStatus.INTERNAL
+            .withDescription("PollInfo mutated previously published endpoint " + index)
+            .toRuntimeException();
+      }
+    }
+  }
+}
