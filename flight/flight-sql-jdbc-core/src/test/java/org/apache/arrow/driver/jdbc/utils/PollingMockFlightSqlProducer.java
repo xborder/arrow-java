@@ -21,9 +21,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.arrow.driver.jdbc.utils.ScriptedPollQuery.Answer;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.CancelFlightInfoRequest;
 import org.apache.arrow.flight.CancelStatus;
@@ -32,6 +34,7 @@ import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.PollInfo;
 import org.apache.arrow.flight.PutResult;
+import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.flight.sql.impl.FlightSql.CommandPreparedStatementQuery;
 
 /** Controllable in-process PollInfo producer used by the JDBC POC conformance tests. */
@@ -61,6 +64,7 @@ public final class PollingMockFlightSqlProducer extends MockFlightSqlProducer {
   private final AtomicInteger getFlightInfoCount = new AtomicInteger();
   private final AtomicInteger parameterBindCount = new AtomicInteger();
   private final AtomicInteger cancelFlightInfoCount = new AtomicInteger();
+  private final List<ScriptedPollQuery> scriptedQueries = new CopyOnWriteArrayList<>();
   private volatile String lastGetFlightInfoFamily;
   private volatile Scenario scenario = Scenario.IMMEDIATE;
   private volatile String scenarioFamily;
@@ -90,9 +94,41 @@ public final class PollingMockFlightSqlProducer extends MockFlightSqlProducer {
     return super.getFlightInfo(context, descriptor);
   }
 
+  /**
+   * Serves {@code query} (sent as a statement query) from a script of poll answers, bypassing the
+   * canned scenarios. The returned handle holds and releases streams and records what the server
+   * saw.
+   */
+  public ScriptedPollQuery scripted(final String query, final Answer... answers) {
+    final ScriptedPollQuery scripted = new ScriptedPollQuery(query, List.of(answers));
+    scriptedQueries.add(scripted);
+    return scripted;
+  }
+
+  @Override
+  public void getStream(
+      final CallContext context, final Ticket ticket, final ServerStreamListener listener) {
+    for (final ScriptedPollQuery scripted : scriptedQueries) {
+      if (scripted.ownsTicket(ticket)) {
+        scripted.doGet(ticket, listener);
+        return;
+      }
+    }
+    super.getStream(context, ticket, listener);
+  }
+
   @Override
   public PollInfo pollFlightInfo(final CallContext context, final FlightDescriptor descriptor) {
     pollDescriptors.add(descriptor);
+    for (final ScriptedPollQuery scripted : scriptedQueries) {
+      if (scripted.matches(descriptor)) {
+        return scripted.poll(context, 0);
+      }
+      final int index = scripted.continuationIndex(descriptor);
+      if (index >= 0) {
+        return scripted.poll(context, index);
+      }
+    }
     final boolean initial = isFlightSqlCommand(descriptor);
     if (initial) {
       finalFlightInfo = super.getFlightInfo(context, descriptor);
@@ -169,6 +205,11 @@ public final class PollingMockFlightSqlProducer extends MockFlightSqlProducer {
       final CallContext context,
       final StreamListener<CancelStatus> listener) {
     cancelFlightInfoCount.incrementAndGet();
+    for (final ScriptedPollQuery scripted : scriptedQueries) {
+      if (scripted.matches(request.getInfo().getDescriptor())) {
+        scripted.recordCancelFlightInfo();
+      }
+    }
     listener.onNext(CancelStatus.CANCELLED);
     listener.onCompleted();
   }

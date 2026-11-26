@@ -520,6 +520,9 @@ public class FlightEndpointDataQueue implements AutoCloseable {
         return ready;
       }
       onStreamFinished(source);
+      // A consumed future may have resumed a poller that the pool rejected: the idle hook must get
+      // another chance, or the reader could wait for a wake-up that was already sent.
+      idleTried = false;
     }
   }
 

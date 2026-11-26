@@ -279,6 +279,12 @@ public final class ArrowFlightJdbcFlightStreamResultSet
 
         currentEndpointData = getNextEndpointStream(false);
       } catch (final FlightRuntimeException e) {
+        // A failed continuation poll cancels the open streams, which surface here as CANCELLED
+        // while the reader is blocked on one: report the recorded failure, not the cancel.
+        final SQLException recordedFailure = flightEndpointDataQueue.failure();
+        if (recordedFailure != null) {
+          throw recordedFailure;
+        }
         // A concurrent statement.cancel() (or close) cancels in-flight FlightStreams,
         // which surface here as CANCELLED. Normalize to Avatica's "Statement canceled".
         if ((cancelled || flightEndpointDataQueue.isClosed())
