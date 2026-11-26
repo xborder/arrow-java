@@ -25,7 +25,9 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 cp "$HERE/PollAhead.tla" "$WORK/"
 
-SAFE="TypeOK InlineMeansPoller EachEndpointOnce ContinuationsOnce NoPrematureEnd FailFast CancelStopsPolling Backpressure NoSpin"
+# The rules before the slot-release change (4b831553c): no rule says when a finished stream's slot is freed.
+OLD_RULES="TypeOK InlineMeansPoller EachEndpointOnce ContinuationsOnce NoPrematureEnd FailFast CancelStopsPolling Backpressure NoSpin OpenWithinLimit"
+SAFE="TypeOK InlineMeansPoller EachEndpointOnce ContinuationsOnce NoPrematureEnd FailFast CancelStopsPolling Backpressure NoSpin SlotFreedOnExhaust FailedQueueInert"
 ALL="$SAFE OpenWithinLimit"
 unexpected=0
 
@@ -85,6 +87,13 @@ check pauseNotAtomic          FALSE TRUE  pauseNotAtomic      "$ALL" yes livenes
 check ownedClearedLate        FALSE TRUE  ownedClearedLate    "$ALL" yes liveness                    "pause clears owned after the lock: resume finds it set"
 check noIdleHook              FALSE TRUE  noIdleHook          "$ALL" yes liveness                    "an orphaned poller is never run inline"
 check staleIdle               FALSE FALSE none                "$SAFE" yes liveness                   "idleTried not cleared after a consumed future (rejected resume strands next())"
+check lateRelease             FALSE TRUE  lateRelease         "$ALL" no invariant:SlotFreedOnExhaust "slot freed only when a later awaitNext consumes the null future, not when the application finishes the stream"
+check applyAfterFail          FALSE TRUE  applyAfterFail      "$ALL" no invariant:FailedQueueInert   "addEndpoints queues and reserves on a queue that already failed"
+check errorNotReported        FALSE TRUE  errorNotReported    "$ALL" yes liveness                    "an Error kills the poller thread without failing the queue (next() waits forever)"
+echo
+echo "Gap check: lateRelease passes every rule that existed before SlotFreedOnExhaust. The late release is a progress"
+echo "problem (a finished stream blocks the poller), not a safety or termination one, and only the new rule sees it."
+check lateRelease-old-rules   FALSE TRUE  lateRelease         "$OLD_RULES" yes pass                  "NOT a bug in the model: shows what the old rule set could not express"
 
 echo
 if [ "$unexpected" -eq 0 ]; then echo "All checks matched their expectations."; else echo "Some checks did not match. See above."; fi
