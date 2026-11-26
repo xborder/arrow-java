@@ -29,6 +29,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.SQLTimeoutException;
 import java.sql.Statement;
 import java.util.Collections;
@@ -123,9 +124,11 @@ public class PollInfoExecutionTest {
   }
 
   @Test
+  // Pinned to the POC path (pollInfoPrefetch=0): the continuations are polled on demand, which
+  // is what the name says. Poll-ahead is covered by pollAheadPollsContinuationsWhile...
   public void multiStepPollsOnDemandAfterPublishedEndpointIsConsumed() throws Exception {
     producer.configure(Scenario.MULTI_STEP, STATEMENT_FAMILY);
-    try (Connection connection = connect(true);
+    try (Connection connection = connect(true, 0);
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery(DIRECT_QUERY)) {
       assertTrue(resultSet.next());
@@ -239,23 +242,29 @@ public class PollInfoExecutionTest {
   public void continuationUnimplementedDoesNotFallbackOrReexecute(final int pollInfoPrefetch)
       throws Exception {
     producer.configure(Scenario.CONTINUATION_UNIMPLEMENTED, STATEMENT_FAMILY);
+    if (pollInfoPrefetch > 0) {
+      // The background poller would otherwise fail before or after the first next(); the failing
+      // answer waits until the first row was read.
+      producer.holdContinuationFailure();
+    }
     try (Connection connection = connect(true, pollInfoPrefetch);
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery(DIRECT_QUERY)) {
-      if (pollInfoPrefetch == 0) {
-        assertTrue(resultSet.next());
-        assertEquals(42, resultSet.getInt(1));
+      assertTrue(resultSet.next());
+      assertEquals(42, resultSet.getInt(1));
+      if (pollInfoPrefetch > 0) {
+        assertTrue(producer.awaitActivePoll(5, TimeUnit.SECONDS), "the poller never polled C1");
+        producer.releaseContinuationFailure();
       }
-      // With poll-ahead the failed continuation fails fast, so it may surface before the first row.
-      final Throwable failure =
-          assertThrows(
-              Throwable.class,
-              () -> {
-                while (resultSet.next()) {
-                  assertEquals(42, resultSet.getInt(1));
-                }
-              });
-      assertTrue(hasFlightStatus(failure, FlightStatusCode.UNIMPLEMENTED), failure.toString());
+      final SQLException failure = assertThrows(SQLException.class, resultSet::next);
+      assertEquals(SQLException.class, failure.getClass());
+      assertEquals("Continuation PollFlightInfo failed", failure.getMessage());
+      assertTrue(failure.getCause() instanceof FlightRuntimeException, failure.toString());
+      assertEquals(
+          FlightStatusCode.UNIMPLEMENTED,
+          ((FlightRuntimeException) failure.getCause()).status().code());
+    } finally {
+      producer.releaseContinuationFailure();
     }
     assertEquals(2, producer.pollDescriptors().size());
     assertEquals(0, producer.getFlightInfoCount());

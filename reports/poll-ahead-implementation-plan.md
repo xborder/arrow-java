@@ -17,7 +17,8 @@ All paths below are relative to `flight/flight-sql-jdbc-core/src/main/java/org/a
 6. End of results: `next()` returns false only when the queue is empty, nothing is pending, and the poller has finished. The poller must mark itself finished in the same locked step that queues the final endpoints.
 7. Fail fast: a failed continuation poll records the failure, closes every open stream, drops pending endpoints and buffered batches, and makes the next `next()` throw. No `CancelFlightInfo` is needed, because the server already ended the query. The exception keeps today's mapping: `TIMED_OUT` becomes `SQLTimeoutException("Query timed out after N SECONDS")`; anything else becomes `SQLException("Continuation PollFlightInfo failed", cause)`.
 8. Cancel and close stop the poller. `Statement.cancel()`, the deadline and `ResultSet.close()` on an incomplete result cancel the operation context, end any open poll, send best-effort `CancelFlightInfo` once (existing `PollInfoOperation.cancel`), close the queue, and make the next `next()` throw "Statement canceled".
-9. Metadata calls, `executeQuery`'s first poll, the `UNIMPLEMENTED` fallback, and `usePollInfo=false` are unchanged.
+9. Unlimited eager queue: a first answer that is already complete (no continuation) and `pollInfoPrefetch=0` both use the queue without an open limit, so every endpoint opens at once, as it always did. The limit applies only while a poller is running.
+10. Metadata calls, `executeQuery`'s first poll, the `UNIMPLEMENTED` fallback, and `usePollInfo=false` are unchanged.
 
 ## Configuration (connection properties)
 

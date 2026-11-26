@@ -72,6 +72,7 @@ public final class PollingMockFlightSqlProducer extends MockFlightSqlProducer {
   private volatile FlightInfo finalFlightInfo;
   private volatile CountDownLatch activePoll = new CountDownLatch(1);
   private volatile CountDownLatch pollTerminated = new CountDownLatch(1);
+  private volatile CountDownLatch continuationFailureGate;
 
   public void configure(final Scenario scenario, final String scenarioFamily) {
     this.scenario = scenario;
@@ -85,6 +86,23 @@ public final class PollingMockFlightSqlProducer extends MockFlightSqlProducer {
     finalFlightInfo = null;
     activePoll = new CountDownLatch(1);
     pollTerminated = new CountDownLatch(1);
+    continuationFailureGate = null;
+  }
+
+  /**
+   * Makes the failing continuation of {@link Scenario#CONTINUATION_UNIMPLEMENTED} wait, once it
+   * arrives, until {@link #releaseContinuationFailure()}. {@link #awaitActivePoll} reports that it
+   * arrived. Call it after {@link #configure}.
+   */
+  public void holdContinuationFailure() {
+    continuationFailureGate = new CountDownLatch(1);
+  }
+
+  public void releaseContinuationFailure() {
+    final CountDownLatch gate = continuationFailureGate;
+    if (gate != null) {
+      gate.countDown();
+    }
   }
 
   @Override
@@ -146,6 +164,20 @@ public final class PollingMockFlightSqlProducer extends MockFlightSqlProducer {
     if (selectedFamily && scenario == Scenario.CONTINUATION_UNIMPLEMENTED) {
       if (initial) {
         return new PollInfo(partialInfo(finalFlightInfo), CONTINUATION_1, 0.25, null);
+      }
+      final CountDownLatch gate = continuationFailureGate;
+      if (gate != null) {
+        activePoll.countDown();
+        try {
+          while (!gate.await(10, TimeUnit.MILLISECONDS)) {
+            if (context.isCancelled()) {
+              throw CallStatus.CANCELLED.toRuntimeException();
+            }
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw CallStatus.CANCELLED.withCause(e).toRuntimeException();
+        }
       }
       throw CallStatus.UNIMPLEMENTED.toRuntimeException();
     }

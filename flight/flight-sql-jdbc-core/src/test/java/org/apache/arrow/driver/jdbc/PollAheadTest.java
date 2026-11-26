@@ -40,6 +40,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
+import java.util.stream.Collectors;
 import org.apache.arrow.driver.jdbc.utils.PollingMockFlightSqlProducer;
 import org.apache.arrow.driver.jdbc.utils.ScriptedPollQuery;
 import org.apache.arrow.driver.jdbc.utils.ScriptedPollQuery.Answer;
@@ -69,6 +71,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 public class PollAheadTest {
   private static final long WAIT_MS = 10_000;
   private static final long QUIET_MS = 300;
+  private static final long POLL_PARK_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
 
   private static final AtomicInteger QUERY_NUMBER = new AtomicInteger();
 
@@ -193,11 +196,15 @@ public class PollAheadTest {
     }
     final List<Long> polls = script.pollNanos();
     assertEquals(6, polls.size());
+    // An answer that adds endpoints is followed at once: no wait after answers 0 and 3. The
+    // shortest backoff wait is 100 ms, so anything below that is no wait at all.
+    assertGapBetween(polls, 0, 1, 0, 100);
+    assertGapBetween(polls, 3, 4, 0, 100);
     // Answers 1 and 2 are empty: waits of 100 ms, then 200 ms.
     assertGapBetween(polls, 1, 2, 100, 1500);
     assertGapBetween(polls, 2, 3, 200, 1500);
-    // Answer 3 adds an endpoint: no wait is required, and the next empty answer waits 100 ms
-    // again, not 400 ms.
+    // After answer 4 (empty, after an answer that added endpoints) the wait starts at 100 ms
+    // again, not at 400 ms.
     assertGapBetween(polls, 4, 5, 100, 350);
   }
 
@@ -214,9 +221,10 @@ public class PollAheadTest {
     }
     final List<Long> polls = script.pollNanos();
     assertEquals(5, polls.size());
-    // Waits after the three empty answers: 100 ms, then capped at 150 ms (not 200, not 400).
-    assertGapBetween(polls, 1, 2, 100, 1500);
-    assertGapBetween(polls, 2, 3, 150, 1500);
+    // Waits after the three empty answers: 100 ms, then capped at 150 ms. Uncapped they would be
+    // 100, 200 and 400 ms, so only the last gap tells the cap from no cap.
+    assertGapBetween(polls, 1, 2, 100, 350);
+    assertGapBetween(polls, 2, 3, 150, 350);
     assertGapBetween(polls, 3, 4, 150, 350);
   }
 
@@ -224,8 +232,10 @@ public class PollAheadTest {
   // read, and the buffered streams are cancelled.
   @Test
   public void continuationFailureStopsReadsAndClosesStreams() throws Exception {
+    // The failing answer waits for the test, so that the first next() cannot race it.
+    final CountDownLatch failNow = new CountDownLatch(1);
     final ScriptedPollQuery script =
-        scripted(Answer.endpoints(1), Answer.endpoints(1), Answer.fail())
+        scripted(Answer.endpoints(1), Answer.endpoints(1), Answer.fail().gatedBy(failNow))
             .rowsPerEndpoint(2)
             .holdEnd(0)
             .holdStart(1);
@@ -234,6 +244,8 @@ public class PollAheadTest {
         ResultSet resultSet = statement.executeQuery(script.query())) {
       assertTrue(resultSet.next());
       assertEquals(0, resultSet.getInt(1));
+      assertTrue(script.awaitBlockedPoll(WAIT_MS));
+      failNow.countDown();
       // fail() records the failure first and then cancels every open stream.
       assertTrue(script.awaitStream(EventType.DOGET_CANCELLED, 0, WAIT_MS));
       assertTrue(script.awaitStream(EventType.DOGET_CANCELLED, 1, WAIT_MS));
@@ -294,7 +306,6 @@ public class PollAheadTest {
       final SQLException canceled = assertThrows(SQLException.class, resultSet::next);
       assertTrue(canceled.getMessage().contains("Statement canceled"), canceled.getMessage());
       assertFalse(script.awaitCancelFlightInfo(2, QUIET_MS));
-      assertFalse(script.awaitPollCount(3, 0));
     }
     assertEquals(2, script.pollCount());
     assertEquals(1, script.cancelFlightInfoCount());
@@ -334,7 +345,9 @@ public class PollAheadTest {
       final int firstRow = resultSet.getInt(1);
       try (AsyncReader reader = new AsyncReader(() -> readAll(resultSet))) {
         if (readerWaits) {
-          // The reader has consumed E0 and now waits for the done answer.
+          // The reader has consumed E0 (it ended on the server) and now waits for the done answer.
+          // awaitBlocked cannot tell the queue wait from a read blocked in FlightStream.next();
+          // either way, releasing the gate must deliver both final endpoints.
           assertTrue(script.awaitBlockedPoll(WAIT_MS));
           assertTrue(script.awaitStream(EventType.DOGET_END, 0, WAIT_MS));
           reader.awaitBlocked();
@@ -498,24 +511,31 @@ public class PollAheadTest {
         assertEquals(
             FlightStatusCode.TIMED_OUT,
             ((FlightRuntimeException) timeout.getCause()).status().code());
+        // The deadline cancels the operation once; closing the result must not cancel again.
+        assertTrue(
+            script.awaitCancelFlightInfo(1, WAIT_MS), "the deadline sent no CancelFlightInfo");
       }
     }
     final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
     assertTrue(elapsedMillis >= 850, "the deadline fired too early: " + elapsedMillis);
     assertTrue(script.awaitPollTerminated(WAIT_MS));
+    assertFalse(script.awaitCancelFlightInfo(2, QUIET_MS));
     assertEquals(2, script.pollCount());
+    assertEquals(1, script.cancelFlightInfoCount());
   }
 
   // Decision: a schema change fails the queue as a plain SQLException.
   @Test
   public void schemaChangeFailsTheResultAsAPlainSqlException() throws Exception {
+    final CountDownLatch changeNow = new CountDownLatch(1);
     final ScriptedPollQuery script =
-        scripted(Answer.endpoints(1), Answer.schemaChange()).rowsPerEndpoint(2);
+        scripted(Answer.endpoints(1), Answer.schemaChange().gatedBy(changeNow)).rowsPerEndpoint(2);
     try (Connection connection = connect("pollInfoPrefetch=2");
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery(script.query())) {
       assertTrue(resultSet.next());
-      assertTrue(script.awaitPollCount(2, WAIT_MS));
+      assertTrue(script.awaitBlockedPoll(WAIT_MS));
+      changeNow.countDown();
       final SQLException failure = assertThrows(SQLException.class, () -> readAllWithin(resultSet));
       assertEquals(SQLException.class, failure.getClass());
       assertEquals("PollInfo changed the result schema", failure.getMessage());
@@ -694,6 +714,215 @@ public class PollAheadTest {
     }
   }
 
+  // S2. Backoff against cancel, deadline and close. Six empty answers after the first endpoint:
+  // the waits are 100, 200, 400, 800 and then 1600 ms (cap 5000 ms), so once poll 5 arrived the
+  // poller sleeps for another 1.6 s, much longer than anything asserted below.
+  private static ScriptedPollQuery backingOff() {
+    return scripted(
+            Answer.endpoints(1),
+            Answer.empty(),
+            Answer.empty(),
+            Answer.empty(),
+            Answer.empty(),
+            Answer.empty(),
+            Answer.empty(),
+            Answer.empty())
+        .rowsPerEndpoint(2);
+  }
+
+  @Test
+  public void cancelDuringABackoffWaitEndsItAndSendsNoMorePolls() throws Exception {
+    final ScriptedPollQuery script = backingOff();
+    try (Connection connection = connect("pollInfoPrefetch=2&pollInfoMaxBackoffMs=5000");
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(script.query())) {
+      assertTrue(resultSet.next());
+      assertTrue(script.awaitPollCount(6, WAIT_MS));
+      final long cancelNanos = System.nanoTime();
+      statement.cancel();
+      final SQLException canceled = assertThrows(SQLException.class, resultSet::next);
+      assertTrue(canceled.getMessage().contains("Statement canceled"), canceled.getMessage());
+      // Cancel ends the wait: the poller leaves its thread long before the 1.6 s are over.
+      awaitPollerPoolIdle(connection, 1000);
+      assertTrue(
+          TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cancelNanos) < 1000,
+          "the backoff wait outlived the cancel");
+      assertTrue(script.awaitCancelFlightInfo(1, WAIT_MS));
+      assertFalse(script.awaitCancelFlightInfo(2, QUIET_MS));
+    }
+    assertEquals(6, script.pollCount());
+    assertEquals(1, script.cancelFlightInfoCount());
+  }
+
+  @Test
+  public void closeDuringABackoffWaitReturnsPromptlyAndSendsNoMorePolls() throws Exception {
+    final ScriptedPollQuery script = backingOff();
+    try (Connection connection = connect("pollInfoPrefetch=2&pollInfoMaxBackoffMs=5000")) {
+      final Statement statement = connection.createStatement();
+      final ResultSet resultSet = statement.executeQuery(script.query());
+      assertTrue(resultSet.next());
+      assertTrue(script.awaitPollCount(6, WAIT_MS));
+      final long closeNanos = System.nanoTime();
+      resultSet.close();
+      statement.close();
+      assertTrue(
+          TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - closeNanos) < 1000,
+          "close waited for the backoff");
+      // The close ends the wait itself (it cancels the operation); nothing interrupts the poller.
+      awaitPollerPoolIdle(connection, 1000);
+      assertTrue(script.awaitCancelFlightInfo(1, WAIT_MS));
+      assertFalse(script.awaitCancelFlightInfo(2, QUIET_MS));
+    }
+    assertEquals(6, script.pollCount());
+    assertEquals(1, script.cancelFlightInfoCount());
+  }
+
+  @Test
+  public void theDeadlineEndsABackoffWaitAndSendsOneCancelFlightInfo() throws Exception {
+    final ScriptedPollQuery script = backingOff();
+    try (Connection connection = connect("pollInfoPrefetch=2&pollInfoMaxBackoffMs=5000");
+        Statement statement = connection.createStatement()) {
+      statement.setQueryTimeout(1);
+      final long startNanos = System.nanoTime();
+      try (ResultSet resultSet = statement.executeQuery(script.query())) {
+        assertTrue(resultSet.next());
+        assertTrue(resultSet.next());
+        final SQLTimeoutException timeout =
+            assertThrows(SQLTimeoutException.class, resultSet::next);
+        final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+        assertEquals("Query timed out after 1 SECONDS", timeout.getMessage());
+        assertInstanceOf(FlightRuntimeException.class, timeout.getCause());
+        assertEquals(
+            FlightStatusCode.TIMED_OUT,
+            ((FlightRuntimeException) timeout.getCause()).status().code());
+        // The polls are at 0, 0, 100, 300 and 700 ms; the wait after the last one is cut to the
+        // deadline (1000 ms) instead of 800 ms, so the next poll is not at 1500 ms.
+        assertTrue(elapsedMillis >= 850, "the deadline fired too early: " + elapsedMillis);
+        assertTrue(elapsedMillis < 1400, "the wait ran past the deadline: " + elapsedMillis);
+        assertTrue(
+            script.awaitCancelFlightInfo(1, WAIT_MS), "the deadline sent no CancelFlightInfo");
+      }
+      assertFalse(script.awaitCancelFlightInfo(2, QUIET_MS));
+    }
+    assertEquals(1, script.cancelFlightInfoCount());
+  }
+
+  // S3. The fallback path (pollInfoPrefetch=0) backs off inside next() as well.
+  @Test
+  public void prefetchZeroBacksOffBetweenEmptyAnswersAndHonorsTheCap() throws Exception {
+    final ScriptedPollQuery script =
+        scripted(
+            Answer.endpoints(1), Answer.empty(), Answer.empty(), Answer.empty(), Answer.done(1));
+    try (Connection connection = connect("pollInfoPrefetch=0&pollInfoMaxBackoffMs=150");
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(script.query())) {
+      assertEquals(List.of(0, 100), readAll(resultSet));
+    }
+    final List<Long> polls = script.pollNanos();
+    assertEquals(5, polls.size());
+    // The reader polls C1 once E0 is read; the waits are 100 ms, then capped at 150 ms (uncapped:
+    // 200 and 400 ms).
+    assertGapBetween(polls, 1, 2, 100, 350);
+    assertGapBetween(polls, 2, 3, 150, 350);
+    assertGapBetween(polls, 3, 4, 150, 350);
+  }
+
+  // S6. Append-only violations fail the result and cancel the open streams.
+  @Test
+  public void anAnswerWithFewerEndpointsFailsTheResultAndCancelsTheStreams() throws Exception {
+    final CountDownLatch breakNow = new CountDownLatch(1);
+    final ScriptedPollQuery script =
+        scripted(Answer.endpoints(2), Answer.shrink().gatedBy(breakNow))
+            .rowsPerEndpoint(2)
+            .holdAllEnds(2);
+    assertAppendOnlyViolation(script, breakNow, "PollInfo removed previously published endpoints");
+  }
+
+  @Test
+  public void anAnswerWithAChangedTicketFailsTheResultAndCancelsTheStreams() throws Exception {
+    final CountDownLatch breakNow = new CountDownLatch(1);
+    final ScriptedPollQuery script =
+        scripted(Answer.endpoints(2), Answer.changedTicket().gatedBy(breakNow))
+            .rowsPerEndpoint(2)
+            .holdAllEnds(2);
+    assertAppendOnlyViolation(script, breakNow, "PollInfo mutated previously published endpoint 0");
+  }
+
+  private static void assertAppendOnlyViolation(
+      final ScriptedPollQuery script, final CountDownLatch breakNow, final String description)
+      throws Exception {
+    try (Connection connection = connect("pollInfoPrefetch=4");
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(script.query())) {
+      assertTrue(resultSet.next());
+      assertTrue(script.awaitBlockedPoll(WAIT_MS));
+      assertTrue(script.awaitDoGetStarted(2, WAIT_MS));
+      breakNow.countDown();
+      assertTrue(script.awaitStream(EventType.DOGET_CANCELLED, 0, WAIT_MS));
+      assertTrue(script.awaitStream(EventType.DOGET_CANCELLED, 1, WAIT_MS));
+      final SQLException failure = assertThrows(SQLException.class, resultSet::next);
+      assertEquals(SQLException.class, failure.getClass());
+      assertEquals("Continuation PollFlightInfo failed", failure.getMessage());
+      assertInstanceOf(FlightRuntimeException.class, failure.getCause());
+      final FlightRuntimeException cause = (FlightRuntimeException) failure.getCause();
+      assertEquals(FlightStatusCode.INTERNAL, cause.status().code());
+      assertEquals(description, cause.status().description());
+    }
+    assertFalse(script.hasEvent(EventType.DOGET_END, 0));
+    assertFalse(script.hasEvent(EventType.DOGET_END, 1));
+  }
+
+  // Mock fidelity: endpoints that name a location (the server itself, or "reuse the connection")
+  // take the single-endpoint open path that resolves locations.
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  public void endpointsWithLocationsAreOpenedAndRead(final boolean reuseConnection)
+      throws Exception {
+    final Location location = reuseConnection ? Location.reuseConnection() : server.getLocation();
+    final ScriptedPollQuery script =
+        scripted(Answer.endpoints(2), Answer.empty(), Answer.done(1))
+            .endpointLocations(location)
+            .rowsPerEndpoint(2);
+    final List<Integer> rows;
+    try (Connection connection = connect("pollInfoPrefetch=2&pollInfoMaxBackoffMs=20");
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(script.query())) {
+      rows = readAll(resultSet);
+    }
+    assertEquals(List.of(0, 1, 100, 101, 200, 201), sorted(rows));
+    assertEquals(3, script.doGetStarted());
+    assertEquals(List.of(0, 1, 2), script.pollIndices());
+  }
+
+  // Mock fidelity: streams with several batches and an empty batch in front of the data. The next
+  // batch of an endpoint must not free its slot; the end of its stream must.
+  @Test
+  public void multiBatchStreamsWithAnEmptyLeadingBatchAreReadInOrder() throws Exception {
+    final ScriptedPollQuery script =
+        scripted(Answer.endpoints(1), Answer.endpoints(1), Answer.done(1))
+            .rowsPerEndpoint(2)
+            .batchesPerEndpoint(3)
+            .leadingEmptyBatch();
+    final List<Integer> rows;
+    try (Connection connection = connect("pollInfoPrefetch=2");
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(script.query())) {
+      rows = readAll(resultSet);
+    }
+    assertEquals(
+        List.of(0, 1, 2, 3, 4, 5, 100, 101, 102, 103, 104, 105, 200, 201, 202, 203, 204, 205),
+        sorted(rows));
+    for (int endpoint = 0; endpoint < 3; endpoint++) {
+      final int first = endpoint * 100;
+      assertEquals(
+          List.of(first, first + 1, first + 2, first + 3, first + 4, first + 5),
+          rows.stream().filter(row -> row / 100 == first / 100).collect(Collectors.toList()),
+          "the batches of endpoint " + endpoint + " arrived out of order");
+    }
+    assertEquals(List.of(0, 1, 2), script.pollIndices());
+    assertTrue(script.maxOpenStreams() <= 2);
+  }
+
   // ---- helpers ----------------------------------------------------------------------------
 
   private static ScriptedPollQuery scripted(final Answer... answers) {
@@ -769,12 +998,18 @@ public class PollAheadTest {
   }
 
   private static void awaitPollerPoolIdle(final Connection connection) throws Exception {
+    awaitPollerPoolIdle(connection, WAIT_MS);
+  }
+
+  private static void awaitPollerPoolIdle(final Connection connection, final long millis)
+      throws Exception {
     final ThreadPoolExecutor pool =
         connection.unwrap(ArrowFlightConnection.class).getPollerExecutor();
-    final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(WAIT_MS);
+    final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
     while (pool.getActiveCount() > 0) {
-      assertTrue(System.nanoTime() < deadline, "the poller pool never became idle");
-      Thread.onSpinWait();
+      assertTrue(
+          System.nanoTime() < deadline, "the poller pool was not idle within " + millis + " ms");
+      LockSupport.parkNanos(POLL_PARK_NANOS);
     }
   }
 
@@ -815,14 +1050,18 @@ public class PollAheadTest {
       return (List<Integer>) value;
     }
 
-    /** Waits until the thread is parked, i.e. blocked inside the driver. */
+    /**
+     * Waits until the thread is parked, i.e. blocked inside the driver. It cannot tell the cause: a
+     * reader blocked in {@code FlightStream.next()} looks the same as one waiting in the queue.
+     * Tests that need one of the two pin it with server state (held or gated streams and polls).
+     */
     void awaitBlocked() throws InterruptedException {
       final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(WAIT_MS);
       while (thread.getState() != Thread.State.WAITING
           && thread.getState() != Thread.State.TIMED_WAITING) {
         assertTrue(System.nanoTime() < deadline, "the reader never blocked");
         assertFalse(result.isDone(), "the reader finished instead of blocking");
-        Thread.onSpinWait();
+        LockSupport.parkNanos(POLL_PARK_NANOS);
       }
     }
 

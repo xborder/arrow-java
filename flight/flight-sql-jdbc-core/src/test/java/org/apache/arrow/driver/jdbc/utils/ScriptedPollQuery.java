@@ -36,6 +36,7 @@ import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightProducer.CallContext;
 import org.apache.arrow.flight.FlightProducer.ServerStreamListener;
+import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.PollInfo;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.flight.sql.impl.FlightSql.CommandStatementQuery;
@@ -116,12 +117,22 @@ public final class ScriptedPollQuery {
     }
   }
 
+  /** How an answer breaks the append-only rule for the endpoints published so far. */
+  private enum Tamper {
+    NONE,
+    /** Publishes one endpoint fewer than the previous answer did. */
+    SHRINK,
+    /** Publishes as many endpoints as before, with the first one's ticket replaced. */
+    CHANGED_TICKET
+  }
+
   /** The server's answer to one poll. */
   public static final class Answer {
     private final int newEndpoints;
     private final boolean done;
     private final boolean failure;
     private final boolean schemaChange;
+    private final Tamper tamper;
     private final CountDownLatch gate;
 
     private Answer(
@@ -129,22 +140,24 @@ public final class ScriptedPollQuery {
         final boolean done,
         final boolean failure,
         final boolean schemaChange,
+        final Tamper tamper,
         final CountDownLatch gate) {
       this.newEndpoints = newEndpoints;
       this.done = done;
       this.failure = failure;
       this.schemaChange = schemaChange;
+      this.tamper = tamper;
       this.gate = gate;
     }
 
     /** Publishes {@code count} more endpoints; the query keeps running. */
     public static Answer endpoints(final int count) {
-      return new Answer(count, false, false, false, null);
+      return new Answer(count, false, false, false, Tamper.NONE, null);
     }
 
     /** Publishes {@code count} more endpoints and completes the query. */
     public static Answer done(final int count) {
-      return new Answer(count, true, false, false, null);
+      return new Answer(count, true, false, false, Tamper.NONE, null);
     }
 
     /** Publishes nothing; the query keeps running. */
@@ -154,12 +167,22 @@ public final class ScriptedPollQuery {
 
     /** Fails the poll with INTERNAL. */
     public static Answer fail() {
-      return new Answer(0, false, true, false, null);
+      return new Answer(0, false, true, false, Tamper.NONE, null);
     }
 
     /** Publishes one more endpoint but announces a different schema. */
     public static Answer schemaChange() {
-      return new Answer(1, false, false, true, null);
+      return new Answer(1, false, false, true, Tamper.NONE, null);
+    }
+
+    /** Publishes one endpoint fewer than before: an append-only violation. */
+    public static Answer shrink() {
+      return new Answer(0, false, false, false, Tamper.SHRINK, null);
+    }
+
+    /** Publishes the same number of endpoints, with the first one's ticket changed. */
+    public static Answer changedTicket() {
+      return new Answer(0, false, false, false, Tamper.CHANGED_TICKET, null);
     }
 
     /** Never answers; the poll ends only when the client cancels it or its deadline expires. */
@@ -169,7 +192,7 @@ public final class ScriptedPollQuery {
 
     /** Holds the answer until {@code gate} is released, or the client cancels the poll. */
     public Answer gatedBy(final CountDownLatch gate) {
-      return new Answer(newEndpoints, done, failure, schemaChange, gate);
+      return new Answer(newEndpoints, done, failure, schemaChange, tamper, gate);
     }
   }
 
@@ -178,6 +201,9 @@ public final class ScriptedPollQuery {
   private final List<Answer> answers;
   private final FlightDescriptor descriptor;
   private volatile int rowsPerEndpoint = 1;
+  private volatile int batchesPerEndpoint = 1;
+  private volatile boolean leadingEmptyBatch;
+  private volatile Location[] endpointLocations = new Location[0];
 
   private final List<Event> events = new ArrayList<>();
   private final Map<Integer, CountDownLatch> startGates = new HashMap<>();
@@ -207,6 +233,31 @@ public final class ScriptedPollQuery {
   public ScriptedPollQuery rowsPerEndpoint(final int rows) {
     this.rowsPerEndpoint = rows;
     return this;
+  }
+
+  /**
+   * Streams {@code batches} batches of {@link #rowsPerEndpoint(int)} rows per endpoint. Row {@code
+   * r} of batch {@code b} holds {@code id * 100 + b * rowsPerEndpoint + r}.
+   */
+  public ScriptedPollQuery batchesPerEndpoint(final int batches) {
+    this.batchesPerEndpoint = batches;
+    return this;
+  }
+
+  /** Every endpoint stream sends one batch with no rows before its data. */
+  public ScriptedPollQuery leadingEmptyBatch() {
+    this.leadingEmptyBatch = true;
+    return this;
+  }
+
+  /** Publishes every endpoint with these locations, like a server that names itself. */
+  public ScriptedPollQuery endpointLocations(final Location... locations) {
+    this.endpointLocations = locations.clone();
+    return this;
+  }
+
+  private Location[] locations() {
+    return endpointLocations;
   }
 
   /** The listed endpoints stream a single batch with no rows, then complete. */
@@ -511,10 +562,17 @@ public final class ScriptedPollQuery {
         published += answers.get(i).newEndpoints;
         schemaChanged |= answers.get(i).schemaChange;
       }
+      if (answer.tamper == Tamper.SHRINK) {
+        published = Math.max(0, published - 1);
+      }
       final List<FlightEndpoint> endpoints = new ArrayList<>();
       for (int id = 0; id < published; id++) {
+        final String ticket =
+            answer.tamper == Tamper.CHANGED_TICKET && id == 0
+                ? ticketPrefix() + "changed"
+                : ticketPrefix() + id;
         endpoints.add(
-            new FlightEndpoint(new Ticket((ticketPrefix() + id).getBytes(StandardCharsets.UTF_8))));
+            new FlightEndpoint(new Ticket(ticket.getBytes(StandardCharsets.UTF_8)), locations()));
       }
       final FlightInfo info =
           new FlightInfo(schemaChanged ? CHANGED_SCHEMA : SCHEMA, descriptor, endpoints, -1, -1);
@@ -601,12 +659,21 @@ public final class ScriptedPollQuery {
         empty = emptyEndpoints.contains(id);
       }
       final int rows = empty ? 0 : rowsPerEndpoint;
-      for (int row = 0; row < rows; row++) {
-        vector.setSafe(row, id * 100 + row);
-      }
       listener.start(root);
-      root.setRowCount(rows);
-      listener.putNext();
+      if (empty || leadingEmptyBatch) {
+        root.setRowCount(0);
+        listener.putNext();
+      }
+      if (empty) {
+        return;
+      }
+      for (int batch = 0; batch < batchesPerEndpoint; batch++) {
+        for (int row = 0; row < rows; row++) {
+          vector.setSafe(row, id * 100 + batch * rows + row);
+        }
+        root.setRowCount(rows);
+        listener.putNext();
+      }
     }
   }
 }
