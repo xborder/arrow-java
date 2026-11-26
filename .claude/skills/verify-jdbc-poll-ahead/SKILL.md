@@ -48,7 +48,7 @@ Each rule is an INVARIANT or PROPERTY in `PollAhead.tla`.
 
 ## Coverage record
 
-Sync commit: `d7c3ed4ab4d30601447bc0518ac05294462b37d3` (branch `bdx-645-pollinfo-poc`, rebased on apache/arrow-java `10c55b9c8`). At that commit the poll-ahead poller exists, and the model matches it, including the finding below.
+Sync commit: `dadd45d8a` (branch `bdx-645-pollinfo-poc`, rebased on apache/arrow-java `10c55b9c8`). The model matches the main code there, including the idle-flag fix (`IdleFix = TRUE`). The diff `d7c3ed4ab..dadd45d8a` of the main code has two changes: the `idleTried = false` line in `awaitNext` (mirrored, see finding 1) and a rethrow of `queue.failure()` in `ResultSet.next()`'s `FlightRuntimeException` catch (not a model action: it only picks the exception thrown while the reader is blocked in a stream, and the application still gets a throw either way).
 
 Abbreviations, all under `flight/flight-sql-jdbc-core/src/main/java/org/apache/arrow/driver/jdbc/`: **P** = `EndpointPoller.java`, **Q** = `utils/FlightEndpointDataQueue.java`, **R** = `ArrowFlightJdbcFlightStreamResultSet.java`, **O** = `client/PollInfoOperation.java`.
 
@@ -64,7 +64,7 @@ Abbreviations, all under `flight/flight-sql-jdbc-core/src/main/java/org/apache/a
 | `OpenReserved`, `OpenFails` | Q `openReserved`, `register`, `releaseReservations`, `fail`. The `opening` count is `resv`. |
 | `AppRead`, `AppReadEmpty` | R `next` and `loadNextPublishedEndpoint` -> Q `awaitNext` taking a ready future, or a `null` future -> `onStreamFinished` (slot freed, `reserveSlotsLocked`, paused flag cleared). |
 | `ReaderResume`, `ReaderResumeRejected` | The resume action `onStreamFinished` runs after `lock.unlock()`: P `resume` (`owned` compare-and-set), `handBack` (`submit`, 10 attempts, then `orphaned.set(true)`, `wakeReader`). |
-| `AppIdle`, `InlineExit` | Q `awaitNext`'s idle hook -> P `runInlineIfOrphaned` (`drive(true)`). `idleTried` is the local variable in `awaitNext`. |
+| `AppIdle`, `InlineExit` | Q `awaitNext`'s idle hook -> P `runInlineIfOrphaned` (`drive(true)`). `idleTried` is the local variable in `awaitNext`; it is cleared after a wait and after every consumed future (`AppReadEmpty`, `IdleFix`). |
 | `ReaderWait` and the wakes (`WakeRd`) | Q `awaitNext` -> `awaitChange`; `signalAll` in `addEndpoints`, `register`, `releaseReservations`, `fail`, `close`, `wakeReader`. |
 | `AppEnd` | Q `awaitNext` returning `null` (futures empty, pending empty, `opening == 0`, `!moreExpected`, under the lock), R `next` returning false. |
 | `AppThrow` | Q `awaitNext` -> `checkOpen`, `throwIfFailed`; R `next` top-of-call checks of `cancelled` and `queue.failure()`. |
@@ -76,7 +76,7 @@ Abbreviations, all under `flight/flight-sql-jdbc-core/src/main/java/org/apache/a
 Run it when a diff touches any covered file:
 
 ```sh
-git diff --name-only d7c3ed4ab4d30601447bc0518ac05294462b37d3..HEAD -- \
+git diff --name-only dadd45d8a..HEAD -- \
   flight/flight-sql-jdbc-core/src/main/java/org/apache/arrow/driver/jdbc/ArrowFlightJdbcFlightStreamResultSet.java \
   flight/flight-sql-jdbc-core/src/main/java/org/apache/arrow/driver/jdbc/EndpointPoller.java \
   flight/flight-sql-jdbc-core/src/main/java/org/apache/arrow/driver/jdbc/ArrowFlightConnection.java \
@@ -101,7 +101,7 @@ Any output means the model may no longer describe the code. Also use this skill 
    N=4 formal/pollinfo-poll-ahead/run.sh
    ```
 
-   The script exits 0 only when every line says `ok`. The design checks must pass. `finding-open-streams` fails on `OpenWithinLimit` by design: it is the old `EagerOpen = TRUE` proposal, which the implementation does not follow. `finding-stale-idle` must fail on `Terminates` until the finding below is fixed in the code and `IdleFix` becomes the only behavior (then delete the constant, the finding row and the `idleReset` wording, and run the liveness check on the main row). Every broken variant must fail on its rule; they run with `IdleFix = TRUE` so the open finding cannot hide a variant that no longer fails. `openNotReserved` only fails from `N=4` on. A variant that suddenly passes means the model lost the ability to catch that bug: fix the model before you trust any pass.
+   The script exits 0 only when every line says `ok`. The design checks must pass. `finding-open-streams` fails on `OpenWithinLimit` by design: it is the old `EagerOpen = TRUE` proposal, which the implementation does not follow. `deferred-open` is the code as written, with `IdleFix = TRUE`, every safety rule and `Terminates`; it must pass. Every broken variant must fail on its rule; they run with `IdleFix = TRUE` so the stale-idle bug cannot hide a variant that no longer fails. `staleIdle` is the exception: it runs with `IdleFix = FALSE` and must fail on `Terminates`. `openNotReserved` only fails from `N=4` on. A variant that suddenly passes means the model lost the ability to catch that bug: fix the model before you trust any pass.
 3. **Read any failure with the pstack `/statechart` skill** (type `/pstack:statechart`). Give it a copy of `PollAhead.tla` and a config with the failing rule, in a scratch folder outside the repo. It prints the shortest path to the violation as numbered steps in plain words. When the model passes, it can draw how a result moves between states.
 4. **Decide whether it is a bug or a modeling error.** Replay the path against the real code, one model action per step: as a unit test with a scripted Flight SQL producer (see `PollingMockFlightSqlProducer` in the JDBC tests), or against the Go conformance server (branch `bdx-645-pollinfo-conformance-server` of `dremio-employees/helder.gregorio`). If the code does the same thing, it is a real bug: report it with the path in the code's words, and do not weaken the rule. If the code cannot take that path, the model is wrong: fix the action, and say what you fixed.
 5. **When a behavior change is intended**, change the action and, if a rule no longer applies, change that rule in a separate commit that explains why. Add a broken variant (a new `Mutation` value plus a `check` line in `run.sh`) for any new rule, and confirm it fails.
@@ -109,18 +109,18 @@ Any output means the model may no longer describe the code. Also use this skill 
 
 ## Known findings
 
-### 1. `finding-stale-idle`: `next()` can hang after a rejected resume (open in the code)
+### 1. Stale `idleTried`: `next()` could hang after a rejected resume (found by the model, fixed in `dadd45d8a`)
 
-`Terminates` fails on the model of the code at `d7c3ed4ab`. `FlightEndpointDataQueue.awaitNext` keeps a local `idleTried` flag (line 464). It sets it when the idle hook returns false (line 490) and clears it only after a wait (line 482). If an endpoint finishes between those two, the flag stays set. Shortest path, with a limit of 2 (`finding-stale-idle`, 16 steps):
+`Terminates` failed on the model of the code at `d7c3ed4ab` (check `finding-stale-idle`, now the broken variant `staleIdle` with `IdleFix = FALSE`, which still fails). `FlightEndpointDataQueue.awaitNext` keeps a local `idleTried` flag. It set it when the idle hook returned false and cleared it only after a wait. If an endpoint finished between those two, the flag stayed set. Shortest path, with a limit of 2 (16 steps):
 
-1. The application has read the first endpoint. `awaitNext` finds nothing queued, `moreExpected` true. It calls the idle hook (`EndpointPoller.runInlineIfOrphaned`), which returns false because the poller is not orphaned, so `idleTried = true` (line 490).
-2. Before the reader takes the lock again (line 468), the poller's open poll answers with two new endpoints. `addEndpoints` reserves both slots, `openReserved` registers the streams (futures not empty), and the poller pauses at the limit (`pauseIfFull`).
+1. The application has read the first endpoint. `awaitNext` finds nothing queued, `moreExpected` true. It calls the idle hook (`EndpointPoller.runInlineIfOrphaned`), which returns false because the poller is not orphaned, so `idleTried = true`.
+2. Before the reader takes the lock again, the poller's open poll answers with two new endpoints. `addEndpoints` reserves both slots, `openReserved` registers the streams (futures not empty), and the poller pauses at the limit (`pauseIfFull`).
 3. The reader takes the first new stream's future. It yields `null` (an endpoint with no rows). `onStreamFinished` frees a slot, clears the paused flag and runs the resume (`EndpointPoller.resume` -> `handBack`). The pool rejects the submit 10 times, so the poller is orphaned (`orphaned.set(true)`, `wakeReader()` on the reader's own thread, so nobody is waiting).
-4. The second new stream also yields `null`. The loop reaches the empty-futures branch with nothing queued and `moreExpected` true. `!idleTried` is false (line 477), so the reader does not run the orphaned poller. It waits (line 481) for a signal nobody will send.
+4. The second new stream also yields `null`. The loop reaches the empty-futures branch with nothing queued and `moreExpected` true. `!idleTried` is false, so the reader does not run the orphaned poller. It waits for a signal nobody will send.
 
-The code can take this path, but it is narrow: the poller must answer and register a stream inside the reader's few instructions between lines 490 and 468, the connection's poller pool must reject a resume (all `pollInfoPollerThreads` busy with other results, or the pool shut down; a fresh pool below its core size creates a thread instead), and the new endpoints must have no rows. When it happens, `next()` hangs until `cancel()` or `close()`. It was not replayed as a test.
+The path was narrow: the poller had to answer and register a stream inside the reader's few instructions between the idle hook and the next lock, the connection's poller pool had to reject a resume (all `pollInfoPollerThreads` busy with other results, or the pool shut down), and the new endpoints had to have no rows. When it happened, `next()` hung until `cancel()` or `close()`.
 
-Fix (checked as `IdleFix = TRUE`, `deferred-open-fixed`): clear `idleTried` whenever the loop consumes a future, for example right after `onStreamFinished(source)` (line 522). Another fix: test the `orphaned` flag inside the locked check at lines 472-483.
+Fix, in `dadd45d8a`: `awaitNext` sets `idleTried = false` right after `onStreamFinished(source)`. This is exactly `IdleFix = TRUE` (`AppReadEmpty` clears `idleTried`; `AppRead` returns to the application, where the local flag ends). Regression test: `rejectedResumeDuringTheIdleHookDoesNotStrandTheReader` in `FlightEndpointDataQueueDeferredOpenTest`. Commit `dadd45d8a` (`next()` rethrows `queue.failure()` before the CANCELLED mapping) changes only which exception a blocked reader throws, not any model action.
 
 ### 2. `finding-open-streams`: the first proposal (`EagerOpen = TRUE`, resolved)
 
@@ -129,4 +129,4 @@ Fix (checked as `IdleFix = TRUE`, `deferred-open-fixed`): clear `idleTried` when
 ## Files
 
 - `formal/pollinfo-poll-ahead/PollAhead.tla`: the model, with the code map in its header.
-- `formal/pollinfo-poll-ahead/run.sh`: all design checks and broken variants, with their expected results. Variants: `endWhenQueueEmpty`, `endIgnoresOpening`, `finishBeforeEnqueue`, `enqueueWholeList`, `reuseContinuation`, `readAfterFail`, `cancelIgnoresPoller`, `noLimit`, `openNotReserved`, `noBackoff`, `noWake`, `pauseNotAtomic`, `ownedClearedLate`, `noIdleHook`.
+- `formal/pollinfo-poll-ahead/run.sh`: all design checks and broken variants, with their expected results. Variants: `staleIdle`, `endWhenQueueEmpty`, `endIgnoresOpening`, `finishBeforeEnqueue`, `enqueueWholeList`, `reuseContinuation`, `readAfterFail`, `cancelIgnoresPoller`, `noLimit`, `openNotReserved`, `noBackoff`, `noWake`, `pauseNotAtomic`, `ownedClearedLate`, `noIdleHook`.

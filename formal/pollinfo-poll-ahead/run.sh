@@ -60,14 +60,13 @@ check() {
 
 echo "PollAhead model check  N=$N  Limit=$LIMIT  ($(java -cp "$JAR" tlc2.TLC 2>&1 | head -1))"
 echo
-echo "Design checks (IdleFix = TRUE is the proposed fix; FALSE is the code at the sync commit)"
+echo "Design checks (IdleFix = TRUE is the code: awaitNext clears idleTried after every consumed future)"
 check proposal-as-written     TRUE  TRUE  none "$SAFE"          yes pass                      "streams open as soon as endpoints are enqueued"
 check finding-open-streams    TRUE  TRUE  none "OpenWithinLimit" no invariant:OpenWithinLimit "KNOWN FINDING: one answer can add more streams than the limit"
-check deferred-open-fixed     FALSE TRUE  none "$ALL"           yes pass                      "deferred open, idle flag cleared on progress"
-check deferred-open           FALSE FALSE none "$ALL"           no  pass                      "the code as written: every safety rule holds"
-check finding-stale-idle      FALSE FALSE none "TypeOK"         yes liveness                  "KNOWN FINDING: next() can hang after a rejected resume (stale idleTried)"
+check deferred-open           FALSE TRUE  none "$ALL"           yes pass                      "the code as written: every safety rule and Terminates hold"
 echo
-echo "Broken variants (each must fail on the rule it targets; the idle fix is on, so only the variant is at fault)"
+echo "Broken variants (each must fail on the rule it targets; the idle fix is on, so only the variant is at fault,"
+echo "except staleIdle, which turns the idle fix off: the bug fixed in dadd45d8a)"
 check endWhenQueueEmpty       FALSE TRUE  endWhenQueueEmpty   "$ALL" no invariant:NoPrematureEnd     "next() ends when the queue is empty"
 check endIgnoresOpening       FALSE TRUE  endIgnoresOpening   "$ALL" no invariant:NoPrematureEnd     "end test forgets streams still opening"
 check finishBeforeEnqueue     FALSE TRUE  finishBeforeEnqueue "$ALL" no invariant:NoPrematureEnd     "moreExpected cleared before the final endpoints are queued"
@@ -85,6 +84,7 @@ check noWake                  FALSE TRUE  noWake              "$ALL" yes livenes
 check pauseNotAtomic          FALSE TRUE  pauseNotAtomic      "$ALL" yes liveness                    "limit check and pause in separate steps"
 check ownedClearedLate        FALSE TRUE  ownedClearedLate    "$ALL" yes liveness                    "pause clears owned after the lock: resume finds it set"
 check noIdleHook              FALSE TRUE  noIdleHook          "$ALL" yes liveness                    "an orphaned poller is never run inline"
+check staleIdle               FALSE FALSE none                "$SAFE" yes liveness                   "idleTried not cleared after a consumed future (rejected resume strands next())"
 
 echo
 if [ "$unexpected" -eq 0 ]; then echo "All checks matched their expectations."; else echo "Some checks did not match. See above."; fi

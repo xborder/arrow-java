@@ -64,8 +64,8 @@ CONSTANTS
     N,          \* most endpoints the query can publish
     Limit,      \* pollInfoPrefetch: the poller polls only while queued, unread endpoints < Limit
     EagerOpen,  \* TRUE: every enqueued endpoint takes a stream slot at once (the proposal as first written)
-    IdleFix,    \* FALSE: the code at the sync commit (the reader clears its idle flag only after a wait);
-                \* TRUE: the proposed fix (it also clears it whenever it finishes an endpoint)
+    IdleFix,    \* TRUE: the code (awaitNext clears idleTried after a wait and after every consumed
+                \* future, dadd45d8a); FALSE: the stale-idle bug, kept to show that the model catches it
     Mutation    \* "none", or the name of a deliberately broken variant (see run.sh)
 
 VARIABLES
@@ -405,7 +405,8 @@ AppRead ==
                    badPoll, polledAtLimit, resent, spun>>
 
 \* Take a null future (an endpoint with no rows) and finish it. awaitNext loops without
-\* returning to the application, so idleTried keeps its value unless IdleFix.
+\* returning to the application. The code clears idleTried right after onStreamFinished
+\* (IdleFix); without it the flag would stay set (the bug fixed in dadd45d8a).
 AppReadEmpty ==
     /\ app = "reading"
     /\ rd = "run"
