@@ -234,9 +234,15 @@ public final class ArrowFlightConnection extends AvaticaConnection {
       executor = pollerExecutor;
     }
     if (executor != null) {
-      executor.shutdownNow();
-      if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
-        LOGGER.warn("PollFlightInfo poller threads did not terminate within 5 seconds");
+      // The statements were closed, so every poller is ending. One that failed the result on a
+      // deadline is still sending its CancelFlightInfo (bounded to 1 s): interrupting it now would
+      // drop the cancel, so give the pollers a moment before interrupting them.
+      executor.shutdown();
+      if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+        executor.shutdownNow();
+        if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+          LOGGER.warn("PollFlightInfo poller threads did not terminate within 5 seconds");
+        }
       }
     }
   }

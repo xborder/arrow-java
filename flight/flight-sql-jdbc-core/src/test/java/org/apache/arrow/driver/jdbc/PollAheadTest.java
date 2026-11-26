@@ -923,6 +923,25 @@ public class PollAheadTest {
     assertTrue(script.maxOpenStreams() <= 2);
   }
 
+  // Reproduction of a dropped CancelFlightInfo: the poller records the failure first and sends
+  // the (blocking) cancel after it, so a connection that is closed as soon as next() threw used
+  // to interrupt the cancel before it reached the server.
+  @Test
+  public void closingRightAfterTheDeadlineFailureStillSendsTheCancelFlightInfo() throws Exception {
+    final ScriptedPollQuery script = scripted(Answer.endpoints(1), Answer.hang());
+    try (Connection connection = connect("pollInfoPrefetch=2");
+        Statement statement = connection.createStatement()) {
+      statement.setQueryTimeout(1);
+      try (ResultSet resultSet = statement.executeQuery(script.query())) {
+        assertTrue(resultSet.next());
+        assertThrows(SQLTimeoutException.class, resultSet::next);
+      }
+    }
+    assertTrue(script.awaitCancelFlightInfo(1, WAIT_MS), "the CancelFlightInfo was dropped");
+    assertFalse(script.awaitCancelFlightInfo(2, QUIET_MS));
+    assertEquals(1, script.cancelFlightInfoCount());
+  }
+
   // ---- helpers ----------------------------------------------------------------------------
 
   private static ScriptedPollQuery scripted(final Answer... answers) {
