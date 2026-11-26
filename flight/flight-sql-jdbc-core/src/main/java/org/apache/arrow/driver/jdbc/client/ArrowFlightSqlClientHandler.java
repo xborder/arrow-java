@@ -161,111 +161,7 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
 
     try {
       for (FlightEndpoint endpoint : flightInfo.getEndpoints()) {
-        if (endpoint.getLocations().isEmpty()) {
-          // Create a stream using the current client only and do not close the client at
-          // the end.
-          endpoints.add(
-              new CloseableEndpointStreamPair(
-                  sqlClient.getStream(endpoint.getTicket(), getOptions()), null));
-        } else {
-          // Clone the builder and then set the new endpoint on it.
-
-          // GH-38574: Currently a new FlightClient will be made for each partition that
-          // returns a
-          // non-empty Location then disposed of. It may be better to cache clients
-          // because a server
-          // may report the same Locations. It would also be good to identify when the
-          // reported
-          // location
-          // is the same as the original connection's Location and skip creating a
-          // FlightClient in
-          // that scenario.
-          // Also copy the cache to the client so we can share a cache. Cache needs to
-          // cache
-          // negative attempts too.
-          List<Exception> exceptions = new ArrayList<>();
-          CloseableEndpointStreamPair stream = null;
-          FlightLocationQueue locations =
-              new FlightLocationQueue(flightClientCache, endpoint.getLocations());
-          while (locations.hasNext()) {
-            Location location = locations.next();
-            final URI endpointUri = location.getUri();
-            if (endpointUri.getScheme().equals(LocationSchemes.REUSE_CONNECTION)) {
-              stream =
-                  new CloseableEndpointStreamPair(
-                      sqlClient.getStream(endpoint.getTicket(), getOptions()), null);
-              break;
-            }
-            final boolean encryptEndpoint =
-                endpointUri.getScheme().equals(LocationSchemes.GRPC_TLS);
-            if (builder.useEncryption && !encryptEndpoint) {
-              exceptions.add(
-                  new SQLException(
-                      String.format(
-                          "Refusing to connect to endpoint location %s without encryption "
-                              + "because the connection to %s is encrypted.",
-                          endpointUri, builder.getLocation().getUri())));
-              continue;
-            }
-            final Builder builderForEndpoint =
-                new Builder(ArrowFlightSqlClientHandler.this.builder)
-                    .withHost(endpointUri.getHost())
-                    .withPort(endpointUri.getPort())
-                    .withEncryption(encryptEndpoint)
-                    .withHostnameOverride(builder.getHostnameOverrideForEndpoint(endpointUri))
-                    .withClientCache(flightClientCache)
-                    .withConnectTimeout(builder.connectTimeout);
-
-            ArrowFlightSqlClientHandler endpointHandler = null;
-            try {
-              endpointHandler = builderForEndpoint.build();
-              stream =
-                  new CloseableEndpointStreamPair(
-                      endpointHandler.sqlClient.getStream(
-                          endpoint.getTicket(), endpointHandler.getOptions()),
-                      endpointHandler.sqlClient);
-              // Make sure we actually get data from the server
-              stream.getStream().getSchema();
-            } catch (Exception ex) {
-              if (endpointHandler != null) {
-                // If the exception is related to connectivity, mark the client as a dud.
-                if (flightClientCache != null) {
-                  if (ex instanceof FlightRuntimeException
-                      && ((FlightRuntimeException) ex).status().code()
-                          == FlightStatusCode.UNAVAILABLE
-                      &&
-                      // IOException covers SocketException and Netty's (private)
-                      // AnnotatedSocketException
-                      // We are looking for things like "Network is unreachable"
-                      ex.getCause() instanceof IOException) {
-                    flightClientCache.markLocationAsDud(location.toString());
-                  }
-                }
-
-                AutoCloseables.close(endpointHandler);
-              }
-              exceptions.add(ex);
-              continue;
-            }
-
-            if (flightClientCache != null) {
-              flightClientCache.markLocationAsReachable(location.toString());
-            }
-            break;
-          }
-          if (stream != null) {
-            endpoints.add(stream);
-          } else if (exceptions.isEmpty()) {
-            // This should never happen...
-            throw new IllegalStateException("Could not connect to endpoint and no errors occurred");
-          } else {
-            Exception ex = exceptions.remove(0);
-            while (!exceptions.isEmpty()) {
-              ex.addSuppressed(exceptions.remove(exceptions.size() - 1));
-            }
-            throw ex;
-          }
-        }
+        endpoints.add(getStream(endpoint));
       }
     } catch (Exception outerException) {
       try {
@@ -280,6 +176,126 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
       throw new SQLException(outerException);
     }
     return endpoints;
+  }
+
+  /**
+   * Opens a single DoGet stream for one endpoint, trying the endpoint's locations in order.
+   *
+   * @param endpoint The {@link FlightEndpoint} to read.
+   * @return the open stream; the caller owns and must close it.
+   */
+  public CloseableEndpointStreamPair getStream(final FlightEndpoint endpoint) throws SQLException {
+    try {
+      return openStream(endpoint);
+    } catch (SQLException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new SQLException(e);
+    }
+  }
+
+  private CloseableEndpointStreamPair openStream(final FlightEndpoint endpoint) throws Exception {
+    if (endpoint.getLocations().isEmpty()) {
+      // Create a stream using the current client only and do not close the client at
+      // the end.
+      return new CloseableEndpointStreamPair(
+          sqlClient.getStream(endpoint.getTicket(), getOptions()), null);
+    }
+    // Clone the builder and then set the new endpoint on it.
+
+    // GH-38574: Currently a new FlightClient will be made for each partition that
+    // returns a
+    // non-empty Location then disposed of. It may be better to cache clients
+    // because a server
+    // may report the same Locations. It would also be good to identify when the
+    // reported
+    // location
+    // is the same as the original connection's Location and skip creating a
+    // FlightClient in
+    // that scenario.
+    // Also copy the cache to the client so we can share a cache. Cache needs to
+    // cache
+    // negative attempts too.
+    List<Exception> exceptions = new ArrayList<>();
+    CloseableEndpointStreamPair stream = null;
+    FlightLocationQueue locations =
+        new FlightLocationQueue(flightClientCache, endpoint.getLocations());
+    while (locations.hasNext()) {
+      Location location = locations.next();
+      final URI endpointUri = location.getUri();
+      if (endpointUri.getScheme().equals(LocationSchemes.REUSE_CONNECTION)) {
+        stream =
+            new CloseableEndpointStreamPair(
+                sqlClient.getStream(endpoint.getTicket(), getOptions()), null);
+        break;
+      }
+      final boolean encryptEndpoint = endpointUri.getScheme().equals(LocationSchemes.GRPC_TLS);
+      if (builder.useEncryption && !encryptEndpoint) {
+        exceptions.add(
+            new SQLException(
+                String.format(
+                    "Refusing to connect to endpoint location %s without encryption "
+                        + "because the connection to %s is encrypted.",
+                    endpointUri, builder.getLocation().getUri())));
+        continue;
+      }
+      final Builder builderForEndpoint =
+          new Builder(ArrowFlightSqlClientHandler.this.builder)
+              .withHost(endpointUri.getHost())
+              .withPort(endpointUri.getPort())
+              .withEncryption(encryptEndpoint)
+              .withHostnameOverride(builder.getHostnameOverrideForEndpoint(endpointUri))
+              .withClientCache(flightClientCache)
+              .withConnectTimeout(builder.connectTimeout);
+
+      ArrowFlightSqlClientHandler endpointHandler = null;
+      try {
+        endpointHandler = builderForEndpoint.build();
+        stream =
+            new CloseableEndpointStreamPair(
+                endpointHandler.sqlClient.getStream(
+                    endpoint.getTicket(), endpointHandler.getOptions()),
+                endpointHandler.sqlClient);
+        // Make sure we actually get data from the server
+        stream.getStream().getSchema();
+      } catch (Exception ex) {
+        if (endpointHandler != null) {
+          // If the exception is related to connectivity, mark the client as a dud.
+          if (flightClientCache != null) {
+            if (ex instanceof FlightRuntimeException
+                && ((FlightRuntimeException) ex).status().code() == FlightStatusCode.UNAVAILABLE
+                &&
+                // IOException covers SocketException and Netty's (private)
+                // AnnotatedSocketException
+                // We are looking for things like "Network is unreachable"
+                ex.getCause() instanceof IOException) {
+              flightClientCache.markLocationAsDud(location.toString());
+            }
+          }
+
+          AutoCloseables.close(endpointHandler);
+        }
+        exceptions.add(ex);
+        continue;
+      }
+
+      if (flightClientCache != null) {
+        flightClientCache.markLocationAsReachable(location.toString());
+      }
+      break;
+    }
+    if (stream != null) {
+      return stream;
+    } else if (exceptions.isEmpty()) {
+      // This should never happen...
+      throw new IllegalStateException("Could not connect to endpoint and no errors occurred");
+    } else {
+      Exception ex = exceptions.remove(0);
+      while (!exceptions.isEmpty()) {
+        ex.addSuppressed(exceptions.remove(exceptions.size() - 1));
+      }
+      throw ex;
+    }
   }
 
   /**

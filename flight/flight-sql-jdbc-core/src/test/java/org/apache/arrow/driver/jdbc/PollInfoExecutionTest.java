@@ -142,6 +142,26 @@ public class PollInfoExecutionTest {
   }
 
   @Test
+  public void pollAheadPollsContinuationsWhileTheApplicationHasNotReadFurther() throws Exception {
+    producer.configure(Scenario.MULTI_STEP, STATEMENT_FAMILY);
+    try (Connection connection = connect(true);
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(DIRECT_QUERY)) {
+      assertTrue(resultSet.next());
+      assertEquals(42, resultSet.getInt(1));
+      // The application does not call next() again, yet both continuations are polled.
+      final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (producer.pollDescriptors().size() < 3 && System.nanoTime() < deadline) {
+        Thread.sleep(10);
+      }
+      assertEquals(3, producer.pollDescriptors().size());
+      assertFalse(resultSet.next());
+    }
+    assertEquals(3, producer.pollDescriptors().size());
+    assertEquals(0, producer.cancelFlightInfoCount());
+  }
+
+  @Test
   public void preparedParametersAreBoundOnceBeforePolling() throws Exception {
     producer.configure(Scenario.MULTI_STEP, PREPARED_FAMILY);
     try (Connection connection = connect(true);
@@ -307,7 +327,7 @@ public class PollInfoExecutionTest {
   @Test
   public void statementCancelInterruptsContinuationAtReadBoundary() throws Exception {
     producer.configure(Scenario.CANCEL_OBSERVABLE, STATEMENT_FAMILY);
-    try (Connection connection = connect(true);
+    try (Connection connection = connect(true, 0);
         Statement statement = connection.createStatement()) {
       final AtomicReference<Throwable> failure = new AtomicReference<>();
       final AtomicBoolean resultSetCreated = new AtomicBoolean();
@@ -350,6 +370,16 @@ public class PollInfoExecutionTest {
         String.format(
             "jdbc:arrow-flight-sql://localhost:%d?useEncryption=false&usePollInfo=%s",
             server.getPort(), usePollInfo));
+  }
+
+  /** Connects with a fixed pollInfoPrefetch; 0 keeps the POC behavior of polling inside next(). */
+  private static Connection connect(final boolean usePollInfo, final int pollInfoPrefetch)
+      throws Exception {
+    return DriverManager.getConnection(
+        String.format(
+            "jdbc:arrow-flight-sql://localhost:%d?useEncryption=false&usePollInfo=%s"
+                + "&pollInfoPrefetch=%d",
+            server.getPort(), usePollInfo, pollInfoPrefetch));
   }
 
   private static void assertDirectRow(final Connection connection) throws Exception {

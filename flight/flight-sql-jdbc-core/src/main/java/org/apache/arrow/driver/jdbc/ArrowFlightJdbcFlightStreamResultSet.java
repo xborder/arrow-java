@@ -16,8 +16,6 @@
  */
 package org.apache.arrow.driver.jdbc;
 
-import static org.apache.arrow.driver.jdbc.utils.FlightEndpointDataQueue.createNewQueue;
-
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
@@ -57,9 +55,12 @@ public final class ArrowFlightJdbcFlightStreamResultSet
     extends ArrowFlightJdbcVectorSchemaRootResultSet {
 
   private final ArrowFlightConnection connection;
-  private FlightInfo flightInfo;
+  private volatile FlightInfo flightInfo;
   private final PollInfoOperation pollInfoOperation;
-  private int consumedEndpointCount;
+  // Written by whichever party currently owns polling (the poller, or the reader inline).
+  private volatile int consumedEndpointCount;
+  private EndpointPoller poller;
+  private int pollerQueryTimeoutSeconds;
   private CloseableEndpointStreamPair currentEndpointData;
   private FlightEndpointDataQueue flightEndpointDataQueue;
   private volatile boolean cancelled;
@@ -84,6 +85,9 @@ public final class ArrowFlightJdbcFlightStreamResultSet
     try {
       this.flightInfo = ((ArrowFlightInfoStatement) statement).executeFlightInfoQuery();
       this.pollInfoOperation = activePollInfoOperation(statement);
+      if (pollInfoOperation != null) {
+        pollInfoOperation.setMaxBackoffMillis(connection.getPollInfoMaxBackoffMs());
+      }
     } catch (FlightRuntimeException e) {
       if (e.status().code() != FlightStatusCode.TIMED_OUT) {
         throw e;
@@ -148,9 +152,24 @@ public final class ArrowFlightJdbcFlightStreamResultSet
     return resultSet;
   }
 
-  private void loadNewQueue() {
+  private boolean shouldPollAhead() {
+    return pollInfoOperation != null
+        && pollInfoOperation.hasContinuation()
+        && connection.getPollInfoPrefetch() > 0;
+  }
+
+  private void loadNewQueue(final boolean pollAhead) {
+    if (poller != null) {
+      poller.stop();
+      poller = null;
+    }
     Optional.ofNullable(flightEndpointDataQueue).ifPresent(AutoCloseables::closeNoChecked);
-    flightEndpointDataQueue = createNewQueue(connection.getExecutorService());
+    // Without poll-ahead the limit is lifted and every endpoint opens at once, as it always did.
+    flightEndpointDataQueue =
+        FlightEndpointDataQueue.createNewQueue(
+            connection.getExecutorService(),
+            pollAhead ? connection.getPollInfoPrefetch() : Integer.MAX_VALUE,
+            endpoint -> connection.getClientHandler().getStream(endpoint));
   }
 
   private void loadNewFlightStream() throws SQLException {
@@ -170,9 +189,26 @@ public final class ArrowFlightJdbcFlightStreamResultSet
   }
 
   private void populateData() throws SQLException {
-    loadNewQueue();
-    enqueueNewEndpoints(flightInfo);
-    loadNewFlightStream();
+    final boolean pollAhead = shouldPollAhead();
+    loadNewQueue(pollAhead);
+    try {
+      // The first answer goes through the queue too, so deferred opening applies to it.
+      appendEndpoints(flightInfo, pollAhead);
+      if (pollAhead) {
+        startPoller();
+      }
+      loadNewFlightStream();
+    } catch (final SQLException | RuntimeException e) {
+      if (poller != null) {
+        poller.stop();
+      }
+      try {
+        flightEndpointDataQueue.close();
+      } catch (final Exception closeException) {
+        e.addSuppressed(closeException);
+      }
+      throw e;
+    }
 
     // Ownership of the root will be passed onto the cursor.
     if (currentEndpointData != null) {
@@ -203,6 +239,14 @@ public final class ArrowFlightJdbcFlightStreamResultSet
 
   @Override
   public boolean next() throws SQLException {
+    // Fail fast: no row after a cancel, or after a background poll failed.
+    if (cancelled) {
+      throw AvaticaConnection.HELPER.createException("Statement canceled");
+    }
+    final FlightEndpointDataQueue queue = flightEndpointDataQueue;
+    if (queue != null && queue.failure() != null) {
+      throw queue.failure();
+    }
     if (currentVectorSchemaRoot == null) {
       if (!loadNextPublishedEndpoint()) {
         return false;
@@ -269,6 +313,9 @@ public final class ArrowFlightJdbcFlightStreamResultSet
   @Override
   protected void cancel() {
     cancelled = true;
+    if (poller != null) {
+      poller.stop();
+    }
     if (pollInfoOperation != null && !pollInfoOperation.isComplete()) {
       pollInfoOperation.cancel();
     }
@@ -296,6 +343,9 @@ public final class ArrowFlightJdbcFlightStreamResultSet
         return;
       }
       this.connection.onResultSetClose(id);
+      if (poller != null) {
+        poller.stop();
+      }
       if (flightEndpointDataQueue != null) {
         // flightStreamQueue should close currentFlightStream internally
         flightEndpointDataQueue.close();
@@ -401,7 +451,33 @@ public final class ArrowFlightJdbcFlightStreamResultSet
     throw exception;
   }
 
-  private void enqueueNewEndpoints(final FlightInfo updatedFlightInfo) throws SQLException {
+  private void startPoller() throws SQLException {
+    pollerQueryTimeoutSeconds = statement != null ? statement.getQueryTimeout() : 0;
+    final EndpointPoller newPoller =
+        new EndpointPoller(
+            flightEndpointDataQueue,
+            pollInfoOperation,
+            connection.getPollerExecutor(),
+            answer -> appendEndpoints(answer.flightInfo(), answer.hasContinuation()),
+            this::mapContinuationFailure,
+            this::finishPollInfoOperation,
+            connection.getPollInfoMaxBackoffMs());
+    flightEndpointDataQueue.setResumeAction(newPoller::resume);
+    flightEndpointDataQueue.setIdleAction(newPoller::runInlineIfOrphaned);
+    poller = newPoller;
+    if (newPoller.start()) {
+      return;
+    }
+    // The poller pool is busy: keep the behavior of polling inside next().
+    poller = null;
+    flightEndpointDataQueue.setResumeAction(null);
+    flightEndpointDataQueue.setIdleAction(null);
+    flightEndpointDataQueue.disablePollAhead();
+  }
+
+  /** Records the endpoints a poll answer appended, and whether more may follow, in one step. */
+  private void appendEndpoints(final FlightInfo updatedFlightInfo, final boolean moreExpected)
+      throws SQLException {
     final int updatedEndpointCount = updatedFlightInfo.getEndpoints().size();
     if (updatedEndpointCount < consumedEndpointCount) {
       throw new SQLException("PollInfo removed previously published endpoints");
@@ -410,33 +486,67 @@ public final class ArrowFlightJdbcFlightStreamResultSet
     if (schema != null && updatedSchema != null && !schema.equals(updatedSchema)) {
       throw new SQLException("PollInfo changed the result schema");
     }
-    if (updatedEndpointCount == consumedEndpointCount) {
-      flightInfo = updatedFlightInfo;
-      return;
-    }
     final List<FlightEndpoint> appendedEndpoints =
         new ArrayList<>(
             updatedFlightInfo.getEndpoints().subList(consumedEndpointCount, updatedEndpointCount));
-    final FlightInfo appendedInfo =
-        new FlightInfo(
-            updatedSchema,
-            updatedFlightInfo.getDescriptor(),
-            appendedEndpoints,
-            updatedFlightInfo.getBytes(),
-            updatedFlightInfo.getRecords());
-    enqueueEndpointData(
-        flightEndpointDataQueue, connection.getClientHandler().getStreams(appendedInfo));
+    try {
+      flightEndpointDataQueue.addEndpoints(appendedEndpoints, moreExpected);
+    } catch (final IllegalStateException e) {
+      throw normalizeClosedQueueException(flightEndpointDataQueue, e);
+    }
     consumedEndpointCount = updatedEndpointCount;
     flightInfo = updatedFlightInfo;
   }
 
+  /** Maps a failed background continuation poll to the exception the reader will throw. */
+  private SQLException mapContinuationFailure(final FlightRuntimeException e) {
+    if (e.status().code() == FlightStatusCode.CANCELLED
+        || e.status().code() == FlightStatusCode.TIMED_OUT) {
+      pollInfoOperation.cancel();
+    } else {
+      pollInfoOperation.terminate();
+    }
+    finishPollInfoOperation();
+    if (e.status().code() == FlightStatusCode.TIMED_OUT) {
+      final SQLTimeoutException timeout =
+          new SQLTimeoutException(
+              String.format(
+                  "Query timed out after %d %s", pollerQueryTimeoutSeconds, TimeUnit.SECONDS));
+      timeout.initCause(e);
+      return timeout;
+    }
+    return new SQLException("Continuation PollFlightInfo failed", e);
+  }
+
   private boolean loadNextPublishedEndpoint() throws SQLException {
+    if (poller != null) {
+      // Poll-ahead: the queue is the single source of truth. It waits while more may arrive, and
+      // null means every endpoint was read and the poller finished.
+      try {
+        currentEndpointData = getNextEndpointStream(false);
+      } catch (final FlightRuntimeException e) {
+        if ((cancelled || flightEndpointDataQueue.isClosed())
+            && e.status().code() == CallStatus.CANCELLED.code()) {
+          throw AvaticaConnection.HELPER.createException("Statement canceled");
+        }
+        throw e;
+      }
+      if (currentEndpointData != null) {
+        populateDataForCurrentFlightStream();
+        return true;
+      }
+      if (cancelled || flightEndpointDataQueue.isClosed()) {
+        throw AvaticaConnection.HELPER.createException("Statement canceled");
+      }
+      finishPollInfoOperation();
+      return false;
+    }
     if (pollInfoOperation == null || !pollInfoOperation.hasContinuation()) {
       finishPollInfoOperation();
       return false;
     }
     try {
-      enqueueNewEndpoints(pollInfoOperation.pollNextAvailable());
+      appendEndpoints(pollInfoOperation.pollNextAvailable(), false);
       currentEndpointData = getNextEndpointStream(false);
       if (currentEndpointData != null) {
         populateDataForCurrentFlightStream();

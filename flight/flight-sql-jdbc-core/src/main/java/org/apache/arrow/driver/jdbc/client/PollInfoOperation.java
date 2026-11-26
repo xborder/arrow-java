@@ -20,6 +20,7 @@ import io.grpc.Context;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
@@ -46,6 +47,8 @@ public final class PollInfoOperation implements AutoCloseable {
   private final boolean progressive;
   private final Context.CancellableContext context;
   private final AtomicBoolean cancelled = new AtomicBoolean();
+  private final CountDownLatch cancelLatch = new CountDownLatch(1);
+  private volatile long maxBackoffMillis = PollBackoff.DEFAULT_MAX_MILLIS;
   private final AtomicBoolean cancelFlightInfoAttempted = new AtomicBoolean();
   private volatile FlightInfo latestFlightInfo;
   private volatile FlightDescriptor continuationDescriptor;
@@ -98,6 +101,7 @@ public final class PollInfoOperation implements AutoCloseable {
   /** Cancel the active PollFlightInfo call, if any. */
   public void cancel() {
     cancelled.set(true);
+    cancelLatch.countDown();
     context.cancel(null);
     final Runnable cleanup = cancelFlightInfo;
     if (cleanup != null) {
@@ -140,17 +144,104 @@ public final class PollInfoOperation implements AutoCloseable {
     continuationDescriptor = null;
   }
 
-  /** Poll until another endpoint is appended, the query completes, or the poll fails. */
-  public synchronized FlightInfo pollNextAvailable() {
+  /** Set the longest wait between answers that add no endpoints. */
+  public void setMaxBackoffMillis(final long maxBackoffMillis) {
+    this.maxBackoffMillis = Math.max(1L, maxBackoffMillis);
+  }
+
+  /** The longest wait between answers that add no endpoints. */
+  public long maxBackoffMillis() {
+    return maxBackoffMillis;
+  }
+
+  /**
+   * Poll until another endpoint is appended, the query completes, or the poll fails. After an
+   * answer that adds nothing while the query is still running, wait with exponential backoff (100
+   * ms doubling up to {@link #maxBackoffMillis()}) before the next poll.
+   */
+  public FlightInfo pollNextAvailable() {
     final int previousEndpointCount = endpointCount(latestFlightInfo);
+    final PollBackoff backoff = new PollBackoff(maxBackoffMillis);
     while (continuationDescriptor != null) {
       remember(poll(continuationDescriptor));
       if (endpointCount(latestFlightInfo) > previousEndpointCount
           || continuationDescriptor == null) {
         return latestFlightInfo;
       }
+      if (!backoff(backoff.nextDelayMillis())) {
+        throw CallStatus.CANCELLED.withDescription("Statement canceled").toRuntimeException();
+      }
     }
     return latestFlightInfo;
+  }
+
+  /**
+   * Poll the held continuation exactly once and remember the answer. The operation monitor is not
+   * held across the RPC, so {@link #cancel()} always gets through.
+   *
+   * @return the answer, or {@code null} when no continuation is held.
+   */
+  public PollAnswer pollOnce() {
+    final FlightDescriptor descriptor = continuationDescriptor;
+    if (descriptor == null) {
+      return null;
+    }
+    final PollInfo pollInfo = poll(descriptor);
+    synchronized (this) {
+      final int before = endpointCount(latestFlightInfo);
+      remember(pollInfo);
+      return new PollAnswer(
+          latestFlightInfo,
+          endpointCount(latestFlightInfo) > before,
+          continuationDescriptor != null);
+    }
+  }
+
+  /**
+   * Wait for the backoff delay, but never past the operation deadline. Returns early, with {@code
+   * false}, when the operation is cancelled or the thread is interrupted (the interrupt flag is
+   * restored).
+   */
+  public boolean backoff(final long delayMillis) {
+    long delayNanos = TimeUnit.MILLISECONDS.toNanos(delayMillis);
+    if (deadlineNanos != NO_DEADLINE) {
+      delayNanos = Math.min(delayNanos, Math.max(0L, remainingTimeoutNanos()));
+    }
+    try {
+      return !cancelLatch.await(delayNanos, TimeUnit.NANOSECONDS);
+    } catch (final InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return false;
+    }
+  }
+
+  /** The result of one continuation poll. */
+  public static final class PollAnswer {
+    private final FlightInfo flightInfo;
+    private final boolean addedEndpoints;
+    private final boolean hasContinuation;
+
+    PollAnswer(
+        final FlightInfo flightInfo, final boolean addedEndpoints, final boolean hasContinuation) {
+      this.flightInfo = flightInfo;
+      this.addedEndpoints = addedEndpoints;
+      this.hasContinuation = hasContinuation;
+    }
+
+    /** The cumulative FlightInfo of this answer. */
+    public FlightInfo flightInfo() {
+      return flightInfo;
+    }
+
+    /** Whether this answer published more endpoints than the previous one. */
+    public boolean addedEndpoints() {
+      return addedEndpoints;
+    }
+
+    /** Whether the query is still running (the answer carries a continuation). */
+    public boolean hasContinuation() {
+      return hasContinuation;
+    }
   }
 
   FlightInfo latestFlightInfo() {

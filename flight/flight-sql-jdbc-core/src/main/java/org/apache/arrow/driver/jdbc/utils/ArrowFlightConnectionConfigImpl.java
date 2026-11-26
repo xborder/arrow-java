@@ -212,6 +212,28 @@ public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl 
   }
 
   /**
+   * Most queued, unread endpoints during progressive PollFlightInfo execution. Negative means auto:
+   * {@code max(2, threadPoolSize)}. Zero disables background polling (the reader polls inside
+   * {@code next()}).
+   */
+  public int pollInfoPrefetch() {
+    final int configured = ArrowFlightConnectionProperty.POLL_INFO_PREFETCH.getInteger(properties);
+    return configured < 0 ? Math.max(2, threadPoolSize()) : configured;
+  }
+
+  /** Size of the connection's pool of background PollFlightInfo pollers. */
+  public int pollInfoPollerThreads() {
+    return Math.max(
+        1, ArrowFlightConnectionProperty.POLL_INFO_POLLER_THREADS.getInteger(properties));
+  }
+
+  /** Longest wait, in milliseconds, between PollFlightInfo answers that add no endpoints. */
+  public long pollInfoMaxBackoffMs() {
+    return Math.max(
+        1L, ArrowFlightConnectionProperty.POLL_INFO_MAX_BACKOFF_MS.getInteger(properties));
+  }
+
+  /**
    * Gets the {@link CallOption}s from this {@link ConnectionConfig}.
    *
    * @return the call options.
@@ -298,6 +320,9 @@ public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl 
     CONNECT_TIMEOUT_MILLIS("connectTimeoutMs", 10000, Type.NUMBER, false),
     USE_CLIENT_CACHE("useClientCache", true, Type.BOOLEAN, false),
     USE_POLL_INFO("usePollInfo", true, Type.BOOLEAN, false),
+    POLL_INFO_PREFETCH("pollInfoPrefetch", -1, Type.NUMBER, false),
+    POLL_INFO_POLLER_THREADS("pollInfoPollerThreads", 4, Type.NUMBER, false),
+    POLL_INFO_MAX_BACKOFF_MS("pollInfoMaxBackoffMs", 5000, Type.NUMBER, false),
 
     // OAuth configuration properties
     OAUTH_FLOW("oauth.flow", null, Type.STRING, false),
