@@ -22,8 +22,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -77,6 +79,7 @@ public final class ScriptedPollQuery {
     POLL,
     POLL_CANCELLED,
     DOGET_START,
+    BATCH_SENT,
     DOGET_END,
     DOGET_CANCELLED,
     CANCEL_FLIGHT_INFO
@@ -179,6 +182,8 @@ public final class ScriptedPollQuery {
   private final List<Event> events = new ArrayList<>();
   private final Map<Integer, CountDownLatch> startGates = new HashMap<>();
   private final Map<Integer, CountDownLatch> endGates = new HashMap<>();
+  private final Set<Integer> emptyEndpoints = new HashSet<>();
+  private volatile CountDownLatch cancelFlightInfoGate;
   private final CountDownLatch blockedPoll = new CountDownLatch(1);
   private final CountDownLatch pollTerminated = new CountDownLatch(1);
   private int openStreams;
@@ -202,6 +207,29 @@ public final class ScriptedPollQuery {
   public ScriptedPollQuery rowsPerEndpoint(final int rows) {
     this.rowsPerEndpoint = rows;
     return this;
+  }
+
+  /** The listed endpoints stream a single batch with no rows, then complete. */
+  public ScriptedPollQuery emptyEndpoints(final int... ids) {
+    synchronized (this) {
+      for (final int id : ids) {
+        emptyEndpoints.add(id);
+      }
+    }
+    return this;
+  }
+
+  /** Makes the server hold its CancelFlightInfo answer until {@link #releaseCancelFlightInfo()}. */
+  public ScriptedPollQuery holdCancelFlightInfo() {
+    cancelFlightInfoGate = new CountDownLatch(1);
+    return this;
+  }
+
+  public void releaseCancelFlightInfo() {
+    final CountDownLatch gate = cancelFlightInfoGate;
+    if (gate != null) {
+      gate.countDown();
+    }
   }
 
   // ---- hold and release -------------------------------------------------------------------
@@ -415,6 +443,14 @@ public final class ScriptedPollQuery {
 
   void recordCancelFlightInfo() {
     record(EventType.CANCEL_FLIGHT_INFO, 0);
+    final CountDownLatch gate = cancelFlightInfoGate;
+    if (gate != null) {
+      try {
+        gate.await(10, TimeUnit.SECONDS);
+      } catch (final InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
   }
 
   private FlightDescriptor continuation(final int index) {
@@ -516,6 +552,7 @@ public final class ScriptedPollQuery {
         return;
       }
       sendBatch(id, listener);
+      record(EventType.BATCH_SENT, id);
       if (!awaitStreamGate(endGates, id, listener)) {
         return;
       }
@@ -559,11 +596,16 @@ public final class ScriptedPollQuery {
         VectorSchemaRoot root = VectorSchemaRoot.create(SCHEMA, allocator)) {
       root.allocateNew();
       final IntVector vector = (IntVector) root.getVector("answer");
-      for (int row = 0; row < rowsPerEndpoint; row++) {
+      final boolean empty;
+      synchronized (this) {
+        empty = emptyEndpoints.contains(id);
+      }
+      final int rows = empty ? 0 : rowsPerEndpoint;
+      for (int row = 0; row < rows; row++) {
         vector.setSafe(row, id * 100 + row);
       }
-      root.setRowCount(rowsPerEndpoint);
       listener.start(root);
+      root.setRowCount(rows);
       listener.putNext();
     }
   }

@@ -59,6 +59,8 @@ import org.apache.arrow.vector.util.Text;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /** Executable POC coverage for synchronous PollInfo through the unchanged JDBC surface. */
 public class PollInfoExecutionTest {
@@ -232,15 +234,27 @@ public class PollInfoExecutionTest {
     assertEquals(0, producer.getFlightInfoCount());
   }
 
-  @Test
-  public void continuationUnimplementedDoesNotFallbackOrReexecute() throws Exception {
+  @ParameterizedTest
+  @ValueSource(ints = {0, 2})
+  public void continuationUnimplementedDoesNotFallbackOrReexecute(final int pollInfoPrefetch)
+      throws Exception {
     producer.configure(Scenario.CONTINUATION_UNIMPLEMENTED, STATEMENT_FAMILY);
-    try (Connection connection = connect(true);
+    try (Connection connection = connect(true, pollInfoPrefetch);
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery(DIRECT_QUERY)) {
-      assertTrue(resultSet.next());
-      assertEquals(42, resultSet.getInt(1));
-      final Throwable failure = assertThrows(Throwable.class, resultSet::next);
+      if (pollInfoPrefetch == 0) {
+        assertTrue(resultSet.next());
+        assertEquals(42, resultSet.getInt(1));
+      }
+      // With poll-ahead the failed continuation fails fast, so it may surface before the first row.
+      final Throwable failure =
+          assertThrows(
+              Throwable.class,
+              () -> {
+                while (resultSet.next()) {
+                  assertEquals(42, resultSet.getInt(1));
+                }
+              });
       assertTrue(hasFlightStatus(failure, FlightStatusCode.UNIMPLEMENTED), failure.toString());
     }
     assertEquals(2, producer.pollDescriptors().size());

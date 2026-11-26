@@ -21,6 +21,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import org.apache.arrow.driver.jdbc.client.PollBackoff;
 import org.apache.arrow.driver.jdbc.client.PollInfoOperation;
@@ -71,6 +72,7 @@ final class EndpointPoller {
   private final Executor executor;
   private final AnswerSink sink;
   private final Function<FlightRuntimeException, SQLException> failureMapper;
+  private final Consumer<FlightRuntimeException> afterFailure;
   private final Runnable onFinished;
   private final PollBackoff backoff;
 
@@ -85,6 +87,7 @@ final class EndpointPoller {
       final Executor executor,
       final AnswerSink sink,
       final Function<FlightRuntimeException, SQLException> failureMapper,
+      final Consumer<FlightRuntimeException> afterFailure,
       final Runnable onFinished,
       final long maxBackoffMillis) {
     this.queue = queue;
@@ -92,6 +95,7 @@ final class EndpointPoller {
     this.executor = executor;
     this.sink = sink;
     this.failureMapper = failureMapper;
+    this.afterFailure = afterFailure;
     this.onFinished = onFinished;
     this.backoff = new PollBackoff(maxBackoffMillis);
   }
@@ -144,8 +148,11 @@ final class EndpointPoller {
     }
     try {
       drive(true);
-    } catch (final RuntimeException e) {
-      fail(e);
+    } catch (final Throwable t) {
+      fail(t);
+      if (t instanceof Error) {
+        throw (Error) t;
+      }
     }
     return true;
   }
@@ -176,8 +183,12 @@ final class EndpointPoller {
   private void runOnPool() {
     try {
       drive(false);
-    } catch (final RuntimeException e) {
-      fail(e);
+    } catch (final Throwable t) {
+      // Whatever ends the poller must reach the reader, or next() would wait forever.
+      fail(t);
+      if (t instanceof Error) {
+        throw (Error) t;
+      }
     }
   }
 
@@ -267,10 +278,13 @@ final class EndpointPoller {
       return;
     }
     state = State.FAILED;
+    // The queue fails first, so the reader sees the failure at once; the cleanup (a blocking
+    // CancelFlightInfo RPC) follows.
     queue.fail(failureMapper.apply(e));
+    afterFailure.accept(e);
   }
 
-  private void fail(final RuntimeException e) {
+  private void fail(final Throwable e) {
     LOGGER.debug("PollFlightInfo poller failed unexpectedly", e);
     state = State.FAILED;
     queue.fail(new SQLException("Continuation PollFlightInfo failed", e));

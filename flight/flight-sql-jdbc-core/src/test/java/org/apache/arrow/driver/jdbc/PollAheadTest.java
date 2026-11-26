@@ -39,6 +39,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.arrow.driver.jdbc.utils.PollingMockFlightSqlProducer;
 import org.apache.arrow.driver.jdbc.utils.ScriptedPollQuery;
 import org.apache.arrow.driver.jdbc.utils.ScriptedPollQuery.Answer;
@@ -521,6 +522,178 @@ public class PollAheadTest {
     }
   }
 
+  // F1. A finished endpoint frees its slot when the application finishes it, not when a reader
+  // task later consumes the end of the stream.
+  @Test
+  public void steadyStateOverlapPollsWhileTheNextEndpointIsStillUnread() throws Exception {
+    // E0 is held after its row, so E1's batch is ready (and its future completed) before the
+    // application finishes E0. Completion order would hand E1 to the application first and keep
+    // E0's slot until E1 was fully read.
+    final ScriptedPollQuery script =
+        scripted(Answer.endpoints(1), Answer.endpoints(1), Answer.endpoints(1), Answer.done(0))
+            .holdEnd(0)
+            .holdEnd(1)
+            .holdStart(1);
+    final List<Integer> rows = new ArrayList<>();
+    try (Connection connection = connect("pollInfoPrefetch=2");
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(script.query())) {
+      assertTrue(resultSet.next());
+      assertEquals(0, resultSet.getInt(1));
+      rows.add(0);
+      assertTrue(script.awaitPollCount(2, WAIT_MS));
+      assertFalse(script.awaitPollCount(3, QUIET_MS), "polled past the limit");
+
+      script.releaseStart(1);
+      assertTrue(script.awaitStream(EventType.BATCH_SENT, 1, WAIT_MS));
+      // Let the client's reader task receive E1's batch.
+      Thread.sleep(QUIET_MS);
+
+      try (AsyncReader reader =
+          new AsyncReader(() -> List.of(resultSet.next() ? resultSet.getInt(1) : -1))) {
+        script.releaseEnd(0);
+        rows.addAll(reader.rows());
+      }
+      // The application is now reading E1 (unread, still held on the server) and has not asked for
+      // more: finishing E0 alone must have resumed the poller.
+      assertTrue(script.awaitPollCount(3, WAIT_MS), "C2 waited for the application to go idle");
+      assertFalse(script.hasEvent(EventType.DOGET_END, 1));
+
+      script.releaseEnd(1);
+      rows.addAll(readAll(resultSet));
+    }
+    assertEquals(List.of(0, 100, 200), sorted(rows));
+    assertEquals(List.of(0, 1, 2, 3), script.pollIndices());
+  }
+
+  @Test
+  public void singleReaderThreadStillFreesAFinishedEndpointsSlot() throws Exception {
+    // threadPoolSize=1: E1's reader task, held before its first batch, occupies the only reader
+    // thread, so a marker task for the finished E0 could never run.
+    final ScriptedPollQuery script =
+        scripted(Answer.endpoints(1), Answer.endpoints(1), Answer.endpoints(1), Answer.done(0))
+            .holdStart(1);
+    final List<Integer> rows = new ArrayList<>();
+    try (Connection connection = connect(1, "pollInfoPrefetch=2");
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(script.query())) {
+      assertTrue(resultSet.next());
+      assertEquals(0, resultSet.getInt(1));
+      rows.add(0);
+      assertTrue(script.awaitPollCount(2, WAIT_MS));
+      assertFalse(script.awaitPollCount(3, QUIET_MS), "polled past the limit");
+
+      try (AsyncReader reader =
+          new AsyncReader(() -> List.of(resultSet.next() ? resultSet.getInt(1) : -1))) {
+        // E0 is done: its slot is freed on the application thread and the poller polls C2, while
+        // the application waits for E1 and the only reader thread is stuck on E1.
+        assertTrue(
+            script.awaitPollCount(3, WAIT_MS), "the slot of a finished endpoint stayed held");
+        reader.awaitBlocked();
+        script.releaseStart(1);
+        rows.addAll(reader.rows());
+      }
+      rows.addAll(readAll(resultSet));
+    }
+    assertEquals(List.of(0, 100, 200), sorted(rows));
+    assertEquals(List.of(0, 1, 2, 3), script.pollIndices());
+  }
+
+  // F3. executeQuery returns once the first endpoint exists; it does not wait for later ones.
+  @Test
+  public void executeQueryDoesNotWaitForFutureEndpointsWhenTheFirstHasNoRows() throws Exception {
+    final CountDownLatch gate = new CountDownLatch(1);
+    final ScriptedPollQuery script =
+        scripted(Answer.endpoints(1), Answer.done(1).gatedBy(gate)).emptyEndpoints(0);
+    try (Connection connection = connect("pollInfoPrefetch=2");
+        Statement statement = connection.createStatement()) {
+      final AtomicReference<ResultSet> opened = new AtomicReference<>();
+      try (AsyncReader execute =
+          new AsyncReader(
+              () -> {
+                opened.set(statement.executeQuery(script.query()));
+                return List.of();
+              })) {
+        execute.rows();
+      }
+      try (ResultSet resultSet = opened.get();
+          AsyncReader reader = new AsyncReader(() -> readAll(resultSet))) {
+        assertTrue(script.awaitBlockedPoll(WAIT_MS));
+        reader.awaitBlocked();
+        gate.countDown();
+        assertEquals(List.of(100), reader.rows());
+      }
+    }
+  }
+
+  // F3, held first stream: the first batch is enough; executeQuery does not wait for the stream to
+  // end or for the continuation.
+  @Test
+  public void executeQueryReturnsWhileTheFirstStreamIsHeldAfterItsFirstBatch() throws Exception {
+    final ScriptedPollQuery script = scripted(Answer.endpoints(1), Answer.hang()).holdEnd(0);
+    try (Connection connection = connect("pollInfoPrefetch=2");
+        Statement statement = connection.createStatement()) {
+      final AtomicReference<ResultSet> opened = new AtomicReference<>();
+      try (AsyncReader execute =
+          new AsyncReader(
+              () -> {
+                opened.set(statement.executeQuery(script.query()));
+                return List.of();
+              })) {
+        execute.rows();
+      }
+      try (ResultSet resultSet = opened.get()) {
+        assertTrue(resultSet.next());
+        assertEquals(0, resultSet.getInt(1));
+      }
+    }
+  }
+
+  // F4. The fallback path must not report the end while a continuation remains.
+  @Test
+  public void prefetchZeroDeliversRowsAfterAnEndpointWithoutRows() throws Exception {
+    final ScriptedPollQuery script =
+        scripted(Answer.endpoints(1), Answer.endpoints(1), Answer.done(1)).emptyEndpoints(1);
+    try (Connection connection = connect("pollInfoPrefetch=0");
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(script.query())) {
+      assertEquals(List.of(0, 200), readAll(resultSet));
+    }
+    assertEquals(List.of(0, 1, 2), script.pollIndices());
+  }
+
+  // F5. A cancel that races a poll in flight reports "Statement canceled", not a poll failure.
+  @Test
+  public void cancelRacingAPollInFlightReportsStatementCanceled() throws Exception {
+    // The server holds its CancelFlightInfo answer, so Statement.cancel() is still inside
+    // operation.cancel() (before ResultSet.cancel() raises its flag) when the poll ends.
+    final ScriptedPollQuery script =
+        scripted(Answer.endpoints(1), Answer.hang()).holdCancelFlightInfo();
+    try (Connection connection = connect("pollInfoPrefetch=2");
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(script.query())) {
+      assertTrue(resultSet.next());
+      try (AsyncReader reader = new AsyncReader(() -> readAll(resultSet));
+          AsyncReader canceller =
+              new AsyncReader(
+                  () -> {
+                    statement.cancel();
+                    return List.of();
+                  },
+                  false)) {
+        assertTrue(script.awaitBlockedPoll(WAIT_MS));
+        reader.awaitBlocked();
+        canceller.start();
+        final SQLException failure = reader.failure();
+        assertTrue(failure.getMessage().contains("Statement canceled"), failure.getMessage());
+        script.releaseCancelFlightInfo();
+        canceller.rows();
+      } finally {
+        script.releaseCancelFlightInfo();
+      }
+    }
+  }
+
   // ---- helpers ----------------------------------------------------------------------------
 
   private static ScriptedPollQuery scripted(final Answer... answers) {
@@ -530,11 +703,16 @@ public class PollAheadTest {
   // threadPoolSize=4: a stream held open must not starve the readers of the other streams, which
   // share one pool per connection (its default size is 1).
   private static Connection connect(final String properties) throws SQLException {
+    return connect(4, properties);
+  }
+
+  private static Connection connect(final int threadPoolSize, final String properties)
+      throws SQLException {
     return DriverManager.getConnection(
         String.format(
             "jdbc:arrow-flight-sql://localhost:%d?useEncryption=false&usePollInfo=true"
-                + "&threadPoolSize=4&%s",
-            server.getPort(), properties));
+                + "&threadPoolSize=%d&%s",
+            server.getPort(), threadPoolSize, properties));
   }
 
   private static List<Integer> readAll(final ResultSet resultSet) throws SQLException {
@@ -606,6 +784,11 @@ public class PollAheadTest {
     private final Thread thread;
 
     AsyncReader(final Callable<?> call) {
+      this(call, true);
+    }
+
+    /** With {@code start} false, the thread runs only once {@link #start()} is called. */
+    AsyncReader(final Callable<?> call, final boolean start) {
       thread =
           new Thread(
               () -> {
@@ -618,6 +801,12 @@ public class PollAheadTest {
               },
               "poll-ahead-test-reader");
       thread.setDaemon(true);
+      if (start) {
+        thread.start();
+      }
+    }
+
+    void start() {
       thread.start();
     }
 

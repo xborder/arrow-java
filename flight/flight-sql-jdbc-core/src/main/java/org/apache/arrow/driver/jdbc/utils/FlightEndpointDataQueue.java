@@ -245,6 +245,10 @@ public class FlightEndpointDataQueue implements AutoCloseable {
     lock.lock();
     try {
       checkOpen();
+      if (failure != null) {
+        // Fail fast: nothing is queued or opened after a failure; the reader rethrows it.
+        return;
+      }
       pending.addAll(endpoints);
       this.moreExpected = moreExpected;
       toOpen = reserveSlotsLocked();
@@ -338,26 +342,36 @@ public class FlightEndpointDataQueue implements AutoCloseable {
     return reserved;
   }
 
-  // Opens reserved endpoints without the lock. On failure, the rest are released and the queue
-  // fails.
+  // Opens reserved endpoints without the lock. On failure, or once the queue failed or closed, the
+  // reservations that were not handed to register() are released, even for an Error.
   private void openReserved(final List<FlightEndpoint> reserved) throws SQLException {
-    for (int index = 0; index < reserved.size(); index++) {
-      final CloseableEndpointStreamPair stream;
-      try {
-        stream = opener.open(reserved.get(index));
-      } catch (final SQLException | RuntimeException e) {
-        final SQLException cause =
-            e instanceof SQLException ? (SQLException) e : new SQLException(e);
-        releaseReservations(reserved.size() - index);
-        fail(cause);
-        throw cause;
+    int settled = 0;
+    try {
+      while (settled < reserved.size()) {
+        if (shutdown || failure != null) {
+          return;
+        }
+        final CloseableEndpointStreamPair stream;
+        try {
+          stream = opener.open(reserved.get(settled));
+        } catch (final SQLException | RuntimeException e) {
+          final SQLException cause =
+              e instanceof SQLException ? (SQLException) e : new SQLException(e);
+          fail(cause);
+          throw cause;
+        }
+        // From here register() settles this endpoint's reservation, even when it throws.
+        settled++;
+        try {
+          register(stream);
+        } catch (final RuntimeException e) {
+          fail(new SQLException("Failed to start reading an endpoint stream", e));
+          throw e;
+        }
       }
-      try {
-        register(stream);
-      } catch (final RuntimeException e) {
-        releaseReservations(reserved.size() - index - 1);
-        fail(new SQLException("Failed to start reading an endpoint stream", e));
-        throw e;
+    } finally {
+      if (settled < reserved.size()) {
+        releaseReservations(reserved.size() - settled);
       }
     }
   }
@@ -427,6 +441,25 @@ public class FlightEndpointDataQueue implements AutoCloseable {
     }
   }
 
+  /**
+   * The application read an endpoint's stream to its end. Frees the endpoint's slot at once, on the
+   * calling thread, under the queue lock: the open-unread count drops, the stream is closed,
+   * pending endpoints open, and a paused poller resumes. Nothing is re-enqueued, so a slot does not
+   * wait for a reader task or for the completion order of other endpoints.
+   *
+   * @param finished the stream the application just exhausted; it is closed here.
+   * @throws SQLException if opening a pending endpoint fails; the queue is then failed with it.
+   */
+  public void endpointExhausted(final CloseableEndpointStreamPair finished) throws SQLException {
+    checkNotNull(finished);
+    if (opener == null) {
+      // A queue without an opener has no slots; the reader task consumes the end of the stream.
+      enqueue(finished);
+      return;
+    }
+    onStreamFinished(finished);
+  }
+
   // The reader finished an endpoint: free its slot, open pending endpoints, and wake the poller.
   private void onStreamFinished(final CloseableEndpointStreamPair finished) throws SQLException {
     final List<FlightEndpoint> toOpen;
@@ -458,7 +491,10 @@ public class FlightEndpointDataQueue implements AutoCloseable {
   }
 
   private CloseableEndpointStreamPair awaitNext(
-      final boolean timed, final long timeoutValue, final TimeUnit timeoutUnit)
+      final boolean timed,
+      final long timeoutValue,
+      final TimeUnit timeoutUnit,
+      final boolean waitForMore)
       throws SQLException {
     final long deadlineNanos = timed ? System.nanoTime() + timeoutUnit.toNanos(timeoutValue) : 0L;
     boolean idleTried = false;
@@ -471,7 +507,7 @@ public class FlightEndpointDataQueue implements AutoCloseable {
         throwIfFailed();
         if (futures.isEmpty()) {
           final boolean nothingQueued = pending.isEmpty() && opening == 0;
-          if (nothingQueued && !moreExpected) {
+          if (nothingQueued && (!moreExpected || !waitForMore)) {
             return null;
           }
           if (nothingQueued && idleAction != null && !idleTried) {
@@ -511,7 +547,10 @@ public class FlightEndpointDataQueue implements AutoCloseable {
           throw (FlightRuntimeException) cause;
         }
         throw AvaticaConnection.HELPER.wrap(e.getMessage(), e);
-      } catch (InterruptedException | CancellationException e) {
+      } catch (final InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw AvaticaConnection.HELPER.wrap(e.getMessage(), e);
+      } catch (final CancellationException e) {
         throw AvaticaConnection.HELPER.wrap(e.getMessage(), e);
       }
       // Get the next FlightStream that has a root with content.
@@ -557,6 +596,7 @@ public class FlightEndpointDataQueue implements AutoCloseable {
     try {
       return completionService.take();
     } catch (final InterruptedException e) {
+      Thread.currentThread().interrupt();
       throw AvaticaConnection.HELPER.wrap(e.getMessage(), e);
     }
   }
@@ -572,6 +612,7 @@ public class FlightEndpointDataQueue implements AutoCloseable {
         return future;
       }
     } catch (final InterruptedException e) {
+      Thread.currentThread().interrupt();
       throw new SQLTimeoutException("Query was interrupted", e);
     }
     throw new SQLTimeoutException(
@@ -594,7 +635,7 @@ public class FlightEndpointDataQueue implements AutoCloseable {
    */
   public CloseableEndpointStreamPair next(final long timeoutValue, final TimeUnit timeoutUnit)
       throws SQLException {
-    return awaitNext(true, timeoutValue, timeoutUnit);
+    return awaitNext(true, timeoutValue, timeoutUnit, true);
   }
 
   /**
@@ -603,7 +644,24 @@ public class FlightEndpointDataQueue implements AutoCloseable {
    * @return a FlightStream that is ready to consume or null if all FlightStreams are ended.
    */
   public CloseableEndpointStreamPair next() throws SQLException {
-    return awaitNext(false, 0L, TimeUnit.NANOSECONDS);
+    return awaitNext(false, 0L, TimeUnit.NANOSECONDS, true);
+  }
+
+  /**
+   * Like {@link #next(long, TimeUnit)}, but returns {@code null} instead of waiting for endpoints
+   * that were not published yet: it waits only while a queued endpoint may still produce a batch.
+   * The first load of a result uses it, so that {@code executeQuery} does not wait for the poller.
+   *
+   * @return a FlightStream that is ready to consume, or null if no queued endpoint is left.
+   */
+  public CloseableEndpointStreamPair nextAvailable(
+      final long timeoutValue, final TimeUnit timeoutUnit) throws SQLException {
+    return awaitNext(true, timeoutValue, timeoutUnit, false);
+  }
+
+  /** Untimed variant of {@link #nextAvailable(long, TimeUnit)}. */
+  public CloseableEndpointStreamPair nextAvailable() throws SQLException {
+    return awaitNext(false, 0L, TimeUnit.NANOSECONDS, false);
   }
 
   /** Checks if this queue is open. */

@@ -109,7 +109,8 @@ public final class PollInfoOperation implements AutoCloseable {
     }
   }
 
-  boolean isCancelled() {
+  /** Whether {@link #cancel()} was called, by the statement, the deadline handling or close. */
+  public boolean isCancelled() {
     return cancelled.get();
   }
 
