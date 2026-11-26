@@ -37,6 +37,8 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 /** A {@link ConnectionConfig} for the {@link ArrowFlightConnection}. */
 public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl {
+  private static final int POLL_INFO_PREFETCH_AUTO = -1;
+
   public ArrowFlightConnectionConfigImpl(final Properties properties) {
     super(properties);
   }
@@ -212,13 +214,29 @@ public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl 
   }
 
   /**
-   * Most queued, unread endpoints during progressive PollFlightInfo execution. Negative means auto:
-   * {@code max(2, threadPoolSize)}. Zero disables background polling (the reader polls inside
-   * {@code next()}).
+   * Most queued, unread endpoints during progressive PollFlightInfo execution. {@code -1} (the
+   * default) means auto: {@code max(2, threadPoolSize)}; a positive value is the limit. The value
+   * is checked when the connection is created, see {@link #validatePollInfoPrefetch()}.
    */
   public int pollInfoPrefetch() {
     final int configured = ArrowFlightConnectionProperty.POLL_INFO_PREFETCH.getInteger(properties);
-    return configured < 0 ? Math.max(2, threadPoolSize()) : configured;
+    return configured == POLL_INFO_PREFETCH_AUTO ? Math.max(2, threadPoolSize()) : configured;
+  }
+
+  /**
+   * Checks the {@code pollInfoPrefetch} property: {@code -1} (auto) or a positive number. Zero and
+   * anything below {@code -1} are rejected, because a progressive result always polls ahead.
+   *
+   * @throws SQLException if the value is not allowed.
+   */
+  public void validatePollInfoPrefetch() throws SQLException {
+    final int configured = ArrowFlightConnectionProperty.POLL_INFO_PREFETCH.getInteger(properties);
+    if (configured != POLL_INFO_PREFETCH_AUTO && configured < 1) {
+      throw new SQLException(
+          String.format(
+              "Invalid pollInfoPrefetch value %d: use -1 (auto) or a positive number of endpoints.",
+              configured));
+    }
   }
 
   /** Size of the connection's pool of background PollFlightInfo pollers. */

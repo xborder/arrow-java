@@ -48,7 +48,6 @@ public final class PollInfoOperation implements AutoCloseable {
   private final Context.CancellableContext context;
   private final AtomicBoolean cancelled = new AtomicBoolean();
   private final CountDownLatch cancelLatch = new CountDownLatch(1);
-  private volatile long maxBackoffMillis = PollBackoff.DEFAULT_MAX_MILLIS;
   private final AtomicBoolean cancelFlightInfoAttempted = new AtomicBoolean();
   private volatile FlightInfo latestFlightInfo;
   private volatile FlightDescriptor continuationDescriptor;
@@ -143,37 +142,6 @@ public final class PollInfoOperation implements AutoCloseable {
   synchronized void complete(final FlightInfo flightInfo) {
     latestFlightInfo = flightInfo;
     continuationDescriptor = null;
-  }
-
-  /** Set the longest wait between answers that add no endpoints. */
-  public void setMaxBackoffMillis(final long maxBackoffMillis) {
-    this.maxBackoffMillis = Math.max(1L, maxBackoffMillis);
-  }
-
-  /** The longest wait between answers that add no endpoints. */
-  public long maxBackoffMillis() {
-    return maxBackoffMillis;
-  }
-
-  /**
-   * Poll until another endpoint is appended, the query completes, or the poll fails. After an
-   * answer that adds nothing while the query is still running, wait with exponential backoff (100
-   * ms doubling up to {@link #maxBackoffMillis()}) before the next poll.
-   */
-  public FlightInfo pollNextAvailable() {
-    final int previousEndpointCount = endpointCount(latestFlightInfo);
-    final PollBackoff backoff = new PollBackoff(maxBackoffMillis);
-    while (continuationDescriptor != null) {
-      remember(poll(continuationDescriptor));
-      if (endpointCount(latestFlightInfo) > previousEndpointCount
-          || continuationDescriptor == null) {
-        return latestFlightInfo;
-      }
-      if (!backoff(backoff.nextDelayMillis())) {
-        throw CallStatus.CANCELLED.withDescription("Statement canceled").toRuntimeException();
-      }
-    }
-    return latestFlightInfo;
   }
 
   /**

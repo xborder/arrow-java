@@ -260,25 +260,6 @@ public class FlightEndpointDataQueue implements AutoCloseable {
   }
 
   /**
-   * Stops waiting for a poller and lifts the open limit: nothing more is expected through {@link
-   * #addEndpoints}, and pending endpoints open now.
-   */
-  public void disablePollAhead() throws SQLException {
-    final List<FlightEndpoint> toOpen;
-    lock.lock();
-    try {
-      maxOpen = Integer.MAX_VALUE;
-      moreExpected = false;
-      paused = false;
-      toOpen = reserveSlotsLocked();
-      changed.signalAll();
-    } finally {
-      lock.unlock();
-    }
-    openReserved(toOpen);
-  }
-
-  /**
    * Atomically checks the limit and pauses the poller. Returns true, after running {@code onPaused}
    * under the lock, when more endpoints are expected but unread endpoints are at the limit. Because
    * the count check, the pause and {@code onPaused} are one step under the same lock the reader

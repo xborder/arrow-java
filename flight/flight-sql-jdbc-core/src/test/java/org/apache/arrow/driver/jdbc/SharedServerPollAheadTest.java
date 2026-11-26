@@ -402,28 +402,6 @@ public class SharedServerPollAheadTest {
   }
 
   @Test
-  public void prefetchZeroKeepsThePocOrderOfPollsAndStreams() throws Exception {
-    final List<Long> rows;
-    try (Connection connection = connect(true, "pollInfoPrefetch=0");
-        Statement statement = connection.createStatement();
-        ResultSet resultSet = statement.executeQuery("trickle")) {
-      rows = values(resultSet, "trickle");
-    }
-    assertEquals(range(1, 12), rows);
-    final List<JsonNode> polls = continuationPolls();
-    assertEquals(5, polls.size(), state());
-    final List<JsonNode> ends = events("DoGet.end");
-    assertEquals(6, ends.size(), state());
-    for (int k = 1; k <= 5; k++) {
-      final long endOfPrevious = single(ends, k).path("sequence").asLong();
-      assertTrue(
-          polls.get(k - 1).path("sequence").asLong() > endOfPrevious,
-          "C" + k + " was polled before E" + k + " ended: " + state());
-    }
-    assertEquals(1, counter("do_get_max_concurrent"), state());
-  }
-
-  @Test
   public void preparedStatementBindsOnceAndDeliversAllRows() throws Exception {
     final List<Long> rows;
     try (Connection connection = connect(true, "pollInfoPrefetch=2");

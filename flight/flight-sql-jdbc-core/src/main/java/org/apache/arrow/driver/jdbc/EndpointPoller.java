@@ -41,9 +41,10 @@ import org.slf4j.LoggerFactory;
  * on the connection's poller pool, never on the stream reader pool. At the limit it pauses and
  * returns its thread; the reader resumes it when it frees a slot.
  *
- * <p>At most one party runs the poller at any moment (the {@code owned} flag). If a resume finds
- * the pool busy, the poller is orphaned and the reader runs it inline when it would otherwise wait
- * for more endpoints, which is the behavior of the polling-in-{@code next()} path.
+ * <p>At most one party runs the poller at any moment (the {@code owned} flag). If the pool is busy
+ * when the poller starts or resumes, the poller is orphaned: the reader runs it inline when it
+ * would otherwise wait for more endpoints, and hands it back to the pool after an answer adds
+ * endpoints.
  */
 final class EndpointPoller {
   private static final Logger LOGGER = LoggerFactory.getLogger(EndpointPoller.class);
@@ -105,18 +106,12 @@ final class EndpointPoller {
   }
 
   /**
-   * Starts polling on the executor.
-   *
-   * @return false if the executor rejected the task; the poller is then unused.
+   * Starts polling on the executor. If the pool rejects the task, the poller is orphaned: the
+   * reader runs it inline when it would otherwise wait for more endpoints.
    */
-  boolean start() {
+  void start() {
     owned.set(true);
-    if (submit()) {
-      return true;
-    }
-    owned.set(false);
-    state = State.STOPPED;
-    return false;
+    handBack();
   }
 
   /** Stops the poller. Cancelling the operation ends an open poll and a backoff wait. */

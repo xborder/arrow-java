@@ -19,7 +19,6 @@ package org.apache.arrow.driver.jdbc;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -93,7 +92,7 @@ public class EndpointPollerTest {
               exception -> {},
               () -> {},
               100);
-      assertTrue(poller.start());
+      poller.start();
 
       final CompletableFuture<Object> next = new CompletableFuture<>();
       final Thread reader =

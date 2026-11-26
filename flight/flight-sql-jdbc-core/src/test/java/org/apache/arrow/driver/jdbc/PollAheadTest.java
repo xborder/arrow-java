@@ -380,27 +380,8 @@ public class PollAheadTest {
     assertEquals(1, script.maxInFlightPolls());
   }
 
-  // 10. pollInfoPrefetch=0 keeps the exact POC order: poll, DoGet, poll, DoGet.
-  @Test
-  public void prefetchZeroKeepsThePocRequestOrder() throws Exception {
-    final ScriptedPollQuery script =
-        scripted(Answer.endpoints(1), Answer.endpoints(1), Answer.done(1)).holdEnd(0);
-    try (Connection connection = connect("pollInfoPrefetch=0");
-        Statement statement = connection.createStatement();
-        ResultSet resultSet = statement.executeQuery(script.query())) {
-      assertTrue(resultSet.next());
-      assertEquals(0, resultSet.getInt(1));
-      // The reader polls only when its queue is empty, so C1 waits for E0 to finish.
-      assertFalse(script.awaitPollCount(2, QUIET_MS), "polled ahead with pollInfoPrefetch=0");
-      script.releaseEnd(0);
-      assertEquals(List.of(100, 200), readAll(resultSet));
-    }
-    assertEquals(
-        List.of("POLL:0", "DOGET_START:0", "POLL:1", "DOGET_START:1", "POLL:2", "DOGET_START:2"),
-        script.eventNames(EventType.POLL, EventType.DOGET_START));
-  }
-
-  // Decision: answers with no continuation, and pollInfoPrefetch=0, open every endpoint at once.
+  // Decision: an answer with no continuation opens every endpoint at once, as the driver always
+  // did.
   @Test
   public void completeFirstAnswerOpensEveryEndpointEagerly() throws Exception {
     final ScriptedPollQuery script = scripted(Answer.done(4)).holdAllEnds(4);
@@ -415,26 +396,29 @@ public class PollAheadTest {
     assertEquals(4, script.maxOpenStreams());
   }
 
-  @Test
-  public void prefetchZeroOpensEveryEndpointEagerly() throws Exception {
-    final ScriptedPollQuery script = scripted(Answer.endpoints(3), Answer.done(1)).holdAllEnds(4);
-    final List<Integer> rows;
-    try (Connection connection = connect("pollInfoPrefetch=0");
-        Statement statement = connection.createStatement();
-        ResultSet resultSet = statement.executeQuery(script.query())) {
-      assertTrue(script.awaitDoGetStarted(3, WAIT_MS), "not every endpoint opened eagerly");
-      rows = readReleasing(resultSet, script);
-    }
-    assertEquals(List.of(0, 100, 200, 300), sorted(rows));
+  // pollInfoPrefetch is -1 (auto) or positive: a progressive result always polls ahead.
+  @ParameterizedTest
+  @ValueSource(strings = {"0", "-2", "-100"})
+  public void anInvalidPollInfoPrefetchIsRejectedWhenTheConnectionIsCreated(final String value) {
+    final SQLException failure =
+        assertThrows(SQLException.class, () -> connect("pollInfoPrefetch=" + value));
+    assertEquals(
+        "Invalid pollInfoPrefetch value "
+            + value
+            + ": use -1 (auto) or a positive number of endpoints.",
+        failure.getMessage());
   }
 
-  // 11. Poller pool busy: the second result falls back to polling in next().
+  // 11. Poller pool busy: the second result's poller starts orphaned and the reader runs it inline.
   @Test
-  public void busyPollerPoolMakesTheNextResultPollInNext() throws Exception {
+  public void busyPollerPoolMakesTheReaderRunTheSecondResultsPollerInline() throws Exception {
     final CountDownLatch releaseA = new CountDownLatch(1);
+    final CountDownLatch releaseB = new CountDownLatch(1);
     final ScriptedPollQuery scriptA =
         scripted(Answer.endpoints(1), Answer.endpoints(1).gatedBy(releaseA), Answer.done(1));
-    final ScriptedPollQuery scriptB = scripted(Answer.endpoints(1), Answer.done(1)).holdEnd(0);
+    final ScriptedPollQuery scriptB =
+        scripted(Answer.endpoints(1), Answer.endpoints(1).gatedBy(releaseB), Answer.done(1))
+            .holdEnd(0);
     try (Connection connection = connect("pollInfoPollerThreads=1&pollInfoPrefetch=2");
         Statement statementA = connection.createStatement();
         Statement statementB = connection.createStatement()) {
@@ -445,16 +429,81 @@ public class PollAheadTest {
         try (ResultSet resultSetB = statementB.executeQuery(scriptB.query())) {
           assertTrue(resultSetB.next());
           assertEquals(0, resultSetB.getInt(1));
-          // B has no poller: it polls inside next(), after E0 finished.
+          // B's poller has no thread. It is orphaned: nobody polls C1 while the reader still has
+          // an open stream to read.
           assertFalse(scriptB.awaitPollCount(2, QUIET_MS), "B polled ahead without a poller");
-          scriptB.releaseEnd(0);
-          assertEquals(List.of(100), readAll(resultSetB));
+
+          try (AsyncReader reader = new AsyncReader(() -> readAll(resultSetB))) {
+            scriptB.releaseEnd(0);
+            // The reader has nothing left to read, so it polls C1 itself, on its own thread, while
+            // A's poller still holds the pool thread inside A's C1.
+            assertTrue(scriptB.awaitBlockedPoll(WAIT_MS), "B's C1 was never polled");
+            assertEquals(2, scriptB.pollCount());
+            assertEquals(2, scriptA.pollCount(), "A's poller moved on");
+            assertEquals(
+                1,
+                connection.unwrap(ArrowFlightConnection.class).getPollerExecutor().getActiveCount(),
+                "B's poll must not be running on the pool");
+            assertTrue(
+                reader.isInside("runInlineIfOrphaned"), "B's poll is not made by the reader");
+
+            releaseB.countDown();
+            // Every poll of B ran inline: the pool stayed busy with A the whole time.
+            assertEquals(List.of(100, 200), reader.rows());
+          }
+          assertEquals(List.of(0, 1, 2), scriptB.pollIndices());
         }
-        assertEquals(List.of(0, 1), scriptB.pollIndices());
         assertEquals(2, scriptA.pollCount());
 
         releaseA.countDown();
         assertEquals(List.of(0, 100, 200), sorted(readAll(resultSetA)));
+      }
+    }
+  }
+
+  // 11b. The orphaned poller goes back to the pool once an inline answer finds it free again.
+  @Test
+  public void anOrphanedStartIsHandedBackToThePoolWhenItFreesUp() throws Exception {
+    final CountDownLatch releaseA = new CountDownLatch(1);
+    final CountDownLatch releaseB1 = new CountDownLatch(1);
+    final CountDownLatch releaseB2 = new CountDownLatch(1);
+    final ScriptedPollQuery scriptA =
+        scripted(Answer.endpoints(1), Answer.endpoints(1).gatedBy(releaseA), Answer.done(1));
+    final ScriptedPollQuery scriptB =
+        scripted(
+            Answer.endpoints(1),
+            Answer.endpoints(1).gatedBy(releaseB1),
+            Answer.endpoints(1).gatedBy(releaseB2),
+            Answer.done(1));
+    try (Connection connection = connect("pollInfoPollerThreads=1&pollInfoPrefetch=2");
+        Statement statementA = connection.createStatement();
+        Statement statementB = connection.createStatement();
+        ResultSet resultSetA = statementA.executeQuery(scriptA.query())) {
+      assertTrue(scriptA.awaitBlockedPoll(WAIT_MS));
+      try (ResultSet resultSetB = statementB.executeQuery(scriptB.query())) {
+        assertTrue(resultSetB.next());
+        assertEquals(0, resultSetB.getInt(1));
+        try (AsyncReader reader = new AsyncReader(() -> readAll(resultSetB))) {
+          // The reader polls B's C1 inline, because the pool is busy with A.
+          assertTrue(scriptB.awaitBlockedPoll(WAIT_MS));
+          assertTrue(reader.isInside("runInlineIfOrphaned"));
+
+          // Let A finish, which frees the pool thread, then answer B's C1.
+          releaseA.countDown();
+          assertEquals(List.of(0, 100, 200), sorted(readAllWithin(resultSetA)));
+          awaitPollerPoolIdle(connection);
+          releaseB1.countDown();
+
+          // The answer added an endpoint, so the poller went back to the pool: C2 is polled by a
+          // pool thread, not by the reader.
+          assertTrue(scriptB.awaitPollCount(3, WAIT_MS), "B's C2 was never polled");
+          assertEquals(
+              1,
+              connection.unwrap(ArrowFlightConnection.class).getPollerExecutor().getActiveCount(),
+              "B's poller was not handed back to the pool");
+          releaseB2.countDown();
+          assertEquals(List.of(100, 200, 300), sorted(reader.rows()));
+        }
       }
     }
   }
@@ -493,12 +542,11 @@ public class PollAheadTest {
   }
 
   // 14. A continuation that never answers ends at a read boundary with the JDBC timeout message.
-  @ParameterizedTest
-  @ValueSource(strings = {"pollInfoPrefetch=0", "pollInfoPrefetch=2"})
-  public void queryTimeoutEndsAtAReadBoundary(final String property) throws Exception {
+  @Test
+  public void queryTimeoutEndsAtAReadBoundary() throws Exception {
     final ScriptedPollQuery script = scripted(Answer.endpoints(1), Answer.hang());
     final long startNanos = System.nanoTime();
-    try (Connection connection = connect(property);
+    try (Connection connection = connect("pollInfoPrefetch=2");
         Statement statement = connection.createStatement()) {
       statement.setQueryTimeout(1);
       try (ResultSet resultSet = statement.executeQuery(script.query())) {
@@ -669,15 +717,28 @@ public class PollAheadTest {
     }
   }
 
-  // F4. The fallback path must not report the end while a continuation remains.
+  // F4. An endpoint without rows must not end the result while a continuation remains.
   @Test
-  public void prefetchZeroDeliversRowsAfterAnEndpointWithoutRows() throws Exception {
+  public void anEndpointWithoutRowsDoesNotEndTheResultWhileAContinuationRemains() throws Exception {
+    final CountDownLatch gate = new CountDownLatch(1);
+    // E1 has no rows and is the last endpoint published until the gated done answer arrives.
     final ScriptedPollQuery script =
-        scripted(Answer.endpoints(1), Answer.endpoints(1), Answer.done(1)).emptyEndpoints(1);
-    try (Connection connection = connect("pollInfoPrefetch=0");
+        scripted(Answer.endpoints(1), Answer.endpoints(1), Answer.done(1).gatedBy(gate))
+            .emptyEndpoints(1);
+    try (Connection connection = connect("pollInfoPrefetch=2");
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery(script.query())) {
-      assertEquals(List.of(0, 200), readAll(resultSet));
+      assertTrue(resultSet.next());
+      assertEquals(0, resultSet.getInt(1));
+      try (AsyncReader reader = new AsyncReader(() -> readAll(resultSet))) {
+        // E0 and E1 are read to their end; only the unanswered poll of the continuation is left.
+        assertTrue(script.awaitBlockedPoll(WAIT_MS));
+        assertTrue(script.awaitStream(EventType.DOGET_END, 1, WAIT_MS));
+        reader.awaitBlocked();
+        assertFalse(reader.isDone(), "the result ended while a continuation remained");
+        gate.countDown();
+        assertEquals(List.of(200), reader.rows());
+      }
     }
     assertEquals(List.of(0, 1, 2), script.pollIndices());
   }
@@ -819,26 +880,6 @@ public class PollAheadTest {
       assertFalse(script.awaitCancelFlightInfo(2, QUIET_MS));
     }
     assertEquals(1, script.cancelFlightInfoCount());
-  }
-
-  // S3. The fallback path (pollInfoPrefetch=0) backs off inside next() as well.
-  @Test
-  public void prefetchZeroBacksOffBetweenEmptyAnswersAndHonorsTheCap() throws Exception {
-    final ScriptedPollQuery script =
-        scripted(
-            Answer.endpoints(1), Answer.empty(), Answer.empty(), Answer.empty(), Answer.done(1));
-    try (Connection connection = connect("pollInfoPrefetch=0&pollInfoMaxBackoffMs=150");
-        Statement statement = connection.createStatement();
-        ResultSet resultSet = statement.executeQuery(script.query())) {
-      assertEquals(List.of(0, 100), readAll(resultSet));
-    }
-    final List<Long> polls = script.pollNanos();
-    assertEquals(5, polls.size());
-    // The reader polls C1 once E0 is read; the waits are 100 ms, then capped at 150 ms (uncapped:
-    // 200 and 400 ms).
-    assertGapBetween(polls, 1, 2, 100, 350);
-    assertGapBetween(polls, 2, 3, 150, 350);
-    assertGapBetween(polls, 3, 4, 150, 350);
   }
 
   // S6. Append-only violations fail the result and cancel the open streams.
@@ -1076,6 +1117,20 @@ public class PollAheadTest {
 
     void start() {
       thread.start();
+    }
+
+    boolean isDone() {
+      return result.isDone();
+    }
+
+    /** Whether the thread's stack is inside a method with this name, e.g. a poll made inline. */
+    boolean isInside(final String methodName) {
+      for (final StackTraceElement frame : thread.getStackTrace()) {
+        if (frame.getMethodName().equals(methodName)) {
+          return true;
+        }
+      }
+      return false;
     }
 
     @SuppressWarnings("unchecked")

@@ -22,6 +22,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -30,12 +32,14 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.SQLTimeoutException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -66,6 +70,7 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 @TestMethodOrder(OrderAnnotation.class)
 public class SharedServerPollInfoExecutionTest {
   private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
+  private static final ObjectMapper JSON = new ObjectMapper();
   private static final int FLIGHT_PORT = Integer.getInteger("pollinfo.shared.flightPort", 32347);
   private static final int CONTROL_PORT = Integer.getInteger("pollinfo.shared.controlPort", 32348);
 
@@ -114,20 +119,15 @@ public class SharedServerPollInfoExecutionTest {
 
   @Test
   @Order(2)
-  // Pinned to the POC path (pollInfoPrefetch=0): the DoGet-before-first-continuation order below is
-  // the POC request order; poll-ahead polls the continuations in the background.
   public void t2MultiStepContinuationsAndFinalCumulativeInfo() throws Exception {
-    try (Connection connection = connect(true, "pollInfoPrefetch=0")) {
+    try (Connection connection = connect(true)) {
       assertEquals(Arrays.asList(1L, 2L, 3L), directValues(connection, "multi-step"));
     }
     final String state = state();
     assertCounters(state, 3, 0, 0, 1, 2, 0, 0, 3);
     assertTrue(state.contains("bdx-645-poll/v1/"));
+    // Each continuation is sent once, and C1 before C2.
     assertTrue(state.indexOf("/1\"") < state.indexOf("/2\""), state);
-    assertTrue(
-        state.indexOf("\"method\": \"DoGet\"")
-            < state.indexOf("\"descriptor_kind\": \"continuation\""),
-        state);
   }
 
   @Test
@@ -201,15 +201,19 @@ public class SharedServerPollInfoExecutionTest {
 
   @Test
   @Order(8)
-  // Pinned to the POC path (pollInfoPrefetch=0): with poll-ahead the failure may surface before
-  // the first row is read.
   public void t7LateErrorSurfacesAtNextReadBoundary() throws Exception {
-    try (Connection connection = connect(true, "pollInfoPrefetch=0");
+    // The failing continuation is held, so the poller cannot record the failure before the first
+    // row was read: it surfaces at the next read.
+    post("/hold-poll", "{\"continuation\":1}");
+    try (Connection connection = connect(true);
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery("late-error")) {
       assertTrue(resultSet.next());
       assertEquals(1L, resultSet.getLong("value"));
+      awaitPollHeld(1);
+      post("/release-poll", "{\"continuation\":1}");
       final Throwable failure = assertThrows(Throwable.class, resultSet::next);
+      assertEquals("Continuation PollFlightInfo failed", failure.getMessage());
       assertTrue(hasFlightStatus(failure, FlightStatusCode.INTERNAL), failure.toString());
     }
     assertCounters(2, 0, 0, 1, 1, 0, 0, 1);
@@ -236,14 +240,12 @@ public class SharedServerPollInfoExecutionTest {
 
   @Test
   @Order(10)
-  // Pinned to the POC path (pollInfoPrefetch=0): the cancel surfaces as the CANCELLED
-  // FlightRuntimeException of the reader's own poll. With poll-ahead it is "Statement canceled"
-  // (SharedServerPollAheadTest).
   public void t9CancelWhileResultSetWaitsForMoreEndpoints() throws Exception {
-    try (Connection connection = connect(true, "pollInfoPrefetch=0");
+    try (Connection connection = connect(true);
         Statement statement = connection.createStatement()) {
       final AtomicReference<Throwable> failure = new AtomicReference<>();
       final AtomicBoolean resultSetCreated = new AtomicBoolean();
+      final CountDownLatch rowsRead = new CountDownLatch(1);
       final Thread execution =
           new Thread(
               () -> {
@@ -253,6 +255,7 @@ public class SharedServerPollInfoExecutionTest {
                   assertEquals(1L, resultSet.getLong("value"));
                   assertTrue(resultSet.next());
                   assertEquals(2L, resultSet.getLong("value"));
+                  rowsRead.countDown();
                   resultSet.next();
                 } catch (Throwable e) {
                   failure.set(e);
@@ -260,6 +263,8 @@ public class SharedServerPollInfoExecutionTest {
               },
               "shared-server-jdbc-cancel");
       execution.start();
+      // The poller polls C1 in the background; the application waits for more endpoints.
+      assertTrue(rowsRead.await(5, TimeUnit.SECONDS), "the rows were never read");
       awaitCounter("poll_flight_info", 2, Duration.ofSeconds(3));
       assertTrue(resultSetCreated.get());
       assertNotNull(statement.getResultSet());
@@ -270,8 +275,9 @@ public class SharedServerPollInfoExecutionTest {
       System.out.println("SHARED_T9_CANCEL_MILLIS " + cancelMillis);
       assertFalse(execution.isAlive());
       assertNotNull(failure.get());
+      assertTrue(failure.get() instanceof SQLException, failure.get().toString());
       assertTrue(
-          hasFlightStatus(failure.get(), FlightStatusCode.CANCELLED), failure.get().toString());
+          failure.get().getMessage().contains("Statement canceled"), failure.get().toString());
       assertTrue(cancelMillis < 1000, "cancellation was not prompt: " + cancelMillis);
     }
     awaitCounter("cancellation", 1, Duration.ofSeconds(2));
@@ -280,30 +286,26 @@ public class SharedServerPollInfoExecutionTest {
 
   @Test
   @Order(11)
-  // Pinned to the POC path (pollInfoPrefetch=0): poll-ahead polls C1 in the background, so the
-  // poll count asserted here is only fixed when the reader polls.
   public void t9ClosingIncompleteResultAttemptsFlightInfoCancellation() throws Exception {
-    try (Connection connection = connect(true, "pollInfoPrefetch=0");
+    try (Connection connection = connect(true);
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery("cancel-observable")) {
       assertTrue(resultSet.next());
       assertEquals(1L, resultSet.getLong("value"));
+      // The background poller has C1 open (the server answers it only when cancelled); closing
+      // the result ends that poll and sends one CancelFlightInfo.
+      awaitCounter("poll_flight_info", 2, Duration.ofSeconds(3));
     }
     awaitCounter("cancellation", 1, Duration.ofSeconds(2));
-    assertCounters(1, 0, 0, 1, 0, 1, 0, 1);
+    awaitCounter("active_call_terminations", 1, Duration.ofSeconds(2));
+    assertCounters(2, 0, 0, 1, 1, 1, 1, 1);
   }
 
   private static Connection connect(final boolean usePollInfo) throws Exception {
-    return connect(usePollInfo, "");
-  }
-
-  /** Connects with extra properties, for example {@code pollInfoPrefetch=0} for the POC path. */
-  private static Connection connect(final boolean usePollInfo, final String extraProperties)
-      throws Exception {
     return DriverManager.getConnection(
         String.format(
-            "jdbc:arrow-flight-sql://127.0.0.1:%d/?useEncryption=false&usePollInfo=%s%s",
-            FLIGHT_PORT, usePollInfo, extraProperties.isEmpty() ? "" : "&" + extraProperties));
+            "jdbc:arrow-flight-sql://127.0.0.1:%d/?useEncryption=false&usePollInfo=%s",
+            FLIGHT_PORT, usePollInfo));
   }
 
   private static List<Long> directValues(final Connection connection, final String query)
@@ -373,6 +375,23 @@ public class SharedServerPollInfoExecutionTest {
     assertEquals(expected, counter(state(), name), state());
   }
 
+  // Waits until the server holds the given continuation poll (set with POST /hold-poll).
+  private static void awaitPollHeld(final int continuation) throws Exception {
+    final long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+    while (true) {
+      final JsonNode events = JSON.readTree(state()).path("events");
+      for (final JsonNode event : events) {
+        if ("PollFlightInfo.hold".equals(event.path("method").asText())
+            && event.path("continuation").asInt() == continuation
+            && "held".equals(event.path("outcome").asText())) {
+          return;
+        }
+      }
+      assertTrue(System.nanoTime() < deadline, "continuation " + continuation + " was not held");
+      Thread.sleep(20);
+    }
+  }
+
   private static void awaitCounterEquals(
       final String name, final int expected, final Duration timeout) throws Exception {
     final long deadline = System.nanoTime() + timeout.toNanos();
@@ -406,6 +425,7 @@ public class SharedServerPollInfoExecutionTest {
         HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + CONTROL_PORT + path))
             .timeout(Duration.ofSeconds(2));
     if ("POST".equals(method)) {
+      builder.header("Content-Type", "application/json");
       builder.POST(HttpRequest.BodyPublishers.ofString(body));
     } else {
       builder.GET();

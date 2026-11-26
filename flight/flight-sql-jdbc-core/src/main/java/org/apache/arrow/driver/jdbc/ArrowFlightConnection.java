@@ -116,6 +116,7 @@ public final class ArrowFlightConnection extends AvaticaConnection {
       url = replaceSemiColons(url);
       final ArrowFlightConnectionConfigImpl config =
           new ArrowFlightConnectionConfigImpl(properties);
+      config.validatePollInfoPrefetch();
       clientHandler = createNewClientHandler(config, allocator, driver.getDriverVersion());
       return new ArrowFlightConnection(
           driver, factory, url, properties, config, allocator, clientHandler);
@@ -200,7 +201,7 @@ public final class ArrowFlightConnection extends AvaticaConnection {
   /**
    * Gets the pool that runs background PollFlightInfo pollers, creating it on first use. The pool
    * is bounded and has no queue: when every thread is busy, submitting a task is rejected and the
-   * result set falls back to polling inside {@code next()}.
+   * poller is run by the result set's reader inside {@code next()} instead.
    */
   synchronized ThreadPoolExecutor getPollerExecutor() {
     if (pollerExecutor == null) {
@@ -218,7 +219,7 @@ public final class ArrowFlightConnection extends AvaticaConnection {
     return pollerExecutor;
   }
 
-  /** The effective most queued, unread endpoints; 0 means poll inside {@code next()}. */
+  /** The effective most queued, unread endpoints of a progressive result; at least 1. */
   int getPollInfoPrefetch() {
     return config.pollInfoPrefetch();
   }

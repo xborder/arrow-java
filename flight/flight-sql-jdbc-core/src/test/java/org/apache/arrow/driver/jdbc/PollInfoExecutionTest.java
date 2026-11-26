@@ -34,6 +34,7 @@ import java.sql.SQLTimeoutException;
 import java.sql.Statement;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -60,8 +61,6 @@ import org.apache.arrow.vector.util.Text;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 
 /** Executable POC coverage for synchronous PollInfo through the unchanged JDBC surface. */
 public class PollInfoExecutionTest {
@@ -124,11 +123,9 @@ public class PollInfoExecutionTest {
   }
 
   @Test
-  // Pinned to the POC path (pollInfoPrefetch=0): the continuations are polled on demand, which
-  // is what the name says. Poll-ahead is covered by pollAheadPollsContinuationsWhile...
-  public void multiStepPollsOnDemandAfterPublishedEndpointIsConsumed() throws Exception {
+  public void multiStepSendsEachContinuationOnceAndInOrder() throws Exception {
     producer.configure(Scenario.MULTI_STEP, STATEMENT_FAMILY);
-    try (Connection connection = connect(true, 0);
+    try (Connection connection = connect(true);
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery(DIRECT_QUERY)) {
       assertTrue(resultSet.next());
@@ -237,25 +234,19 @@ public class PollInfoExecutionTest {
     assertEquals(0, producer.getFlightInfoCount());
   }
 
-  @ParameterizedTest
-  @ValueSource(ints = {0, 2})
-  public void continuationUnimplementedDoesNotFallbackOrReexecute(final int pollInfoPrefetch)
-      throws Exception {
+  @Test
+  public void continuationUnimplementedDoesNotFallbackOrReexecute() throws Exception {
     producer.configure(Scenario.CONTINUATION_UNIMPLEMENTED, STATEMENT_FAMILY);
-    if (pollInfoPrefetch > 0) {
-      // The background poller would otherwise fail before or after the first next(); the failing
-      // answer waits until the first row was read.
-      producer.holdContinuationFailure();
-    }
-    try (Connection connection = connect(true, pollInfoPrefetch);
+    // The background poller would otherwise fail before or after the first next(); the failing
+    // answer waits until the first row was read.
+    producer.holdContinuationFailure();
+    try (Connection connection = connect(true);
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery(DIRECT_QUERY)) {
       assertTrue(resultSet.next());
       assertEquals(42, resultSet.getInt(1));
-      if (pollInfoPrefetch > 0) {
-        assertTrue(producer.awaitActivePoll(5, TimeUnit.SECONDS), "the poller never polled C1");
-        producer.releaseContinuationFailure();
-      }
+      assertTrue(producer.awaitActivePoll(5, TimeUnit.SECONDS), "the poller never polled C1");
+      producer.releaseContinuationFailure();
       final SQLException failure = assertThrows(SQLException.class, resultSet::next);
       assertEquals(SQLException.class, failure.getClass());
       assertEquals("Continuation PollFlightInfo failed", failure.getMessage());
@@ -350,10 +341,11 @@ public class PollInfoExecutionTest {
   @Test
   public void statementCancelInterruptsContinuationAtReadBoundary() throws Exception {
     producer.configure(Scenario.CANCEL_OBSERVABLE, STATEMENT_FAMILY);
-    try (Connection connection = connect(true, 0);
+    try (Connection connection = connect(true);
         Statement statement = connection.createStatement()) {
       final AtomicReference<Throwable> failure = new AtomicReference<>();
       final AtomicBoolean resultSetCreated = new AtomicBoolean();
+      final CountDownLatch firstRowRead = new CountDownLatch(1);
       final Thread execution =
           new Thread(
               () -> {
@@ -362,6 +354,7 @@ public class PollInfoExecutionTest {
                   if (!resultSet.next() || resultSet.getInt(1) != 42) {
                     throw new AssertionError("missing published row");
                   }
+                  firstRowRead.countDown();
                   resultSet.next();
                 } catch (Throwable e) {
                   failure.set(e);
@@ -369,6 +362,9 @@ public class PollInfoExecutionTest {
               },
               "jdbc-pollinfo-cancellation-test");
       execution.start();
+      // The background poller polls C1 as soon as the result exists; cancel once the application
+      // is waiting for more endpoints.
+      assertTrue(firstRowRead.await(5, TimeUnit.SECONDS), "the first row was never read");
       assertTrue(producer.awaitActivePoll(2, TimeUnit.SECONDS));
       assertNotNull(statement.getResultSet());
       final long cancelStart = System.nanoTime();
@@ -379,8 +375,9 @@ public class PollInfoExecutionTest {
       assertFalse(execution.isAlive());
       assertTrue(resultSetCreated.get(), "ResultSet should expose the first published endpoint");
       assertNotNull(failure.get());
+      assertTrue(failure.get() instanceof SQLException, failure.get().toString());
       assertTrue(
-          hasFlightStatus(failure.get(), FlightStatusCode.CANCELLED), failure.get().toString());
+          failure.get().getMessage().contains("Statement canceled"), failure.get().toString());
       assertTrue(cancelMillis < 1000, "cancellation was not prompt: " + cancelMillis);
       assertTrue(producer.awaitPollTerminated(1, TimeUnit.SECONDS));
       assertEquals(1, producer.cancelFlightInfoCount());
@@ -393,16 +390,6 @@ public class PollInfoExecutionTest {
         String.format(
             "jdbc:arrow-flight-sql://localhost:%d?useEncryption=false&usePollInfo=%s",
             server.getPort(), usePollInfo));
-  }
-
-  /** Connects with a fixed pollInfoPrefetch; 0 keeps the POC behavior of polling inside next(). */
-  private static Connection connect(final boolean usePollInfo, final int pollInfoPrefetch)
-      throws Exception {
-    return DriverManager.getConnection(
-        String.format(
-            "jdbc:arrow-flight-sql://localhost:%d?useEncryption=false&usePollInfo=%s"
-                + "&pollInfoPrefetch=%d",
-            server.getPort(), usePollInfo, pollInfoPrefetch));
   }
 
   private static void assertDirectRow(final Connection connection) throws Exception {
