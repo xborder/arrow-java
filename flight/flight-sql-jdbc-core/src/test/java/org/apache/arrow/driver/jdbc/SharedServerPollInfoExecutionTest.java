@@ -167,8 +167,10 @@ public class SharedServerPollInfoExecutionTest {
 
   @Test
   @Order(8)
+  // Pinned to the POC path (pollInfoPrefetch=0): with poll-ahead the failure may surface before
+  // the first row is read.
   public void t7LateErrorSurfacesAtNextReadBoundary() throws Exception {
-    try (Connection connection = connect(true);
+    try (Connection connection = connect(true, "pollInfoPrefetch=0");
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery("late-error")) {
       assertTrue(resultSet.next());
@@ -241,8 +243,10 @@ public class SharedServerPollInfoExecutionTest {
 
   @Test
   @Order(11)
+  // Pinned to the POC path (pollInfoPrefetch=0): poll-ahead polls C1 in the background, so the
+  // poll count asserted here is only fixed when the reader polls.
   public void t9ClosingIncompleteResultAttemptsFlightInfoCancellation() throws Exception {
-    try (Connection connection = connect(true);
+    try (Connection connection = connect(true, "pollInfoPrefetch=0");
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery("cancel-observable")) {
       assertTrue(resultSet.next());
@@ -253,10 +257,16 @@ public class SharedServerPollInfoExecutionTest {
   }
 
   private static Connection connect(final boolean usePollInfo) throws Exception {
+    return connect(usePollInfo, "");
+  }
+
+  /** Connects with extra properties, for example {@code pollInfoPrefetch=0} for the POC path. */
+  private static Connection connect(final boolean usePollInfo, final String extraProperties)
+      throws Exception {
     return DriverManager.getConnection(
         String.format(
-            "jdbc:arrow-flight-sql://127.0.0.1:%d/?useEncryption=false&usePollInfo=%s",
-            FLIGHT_PORT, usePollInfo));
+            "jdbc:arrow-flight-sql://127.0.0.1:%d/?useEncryption=false&usePollInfo=%s%s",
+            FLIGHT_PORT, usePollInfo, extraProperties.isEmpty() ? "" : "&" + extraProperties));
   }
 
   private static List<Long> directValues(final Connection connection, final String query)
