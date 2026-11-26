@@ -56,7 +56,7 @@ Each rule is an INVARIANT or PROPERTY in `PollAhead.tla`.
 
 Abbreviations, all under `flight/flight-sql-jdbc-core/src/main/java/org/apache/arrow/driver/jdbc/`: **P** = `EndpointPoller.java`, **Q** = `utils/FlightEndpointDataQueue.java`, **R** = `ArrowFlightJdbcFlightStreamResultSet.java`, **O** = `client/PollInfoOperation.java`.
 
-Sync commit: `4b831553c` (branch `bdx-645-pollinfo-poc`, rebased on apache/arrow-java `10c55b9c8`). The model matches the main code there, including the idle-flag fix (`IdleFix = TRUE`) and the slot release on exhaustion.
+Sync commit: `2574a511c` (branch `bdx-645-pollinfo-poc`, rebased on apache/arrow-java `10c55b9c8`). The model matches the main code there, including the idle-flag fix (`IdleFix = TRUE`) and the slot release on exhaustion. The only main-code change after `4b831553c` is `436156f29` (see below), which is not a model action.
 
 Earlier syncs: the diff `d7c3ed4ab..dadd45d8a` of the main code has two changes: the `idleTried = false` line in `awaitNext` (mirrored, see finding 1) and a rethrow of `queue.failure()` in `ResultSet.next()`'s `FlightRuntimeException` catch (not a model action: it only picks the exception thrown while the reader is blocked in a stream).
 
@@ -72,7 +72,7 @@ The diff `dadd45d8a..4b831553c` of the main code (four files: **R**, **P**, **O*
 
 Not a model action: `Thread.currentThread().interrupt()` before wrapping an `InterruptedException`, `volatile` on `R.poller`, and the new public `O.isCancelled()` (it is read by `mapContinuationFailure`, see `CancelOp`).
 
-Reviewed after the sync, not a model action: `436156f29` (`ArrowFlightConnection` shuts the poller pool down with `shutdown()` and a 2 s grace before `shutdownNow()`, so a poller's `CancelFlightInfo` is not interrupted). A rejected submit after the shutdown is already the free choice `ReaderResumeRejected`, and, per the commit message, the statements are closed (pollers stopped) before the pool goes. The sync commit stays at `4b831553c`: move it to a later commit once its main-code diff has been checked the same way.
+Reviewed after the sync, not a model action: `436156f29` (`ArrowFlightConnection` shuts the poller pool down with `shutdown()` and a 2 s grace before `shutdownNow()`, so a poller's `CancelFlightInfo` is not interrupted). A rejected submit after the shutdown is already the free choice `ReaderResumeRejected`, and, per the commit message, the statements are closed (pollers stopped) before the pool goes. Checked against the code at `2574a511c`, whose main code differs from `4b831553c` only by this change, so the sync commit moved there.
 
 | Model action | Code at the sync commit |
 | --- | --- |
@@ -103,7 +103,7 @@ Reviewed after the sync, not a model action: `436156f29` (`ArrowFlightConnection
 Run it when a diff touches any covered file:
 
 ```sh
-git --no-pager diff --name-only 4b831553c..HEAD -- \
+git --no-pager diff --name-only 2574a511c..HEAD -- \
   flight/flight-sql-jdbc-core/src/main/java/org/apache/arrow/driver/jdbc/ArrowFlightJdbcFlightStreamResultSet.java \
   flight/flight-sql-jdbc-core/src/main/java/org/apache/arrow/driver/jdbc/EndpointPoller.java \
   flight/flight-sql-jdbc-core/src/main/java/org/apache/arrow/driver/jdbc/ArrowFlightConnection.java \
@@ -147,7 +147,7 @@ Any output means the model may no longer describe the code. Also use this skill 
 
 The path was narrow: the poller had to answer and register a stream inside the reader's few instructions between the idle hook and the next lock, the connection's poller pool had to reject a resume (all `pollInfoPollerThreads` busy with other results, or the pool shut down), and the new endpoints had to have no rows. When it happened, `next()` hung until `cancel()` or `close()`.
 
-Fix, in `dadd45d8a`: `awaitNext` sets `idleTried = false` right after `onStreamFinished(source)`. This is exactly `IdleFix = TRUE` (`AppReadEmpty` clears `idleTried`; `AppTake` returns to the application, where the local flag ends). Regression test: `rejectedResumeDuringTheIdleHookDoesNotStrandTheReader` in `FlightEndpointDataQueueDeferredOpenTest`. Commit `dadd45d8a` (`next()` rethrows `queue.failure()` before the CANCELLED mapping) changes only which exception a blocked reader throws, not any model action.
+Fix, in `dadd45d8a`: `awaitNext` sets `idleTried = false` right after `onStreamFinished(source)`. This is exactly `IdleFix = TRUE` (`AppReadEmpty` clears `idleTried`; `AppTake` returns to the application, where the local flag ends). Regression test: `rejectedResumeDuringTheIdleHookDoesNotStrandTheReader` in `FlightEndpointDataQueueDeferredOpenTest`. The same commit also makes `next()` rethrow `queue.failure()` before the CANCELLED mapping. That changes only which exception a blocked reader throws, not any model action.
 
 ### 2. `finding-open-streams`: the first proposal (`EagerOpen = TRUE`, resolved)
 
