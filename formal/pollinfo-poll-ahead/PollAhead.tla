@@ -2,20 +2,24 @@
 (***************************************************************************)
 (* Bounded poll-ahead for the Arrow Flight SQL JDBC driver (BDX-645).      *)
 (*                                                                         *)
-(* One progressive JDBC ResultSet, from the moment its poller has started: *)
-(* the first PollInfo published endpoint E1 and continuation C1, and C1    *)
-(* has been handed to the poller. The application thread is in             *)
-(* executeQuery's first load (Q.nextAvailable) or in ResultSet.next(); both*)
-(* run the same awaitNext loop, and the first load only differs by         *)
-(* returning null instead of waiting, so the model does not tell them apart.*)
+(* One progressive JDBC ResultSet that has a continuation, from the moment *)
+(* its poller has started: the first PollInfo published endpoint E1 and    *)
+(* continuation C1, and C1 has been handed to the poller (P.start: owned   *)
+(* is set, then handBack). The pool either took the task (the poller is    *)
+(* "running") or rejected it (the poller is "orphaned", which is the same  *)
+(* state a rejected resume leaves); Init chooses either. The application   *)
+(* thread is in executeQuery's first load (Q.nextAvailable) or in          *)
+(* ResultSet.next(); both run the same awaitNext loop, and the first load  *)
+(* only differs by returning null instead of waiting, so the model does not*)
+(* tell them apart.*)
 (*                                                                         *)
 (* Parties that run concurrently:                                          *)
 (*   - the Flight SQL server, which publishes endpoints and finishes or    *)
 (*     fails the query, and answers PollFlightInfo at any moment (a server *)
 (*     that does not long-poll may answer at once with nothing new);       *)
 (*   - the poller (EndpointPoller), which chains continuations. It runs on *)
-(*     a pool thread, or, if the pool rejected a resume, inline on the     *)
-(*     reader's thread;                                                    *)
+(*     a pool thread, or, if the pool rejected its start or a resume,      *)
+(*     inline on the reader's thread;                                      *)
 (*   - the reader: the application thread inside ResultSet.next(), which   *)
 (*     is inside FlightEndpointDataQueue.awaitNext, takes a ready stream,  *)
 (*     reads it to the end (and frees its slot), ends the results, or      *)
@@ -25,6 +29,11 @@
 (* Code map (sync commit in .claude/skills/verify-jdbc-poll-ahead/SKILL.md;*)
 (* "Q" = utils/FlightEndpointDataQueue, "P" = EndpointPoller, "R" =        *)
 (* ArrowFlightJdbcFlightStreamResultSet, "O" = client/PollInfoOperation):  *)
+(*   Init (poller)              R.startPoller -> P.start: owned.set(true);  *)
+(*                              handBack(). The pool accepts: "running".   *)
+(*                              The pool rejects 10 submits: orphaned set, *)
+(*                              Q.wakeReader: "orphaned", exactly as after *)
+(*                              a rejected resume                          *)
 (*   PollerSend / PollerTake    P.drive -> O.pollOnce -> O.poll            *)
 (*   PollerApply*               O.remember (inside pollOnce) and          *)
 (*                              R.appendEndpoints -> Q.addEndpoints, one   *)
@@ -55,6 +64,8 @@
 (*   AppIdle, ReaderWait,       Q.awaitNext, empty-futures branch: end,    *)
 (*   AppEnd, AppThrow           idle hook (P.runInlineIfOrphaned), or wait *)
 (*   InlineExit                 P.runInlineIfOrphaned returning            *)
+(*   PollerApplyHandBack        P.drive(true) -> handBack after an answer  *)
+(*                              that added endpoints (submit, or orphaned) *)
 (*   CancelOp, AppCancel,       Statement.cancel: O.cancel first (an open  *)
 (*   CancelStop                 poll ends CANCELLED), then R.cancel: the   *)
 (*                              cancelled flag, then P.stop + O.cancel +   *)
@@ -66,9 +77,10 @@
 (*                              poll                                       *)
 (*                                                                         *)
 (* The implementation corresponds to EagerOpen = FALSE (a Q built with     *)
-(* maxOpen = pollInfoPrefetch). Answers with no continuation, and          *)
-(* pollInfoPrefetch = 0, use an unlimited eager queue and never start a    *)
-(* poller; the model does not cover them.                                  *)
+(* maxOpen = pollInfoPrefetch, which must be >= 1). A result whose first   *)
+(* answer has no continuation uses an unlimited eager queue and never      *)
+(* starts a poller; the model does not cover it. There is no fallback that *)
+(* polls inside next(): a poller the pool did not accept is orphaned.      *)
 (*                                                                         *)
 (* Rows are abstracted: an endpoint is taken (AppTake, its first batch     *)
 (* reaches the application) and later read to the end (AppExhaust, which   *)
@@ -104,6 +116,7 @@ VARIABLES
     got,            \* the answer the poller took, not yet applied
     poller,         \* "running" (at the top of its loop) | "polling" | "received" | "backoff"
                     \* | "paused" | "pausing" | "orphaned" | "finished" | "failed" | "stopped"
+                    \* | "dead" | "unused" (rejectedStartUnused only)
     lastEmpty,      \* the last applied answer added no endpoints while the query was running
     waited,         \* a backoff has elapsed since that empty answer
     sawFull,        \* pauseNotAtomic only: the poller saw the limit reached and has not paused yet
@@ -166,7 +179,10 @@ Init ==
     /\ inflight = FALSE
     /\ resp = NoAnswer
     /\ got = NoAnswer
-    /\ poller = "running"
+    \* P.start: the pool accepts the task ("running") or rejects it and the poller is orphaned,
+    \* the state a rejected resume leaves too. Broken variant rejectedStartUnused: a rejected
+    \* start leaves the poller stopped and unused, nobody runs it ("unused").
+    /\ poller \in {"running", IF Mutation = "rejectedStartUnused" THEN "unused" ELSE "orphaned"}
     /\ lastEmpty = FALSE
     /\ waited = FALSE
     /\ sawFull = FALSE
@@ -663,7 +679,7 @@ TypeOK ==
     /\ enq \in [1..N -> 0..2]
     /\ resp \in Answer /\ got \in Answer
     /\ poller \in {"running", "polling", "received", "backoff", "paused", "pausing",
-                   "orphaned", "finished", "failed", "stopped", "dead"}
+                   "orphaned", "finished", "failed", "stopped", "dead", "unused"}
     /\ rd \in {"run", "resume", "waiting", "inline"}
     /\ app \in {"reading", "ended", "threw"}
     /\ sawFull \in BOOLEAN

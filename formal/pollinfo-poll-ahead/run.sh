@@ -63,6 +63,7 @@ check() {
 echo "PollAhead model check  N=$N  Limit=$LIMIT  ($(java -cp "$JAR" tlc2.TLC 2>&1 | head -1))"
 echo
 echo "Design checks (IdleFix = TRUE is the code: awaitNext clears idleTried after every consumed future)"
+echo "(every check starts the poller either accepted by the pool or rejected, which leaves it orphaned)"
 check proposal-as-written     TRUE  TRUE  none "$SAFE"          yes pass                      "streams open as soon as endpoints are enqueued"
 check finding-open-streams    TRUE  TRUE  none "OpenWithinLimit" no invariant:OpenWithinLimit "KNOWN FINDING: one answer can add more streams than the limit"
 check deferred-open           FALSE TRUE  none "$ALL"           yes pass                      "the code as written: every safety rule and Terminates hold"
@@ -90,6 +91,7 @@ check staleIdle               FALSE FALSE none                "$SAFE" yes livene
 check lateRelease             FALSE TRUE  lateRelease         "$ALL" no invariant:SlotFreedOnExhaust "slot freed only when a later awaitNext consumes the null future, not when the application finishes the stream"
 check applyAfterFail          FALSE TRUE  applyAfterFail      "$ALL" no invariant:FailedQueueInert   "addEndpoints queues and reserves on a queue that already failed"
 check errorNotReported        FALSE TRUE  errorNotReported    "$ALL" yes liveness                    "an Error kills the poller thread without failing the queue (next() waits forever)"
+check rejectedStartUnused     FALSE TRUE  rejectedStartUnused "$ALL" yes liveness                    "a rejected poller start leaves the poller unused instead of orphaned (next() waits forever)"
 echo
 echo "Gap check: lateRelease passes every rule that existed before SlotFreedOnExhaust. The late release is a progress"
 echo "problem (a finished stream blocks the poller), not a safety or termination one, and only the new rule sees it."
