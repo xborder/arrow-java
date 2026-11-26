@@ -730,6 +730,20 @@ public class PollAheadTest {
         .rowsPerEndpoint(2);
   }
 
+  // Returns once the poller sleeps in the long backoff wait that follows poll 5. The server only
+  // sees a poll arrive, so the answer and the start of the wait are given a moment: a cancel that
+  // came during the RPC would end the poll, not the wait, and prove nothing about the backoff.
+  private static void awaitBackoffWait(final ScriptedPollQuery script, final Connection connection)
+      throws Exception {
+    assertTrue(script.awaitPollCount(6, WAIT_MS));
+    Thread.sleep(QUIET_MS);
+    assertEquals(
+        1,
+        connection.unwrap(ArrowFlightConnection.class).getPollerExecutor().getActiveCount(),
+        "the poller is not waiting in its backoff");
+    assertEquals(6, script.pollCount(), "the poller polled again before the wait ended");
+  }
+
   @Test
   public void cancelDuringABackoffWaitEndsItAndSendsNoMorePolls() throws Exception {
     final ScriptedPollQuery script = backingOff();
@@ -737,7 +751,7 @@ public class PollAheadTest {
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery(script.query())) {
       assertTrue(resultSet.next());
-      assertTrue(script.awaitPollCount(6, WAIT_MS));
+      awaitBackoffWait(script, connection);
       final long cancelNanos = System.nanoTime();
       statement.cancel();
       final SQLException canceled = assertThrows(SQLException.class, resultSet::next);
@@ -761,7 +775,7 @@ public class PollAheadTest {
       final Statement statement = connection.createStatement();
       final ResultSet resultSet = statement.executeQuery(script.query());
       assertTrue(resultSet.next());
-      assertTrue(script.awaitPollCount(6, WAIT_MS));
+      awaitBackoffWait(script, connection);
       final long closeNanos = System.nanoTime();
       resultSet.close();
       statement.close();
