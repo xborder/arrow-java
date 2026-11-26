@@ -2,7 +2,7 @@
 # Model-check the JDBC poll-ahead design (BDX-645) with TLC.
 #
 #   formal/pollinfo-poll-ahead/run.sh            # all checks
-#   N=4 LIMIT=2 formal/pollinfo-poll-ahead/run.sh  # larger bound (slower)
+#   N=4 LIMIT=2 formal/pollinfo-poll-ahead/run.sh  # larger bound (about 30 s)
 #
 # Each check states what it expects. The script exits 0 only when every
 # check matches its expectation, including the broken variants, which must
@@ -25,17 +25,17 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 cp "$HERE/PollAhead.tla" "$WORK/"
 
-SAFE="TypeOK EachEndpointOnce ContinuationsOnce NoPrematureEnd FailFast CancelStopsPolling Backpressure NoSpin"
+SAFE="TypeOK InlineMeansPoller EachEndpointOnce ContinuationsOnce NoPrematureEnd FailFast CancelStopsPolling Backpressure NoSpin"
 ALL="$SAFE OpenWithinLimit"
 unexpected=0
 
-# check NAME EAGER_OPEN MUTATION "INVARIANTS" LIVENESS(yes|no) EXPECT(pass|invariant:Name|deadlock|liveness) NOTE
+# check NAME EAGER_OPEN IDLE_FIX MUTATION "INVARIANTS" LIVENESS(yes|no) EXPECT(pass|invariant:Name|deadlock|liveness) NOTE
 check() {
-  local name=$1 eager=$2 mutation=$3 invariants=$4 liveness=$5 expect=$6 note=$7
+  local name=$1 eager=$2 idlefix=$3 mutation=$4 invariants=$5 liveness=$6 expect=$7 note=$8
   local cfg="$WORK/$name.cfg" out="$WORK/$name.out" got
   {
     echo "SPECIFICATION Spec"
-    echo "CONSTANTS N = $N  Limit = $LIMIT  EagerOpen = $eager  Mutation = \"$mutation\""
+    echo "CONSTANTS N = $N  Limit = $LIMIT  EagerOpen = $eager  IdleFix = $idlefix  Mutation = \"$mutation\""
     for inv in $invariants; do echo "INVARIANT $inv"; done
     if [ "$liveness" = yes ]; then echo "PROPERTY Terminates"; fi
   } > "$cfg"
@@ -60,22 +60,31 @@ check() {
 
 echo "PollAhead model check  N=$N  Limit=$LIMIT  ($(java -cp "$JAR" tlc2.TLC 2>&1 | head -1))"
 echo
-echo "Design checks"
-check proposal-as-written     TRUE  none "$SAFE"          yes pass                      "streams open as soon as endpoints are enqueued"
-check finding-open-streams    TRUE  none "OpenWithinLimit" no invariant:OpenWithinLimit "KNOWN FINDING: one answer can add more streams than the limit"
-check deferred-open           FALSE none "$ALL"           yes pass                      "streams open only while open < limit"
+echo "Design checks (IdleFix = TRUE is the proposed fix; FALSE is the code at the sync commit)"
+check proposal-as-written     TRUE  TRUE  none "$SAFE"          yes pass                      "streams open as soon as endpoints are enqueued"
+check finding-open-streams    TRUE  TRUE  none "OpenWithinLimit" no invariant:OpenWithinLimit "KNOWN FINDING: one answer can add more streams than the limit"
+check deferred-open-fixed     FALSE TRUE  none "$ALL"           yes pass                      "deferred open, idle flag cleared on progress"
+check deferred-open           FALSE FALSE none "$ALL"           no  pass                      "the code as written: every safety rule holds"
+check finding-stale-idle      FALSE FALSE none "TypeOK"         yes liveness                  "KNOWN FINDING: next() can hang after a rejected resume (stale idleTried)"
 echo
-echo "Broken variants (each must fail on the rule it targets)"
-check endWhenQueueEmpty       FALSE endWhenQueueEmpty   "$ALL" no invariant:NoPrematureEnd     "next() ends when the queue is empty"
-check finishBeforeEnqueue     FALSE finishBeforeEnqueue "$ALL" no invariant:NoPrematureEnd     "poller marked finished before enqueueing"
-check enqueueWholeList        FALSE enqueueWholeList    "$ALL" no invariant:EachEndpointOnce   "cumulative list enqueued, not the suffix"
-check reuseContinuation       FALSE reuseContinuation   "$ALL" no invariant:ContinuationsOnce  "old continuation kept after empty answer"
-check readAfterFail           FALSE readAfterFail       "$ALL" no invariant:FailFast           "reader ignores the failure flag"
-check cancelIgnoresPoller     FALSE cancelIgnoresPoller "$ALL" no invariant:CancelStopsPolling "cancel does not stop the poller"
-check noLimit                 FALSE noLimit             "$ALL" no invariant:Backpressure       "poller ignores the limit"
-check noBackoff               FALSE noBackoff           "$ALL" no invariant:NoSpin             "no wait after an empty answer"
-check noWake                  FALSE noWake              "$ALL" yes liveness                    "reader never wakes a paused poller"
-check pauseNotAtomic          FALSE pauseNotAtomic      "$ALL" yes liveness                    "limit check and pause in separate steps"
+echo "Broken variants (each must fail on the rule it targets; the idle fix is on, so only the variant is at fault)"
+check endWhenQueueEmpty       FALSE TRUE  endWhenQueueEmpty   "$ALL" no invariant:NoPrematureEnd     "next() ends when the queue is empty"
+check endIgnoresOpening       FALSE TRUE  endIgnoresOpening   "$ALL" no invariant:NoPrematureEnd     "end test forgets streams still opening"
+check finishBeforeEnqueue     FALSE TRUE  finishBeforeEnqueue "$ALL" no invariant:NoPrematureEnd     "moreExpected cleared before the final endpoints are queued"
+check enqueueWholeList        FALSE TRUE  enqueueWholeList    "$ALL" no invariant:EachEndpointOnce   "cumulative list enqueued, not the suffix"
+check reuseContinuation       FALSE TRUE  reuseContinuation   "$ALL" no invariant:ContinuationsOnce  "old continuation kept after empty answer"
+check readAfterFail           FALSE TRUE  readAfterFail       "$ALL" no invariant:FailFast           "reader ignores the failure flag"
+check cancelIgnoresPoller     FALSE TRUE  cancelIgnoresPoller "$ALL" no invariant:CancelStopsPolling "cancel does not stop the poller"
+check noLimit                 FALSE TRUE  noLimit             "$ALL" no invariant:Backpressure       "poller ignores the limit"
+# The poller never has two batches reserved at once (it stops polling at the limit), so the
+# reader's and the poller's reservations only collide from 4 endpoints on.
+if [ "$N" -ge 4 ]; then OPEN_NOT_RESERVED=invariant:OpenWithinLimit; else OPEN_NOT_RESERVED=pass; fi
+check openNotReserved         FALSE TRUE  openNotReserved     "$ALL" no "$OPEN_NOT_RESERVED"         "a stream takes its slot only once opened, not when reserved (needs N>=4)"
+check noBackoff               FALSE TRUE  noBackoff           "$ALL" no invariant:NoSpin             "no wait after an empty answer"
+check noWake                  FALSE TRUE  noWake              "$ALL" yes liveness                    "reader never resumes a paused poller"
+check pauseNotAtomic          FALSE TRUE  pauseNotAtomic      "$ALL" yes liveness                    "limit check and pause in separate steps"
+check ownedClearedLate        FALSE TRUE  ownedClearedLate    "$ALL" yes liveness                    "pause clears owned after the lock: resume finds it set"
+check noIdleHook              FALSE TRUE  noIdleHook          "$ALL" yes liveness                    "an orphaned poller is never run inline"
 
 echo
 if [ "$unexpected" -eq 0 ]; then echo "All checks matched their expectations."; else echo "Some checks did not match. See above."; fi
