@@ -43,7 +43,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStatusCode;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.MethodOrderer.OrderAnnotation;
 import org.junit.jupiter.api.Order;
@@ -52,7 +54,14 @@ import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
-/** Black-box BDX-645 contract checks against the standalone shared conformance server. */
+/**
+ * Black-box BDX-645 contract checks against the standalone shared conformance server.
+ *
+ * <p>Enable with {@code -Dpollinfo.shared.enabled=true}. Every shared-server class resets the
+ * server and asserts its global counters, so two of them must never run at once. Surefire runs
+ * several forks, hence each class holds the cross-JVM {@link SharedServerLock} from
+ * {@code @BeforeAll} to {@code @AfterAll} and leaves the server reset.
+ */
 @EnabledIfSystemProperty(named = "pollinfo.shared.enabled", matches = "true")
 @TestMethodOrder(OrderAnnotation.class)
 public class SharedServerPollInfoExecutionTest {
@@ -60,8 +69,31 @@ public class SharedServerPollInfoExecutionTest {
   private static final int FLIGHT_PORT = Integer.getInteger("pollinfo.shared.flightPort", 32347);
   private static final int CONTROL_PORT = Integer.getInteger("pollinfo.shared.controlPort", 32348);
 
+  private static SharedServerLock serverLock;
+
+  @BeforeAll
+  public static void lockServer() throws Exception {
+    serverLock = SharedServerLock.acquire(CONTROL_PORT);
+  }
+
+  @AfterAll
+  public static void resetAndUnlockServer() throws Exception {
+    try {
+      resetWhenIdle();
+    } finally {
+      serverLock.close();
+    }
+  }
+
   @BeforeEach
   public void resetServer() throws Exception {
+    resetWhenIdle();
+  }
+
+  // The previous test closed its connections; /reset must not run while the server still has
+  // streams open.
+  private static void resetWhenIdle() throws Exception {
+    awaitCounterEquals("do_get_active", 0, Duration.ofSeconds(10));
     post("/reset", "");
   }
 
@@ -82,8 +114,10 @@ public class SharedServerPollInfoExecutionTest {
 
   @Test
   @Order(2)
+  // Pinned to the POC path (pollInfoPrefetch=0): the DoGet-before-first-continuation order below is
+  // the POC request order; poll-ahead polls the continuations in the background.
   public void t2MultiStepContinuationsAndFinalCumulativeInfo() throws Exception {
-    try (Connection connection = connect(true)) {
+    try (Connection connection = connect(true, "pollInfoPrefetch=0")) {
       assertEquals(Arrays.asList(1L, 2L, 3L), directValues(connection, "multi-step"));
     }
     final String state = state();
@@ -202,8 +236,11 @@ public class SharedServerPollInfoExecutionTest {
 
   @Test
   @Order(10)
+  // Pinned to the POC path (pollInfoPrefetch=0): the cancel surfaces as the CANCELLED
+  // FlightRuntimeException of the reader's own poll. With poll-ahead it is "Statement canceled"
+  // (SharedServerPollAheadTest).
   public void t9CancelWhileResultSetWaitsForMoreEndpoints() throws Exception {
-    try (Connection connection = connect(true);
+    try (Connection connection = connect(true, "pollInfoPrefetch=0");
         Statement statement = connection.createStatement()) {
       final AtomicReference<Throwable> failure = new AtomicReference<>();
       final AtomicBoolean resultSetCreated = new AtomicBoolean();
@@ -329,6 +366,18 @@ public class SharedServerPollInfoExecutionTest {
     final long deadline = System.nanoTime() + timeout.toNanos();
     do {
       if (counter(state(), name) >= expected) {
+        return;
+      }
+      Thread.sleep(20);
+    } while (System.nanoTime() < deadline);
+    assertEquals(expected, counter(state(), name), state());
+  }
+
+  private static void awaitCounterEquals(
+      final String name, final int expected, final Duration timeout) throws Exception {
+    final long deadline = System.nanoTime() + timeout.toNanos();
+    do {
+      if (counter(state(), name) == expected) {
         return;
       }
       Thread.sleep(20);

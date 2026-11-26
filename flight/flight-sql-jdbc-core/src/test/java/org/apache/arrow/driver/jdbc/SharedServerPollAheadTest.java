@@ -38,8 +38,8 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -47,7 +47,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import org.apache.arrow.flight.FlightRuntimeException;
+import org.apache.arrow.flight.FlightStatusCode;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
@@ -60,7 +64,11 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
  *
  * <p>Enable with {@code -Dpollinfo.shared.enabled=true -Dpollinfo.shared.flightPort=...
  * -Dpollinfo.shared.controlPort=...}. Connections use {@code threadPoolSize=4}: the reader pool
- * defaults to 1, and a held stream would starve the others.
+ * defaults to 1, and a held stream would starve the others (and the default prefetch is then 4).
+ *
+ * <p>Every shared-server class resets the server and asserts its global counters, so two of them
+ * must never run at once. Surefire runs several forks, hence each class holds the cross-JVM {@link
+ * SharedServerLock} from {@code @BeforeAll} to {@code @AfterAll} and leaves the server reset.
  */
 @EnabledIfSystemProperty(named = "pollinfo.shared.enabled", matches = "true")
 public class SharedServerPollAheadTest {
@@ -73,7 +81,24 @@ public class SharedServerPollAheadTest {
   private static final Duration QUIET = Duration.ofMillis(400);
   private static final String CONTINUATION = "continuation";
 
+  private static SharedServerLock serverLock;
+
   private ExecutorService background;
+
+  @BeforeAll
+  public static void lockServer() throws Exception {
+    serverLock = SharedServerLock.acquire(CONTROL_PORT);
+  }
+
+  @AfterAll
+  public static void resetAndUnlockServer() throws Exception {
+    try {
+      awaitUntil("no open streams before reset", () -> counter("do_get_active") == 0);
+      post("/reset", "");
+    } finally {
+      serverLock.close();
+    }
+  }
 
   @BeforeEach
   public void resetServer() throws Exception {
@@ -202,7 +227,7 @@ public class SharedServerPollAheadTest {
   @Test
   public void emptyAnswersBackOffExponentiallyUpToTheCap() throws Exception {
     final List<Long> rows;
-    try (Connection connection = connect(true, "pollInfoMaxBackoffMs=300");
+    try (Connection connection = connect(true, "pollInfoMaxBackoffMs=250");
         Statement statement = connection.createStatement();
         ResultSet resultSet = statement.executeQuery("empty-answers")) {
       rows = values(resultSet, "empty-answers");
@@ -215,69 +240,139 @@ public class SharedServerPollAheadTest {
     final long gap3 = gapMillis(polls.get(2), polls.get(3));
     System.out.printf("SHARED_BACKOFF_GAPS_MILLIS %d %d %d%n", gap1, gap2, gap3);
     // Lower bounds are the configured delays (with a little slack); the upper bounds are generous,
-    // except that the third gap must show the cap: 400 ms uncapped, 300 ms capped.
+    // except that the third gap must show the cap: 400 ms uncapped, 250 ms capped, so 350 ms
+    // leaves 100 ms of headroom above the cap and 50 ms below the uncapped wait.
     assertTrue(gap1 >= 90 && gap1 < 1000, "gap1=" + gap1);
     assertTrue(gap2 >= 180 && gap2 < 1000, "gap2=" + gap2);
-    assertTrue(gap3 >= 270 && gap3 < 390, "gap3=" + gap3);
+    assertTrue(gap3 >= 225 && gap3 < 350, "gap3=" + gap3);
   }
 
   @Test
-  public void lateFailureCancelsTheBufferedStreamsAndDeliversNoRows() throws Exception {
+  public void lateFailureCancelsTheBufferedStreamsAndSurfacesFromNext() throws Exception {
     post("/hold", "{\"endpoint\":1}");
     post("/hold", "{\"endpoint\":2}");
+    // The failing poll (the second continuation) is held, so the failure cannot be recorded
+    // before executeQuery returns: it must surface from next().
+    holdPoll(2);
     try (Connection connection = connect(true, "");
         Statement statement = connection.createStatement()) {
       final Future<ResultSet> execution = executeAsync(statement, "late-error-buffered");
-      awaitUntil("C2 polled", () -> continuationPolls().size() >= 2);
-      // The failure cancels every buffered stream by itself, before anything is read or closed.
-      awaitUntil("E1 cancelled", () -> hasEnd(1, "cancelled"));
-      awaitUntil("streams ended", () -> counter("do_get_active") == 0);
-      // E1 is held, so the first read may still be pending when the poller records the failure.
-      // The failure then surfaces from executeQuery; otherwise from the first next(). Either way
-      // it is the same exception and no row is delivered.
-      final SQLException failure;
-      final ResultSet resultSet = awaitResultOrFailure(execution);
-      if (resultSet == null) {
-        failure = executionFailure(execution);
-      } else {
-        try (ResultSet toClose = resultSet) {
-          failure = assertThrows(SQLException.class, toClose::next);
-          assertThrows(SQLException.class, toClose::next);
-        }
+      try (ResultSet resultSet = result(execution)) {
+        awaitUntil("E1 held", () -> hasHold(1, "held"));
+        awaitUntil("E2 held", () -> hasHold(2, "held"));
+        awaitUntil("C2 held", () -> hasPollHold(2, "held"));
+        releasePoll(2);
+        // The failure cancels every buffered stream by itself, before anything is read or closed.
+        awaitUntil("E1 cancelled", () -> hasEnd(1, "cancelled"));
+        awaitUntil("E2 cancelled", () -> hasEnd(2, "cancelled"));
+
+        final SQLException failure = assertThrows(SQLException.class, resultSet::next);
+        assertContinuationFailure(failure);
+        // The failure is sticky, and no row is delivered.
+        assertContinuationFailure(assertThrows(SQLException.class, resultSet::next));
       }
-      assertEquals("Continuation PollFlightInfo failed", failureWithMessage(failure));
     }
     awaitUntil("streams ended", () -> counter("do_get_active") == 0);
     final List<JsonNode> ends = events("DoGet.end");
     assertTrue(
         ends.stream().noneMatch(event -> "completed".equals(event.path("outcome").asText())),
         "no stream may complete: " + state());
-    // E2 was either cancelled or never started; it never sent a row.
-    assertTrue(
-        ends.stream()
-            .filter(event -> event.path("endpoint").asInt() == 2)
-            .allMatch(event -> "cancelled".equals(event.path("outcome").asText())),
-        state());
+    assertFalse(hasHold(1, "released"), state());
     assertFalse(hasHold(2, "released"), state());
+    assertTrue(hasPollHold(2, "released"), state());
     assertEquals(2, continuationPolls().size(), state());
     // The server already ended the query, so the driver sends no CancelFlightInfo.
     assertEquals(0, counter("cancellation"), state());
   }
 
+  // The driver's own failure for a continuation the server failed: the exact class, the message,
+  // and the server's status as the cause.
+  private static void assertContinuationFailure(final SQLException failure) {
+    assertEquals(SQLException.class, failure.getClass());
+    assertEquals("Continuation PollFlightInfo failed", failure.getMessage());
+    assertTrue(failure.getCause() instanceof FlightRuntimeException, failure.toString());
+    final FlightRuntimeException cause = (FlightRuntimeException) failure.getCause();
+    assertEquals(FlightStatusCode.INTERNAL, cause.status().code());
+    assertTrue(
+        String.valueOf(cause.status().description()).contains("deterministic late query failure"),
+        cause.toString());
+  }
+
   @Test
   public void cancelWhileAPollIsOpenSendsNoMorePollsAndOneCancelFlightInfo() throws Exception {
-    try (Connection connection = connect(true, "");
-        Statement statement = connection.createStatement();
-        ResultSet resultSet = statement.executeQuery("cancel-observable")) {
-      awaitUntil("C1 poll blocked on the server", () -> continuationPolls().size() >= 1);
-      statement.cancel();
-      final SQLException canceled = assertThrows(SQLException.class, resultSet::next);
-      assertTrue(canceled.getMessage().contains("Statement canceled"), canceled.getMessage());
+    // burst: [E1]+C1, then [E1..E4]+C2; the poll of C2 is held, so four endpoints are readable
+    // while a poll is open. A prefetch above 4 keeps the poller polling.
+    holdPoll(2);
+    try (Connection connection = connect(true, "pollInfoPrefetch=8");
+        Statement statement = connection.createStatement()) {
+      final Future<ResultSet> execution = executeAsync(statement, "burst");
+      try (ResultSet resultSet = result(execution)) {
+        awaitUntil("C2 poll held", () -> hasPollHold(2, "held"));
+        final List<Long> rows = new ArrayList<>();
+        for (int row = 0; row < 4; row++) {
+          assertTrue(resultSet.next());
+          rows.add(resultSet.getLong("value"));
+        }
+        assertEquals(4, new HashSet<>(rows).size(), "rows were read twice: " + rows);
+        assertTrue(range(1, 8).containsAll(rows), rows.toString());
+
+        statement.cancel();
+        final SQLException canceled = assertThrows(SQLException.class, resultSet::next);
+        assertTrue(canceled.getMessage().contains("Statement canceled"), canceled.getMessage());
+        awaitUntil("CancelFlightInfo", () -> counter("cancellation") >= 1);
+        awaitUntil("the open poll ended", () -> hasPollHoldEnded(2));
+      }
+    }
+    awaitUntil("streams ended", () -> counter("do_get_active") == 0);
+    assertQuiet(
+        "a poll or a cancel after the cancel",
+        () -> counter("cancellation") == 1 && counter("poll_flight_info") == 3);
+    assertEquals(2, continuationPolls().size(), state());
+    assertFalse(hasPollHold(2, "released"), state());
+  }
+
+  @Test
+  public void closingAnUnfinishedResultWhileAPollIsOpenCancelsOnceAndPollsNoMore()
+      throws Exception {
+    holdPoll(2);
+    try (Connection connection = connect(true, "pollInfoPrefetch=8");
+        Statement statement = connection.createStatement()) {
+      final Future<ResultSet> execution = executeAsync(statement, "burst");
+      try (ResultSet resultSet = result(execution)) {
+        awaitUntil("C2 poll held", () -> hasPollHold(2, "held"));
+        assertTrue(resultSet.next());
+      }
+      awaitUntil("CancelFlightInfo", () -> counter("cancellation") >= 1);
+      awaitUntil("the open poll ended", () -> hasPollHoldEnded(2));
+    }
+    // The statement and the connection are closed now; none of it may cancel or poll again.
+    awaitUntil("streams ended", () -> counter("do_get_active") == 0);
+    assertQuiet(
+        "a poll or a cancel after the close",
+        () -> counter("cancellation") == 1 && counter("poll_flight_info") == 3);
+    assertEquals(2, continuationPolls().size(), state());
+    assertFalse(hasPollHold(2, "released"), state());
+  }
+
+  @Test
+  public void closingAnUnfinishedResultWhilePollingIsPausedCancelsOnceAndPollsNoMore()
+      throws Exception {
+    try (Connection connection = connect(true, "pollInfoPrefetch=2");
+        Statement statement = connection.createStatement()) {
+      final Future<ResultSet> execution = executeAsync(statement, "burst");
+      try (ResultSet resultSet = result(execution)) {
+        // E1..E4 are queued and unread, which is above the limit: the poller pauses before C2.
+        awaitUntil("C1 polled", () -> continuationPolls().size() >= 1);
+        assertQuiet("polled past the limit", () -> continuationPolls().size() == 1);
+        assertTrue(resultSet.next());
+      }
       awaitUntil("CancelFlightInfo", () -> counter("cancellation") >= 1);
     }
-    assertEquals(1, counter("cancellation"), state());
+    awaitUntil("streams ended", () -> counter("do_get_active") == 0);
+    assertQuiet(
+        "a poll or a cancel after the close",
+        () -> counter("cancellation") == 1 && counter("poll_flight_info") == 2);
     assertEquals(1, continuationPolls().size(), state());
-    assertEquals(2, counter("poll_flight_info"), state());
   }
 
   @Test
@@ -296,11 +391,12 @@ public class SharedServerPollAheadTest {
         final SQLException canceled = assertThrows(SQLException.class, resultSet::next);
         assertTrue(canceled.getMessage().contains("Statement canceled"), canceled.getMessage());
         awaitUntil("E1 cancelled", () -> hasEnd(1, "cancelled"));
+        awaitUntil("CancelFlightInfo", () -> counter("cancellation") >= 1);
       }
       awaitUntil("streams ended", () -> counter("do_get_active") == 0);
     }
     assertEquals(2, counter("poll_flight_info"), state());
-    assertTrue(counter("cancellation") <= 1, state());
+    assertEquals(1, counter("cancellation"), state());
     // The held stream was cancelled, never completed.
     assertFalse(hasEnd(1, "completed"), state());
   }
@@ -362,34 +458,6 @@ public class SharedServerPollAheadTest {
 
   private Future<ResultSet> executeAsync(final Statement statement, final String query) {
     return background.submit(() -> statement.executeQuery(query));
-  }
-
-  // Null if executeQuery failed; its exception is then available from executionFailure.
-  private static ResultSet awaitResultOrFailure(final Future<ResultSet> execution)
-      throws Exception {
-    try {
-      return result(execution);
-    } catch (ExecutionException e) {
-      return null;
-    }
-  }
-
-  private static SQLException executionFailure(final Future<ResultSet> execution) throws Exception {
-    final ExecutionException e = assertThrows(ExecutionException.class, execution::get);
-    assertTrue(e.getCause() instanceof SQLException, e.toString());
-    return (SQLException) e.getCause();
-  }
-
-  // The message of the first exception in the cause chain that is the driver's own failure.
-  private static String failureWithMessage(final Throwable failure) {
-    Throwable current = failure;
-    while (current != null) {
-      if ("Continuation PollFlightInfo failed".equals(current.getMessage())) {
-        return current.getMessage();
-      }
-      current = current.getCause();
-    }
-    return failure.getMessage();
   }
 
   private static ResultSet result(final Future<ResultSet> execution) throws Exception {
@@ -466,6 +534,28 @@ public class SharedServerPollAheadTest {
             event ->
                 event.path("endpoint").asInt() == endpoint
                     && outcome.equals(event.path("outcome").asText()));
+  }
+
+  private static void holdPoll(final int continuation) {
+    post("/hold-poll", "{\"continuation\":" + continuation + "}");
+  }
+
+  private static void releasePoll(final int continuation) {
+    post("/release-poll", "{\"continuation\":" + continuation + "}");
+  }
+
+  private static boolean hasPollHold(final int continuation, final String outcome) {
+    return events("PollFlightInfo.hold").stream()
+        .anyMatch(
+            event ->
+                event.path(CONTINUATION).asInt() == continuation
+                    && outcome.equals(event.path("outcome").asText()));
+  }
+
+  // A held poll ended by the client: CancelFlightInfo, or the cancelled call (context).
+  private static boolean hasPollHoldEnded(final int continuation) {
+    return hasPollHold(continuation, "cancel-terminated")
+        || hasPollHold(continuation, "context-terminated");
   }
 
   private static boolean hasEnd(final int endpoint, final String outcome) {
